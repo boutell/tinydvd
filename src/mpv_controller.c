@@ -1,8 +1,84 @@
 #include "mpv_controller.h"
+#include <mpv/stream_cb.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdatomic.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+typedef struct {
+    int      fd;
+    uint64_t base_offset;
+    uint64_t size;
+    uint64_t pos;
+} tdvd_mpv_stream_t;
+
+static int64_t tdvd_stream_read(void *cookie, char *buf, uint64_t nbytes) {
+    tdvd_mpv_stream_t *s = (tdvd_mpv_stream_t *)cookie;
+    if (!s || s->pos >= s->size) return 0;
+    uint64_t avail = s->size - s->pos;
+    if (nbytes > avail) nbytes = avail;
+    ssize_t n = pread(s->fd, buf, (size_t)nbytes, (off_t)(s->base_offset + s->pos));
+    if (n <= 0) return n < 0 ? -1 : 0;
+    s->pos += (uint64_t)n;
+    return (int64_t)n;
+}
+
+static int64_t tdvd_stream_seek(void *cookie, int64_t offset) {
+    tdvd_mpv_stream_t *s = (tdvd_mpv_stream_t *)cookie;
+    if (!s || offset < 0 || (uint64_t)offset > s->size) return MPV_ERROR_GENERIC;
+    s->pos = (uint64_t)offset;
+    return offset;
+}
+
+static int64_t tdvd_stream_size(void *cookie) {
+    tdvd_mpv_stream_t *s = (tdvd_mpv_stream_t *)cookie;
+    return s ? (int64_t)s->size : MPV_ERROR_GENERIC;
+}
+
+static void tdvd_stream_close(void *cookie) {
+    tdvd_mpv_stream_t *s = (tdvd_mpv_stream_t *)cookie;
+    if (!s) return;
+    if (s->fd >= 0) close(s->fd);
+    free(s);
+}
+
+static int tdvd_stream_open(void *user_data, char *uri, mpv_stream_cb_info *info) {
+    (void)user_data;
+    if (!uri || !info) return MPV_ERROR_LOADING_FAILED;
+    const char *p = uri;
+    if (strncmp(p, "tdvd://", 7) == 0) p += 7;
+
+    char *end1 = NULL;
+    uint64_t base_offset = strtoull(p, &end1, 10);
+    if (!end1 || *end1 != ':') return MPV_ERROR_LOADING_FAILED;
+
+    char *end2 = NULL;
+    uint64_t slice_size = strtoull(end1 + 1, &end2, 10);
+    if (!end2 || *end2 != ':') return MPV_ERROR_LOADING_FAILED;
+
+    const char *file_path = end2 + 1;
+    int fd = open(file_path, O_RDONLY);
+    if (fd < 0) return MPV_ERROR_LOADING_FAILED;
+
+    tdvd_mpv_stream_t *s = (tdvd_mpv_stream_t *)calloc(1, sizeof(tdvd_mpv_stream_t));
+    if (!s) {
+        close(fd);
+        return MPV_ERROR_NOMEM;
+    }
+    s->fd = fd;
+    s->base_offset = base_offset;
+    s->size = slice_size;
+    s->pos = 0;
+
+    info->cookie   = s;
+    info->read_fn  = tdvd_stream_read;
+    info->seek_fn  = tdvd_stream_seek;
+    info->size_fn  = tdvd_stream_size;
+    info->close_fn = tdvd_stream_close;
+    return 0;
+}
 
 struct mpv_controller {
     mpv_handle *mpv;
@@ -87,6 +163,9 @@ mpv_controller_t *mpv_controller_init(void *(*get_proc_address)(void *, const ch
     /* Observe time-pos and pause asynchronously so background VM thread never blocks on mpv */
     mpv_observe_property(ctrl->mpv, 1, "time-pos", MPV_FORMAT_DOUBLE);
     mpv_observe_property(ctrl->mpv, 2, "pause", MPV_FORMAT_FLAG);
+
+    /* Register zero-copy tdvd:// byte-slice stream protocol for .tdvd single-file containers */
+    mpv_stream_cb_add_ro(ctrl->mpv, "tdvd", ctrl, tdvd_stream_open);
 
     if (get_proc_address) {
         mpv_opengl_init_params gl_init = {

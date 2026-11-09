@@ -1,6 +1,8 @@
 #include "dvd_vm_bridge.h"
 #include "mvob_parser.h"
+#include "tdvd_archive.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -69,6 +71,7 @@ typedef enum {
 
 struct dvd_vm_bridge {
     char *dvd_path;
+    tdvd_archive_t *archive;
     mpv_controller_t *mpv;
     spu_compositor_t *spu;
 
@@ -100,6 +103,8 @@ struct dvd_vm_bridge {
     dvd_domain_t indexed_domain;
     int          indexed_vts;
     FILE        *domain_files[10];
+    uint64_t     domain_file_base_offsets[10];
+    uint64_t     domain_file_sizes[10];
     int          domain_file_count;
     mvob_vobu_entry_t *vobu_index;
     size_t       vobu_count;
@@ -695,7 +700,44 @@ static FILE *open_dvd_subfile(const char *dvd_path, const char *filename) {
     return fopen(path, "rb");
 }
 
-static bool resolve_mkv_subfile(const char *dvd_path, const char *filename, char *out_buf, size_t out_len) {
+static bool open_domain_subfile(dvd_vm_bridge_t *b, const char *filename) {
+    if (!b || b->domain_file_count >= 10) return false;
+    if (b->archive) {
+        uint64_t base_off = 0, sz = 0;
+        if (!tdvd_archive_find(b->archive, filename, &base_off, &sz)) {
+            return false;
+        }
+        FILE *f = fopen(tdvd_archive_path(b->archive), "rb");
+        if (!f) return false;
+        int idx = b->domain_file_count++;
+        b->domain_files[idx] = f;
+        b->domain_file_base_offsets[idx] = base_off;
+        b->domain_file_sizes[idx] = sz;
+        return true;
+    }
+
+    FILE *f = open_dvd_subfile(b->dvd_path, filename);
+    if (!f) return false;
+    int idx = b->domain_file_count++;
+    b->domain_files[idx] = f;
+    b->domain_file_base_offsets[idx] = 0;
+    b->domain_file_sizes[idx] = UINT64_MAX;
+    return true;
+}
+
+static bool resolve_mkv_subfile(dvd_vm_bridge_t *b, const char *filename, char *out_buf, size_t out_len) {
+    if (b && b->archive) {
+        uint64_t mkv_off = 0, mkv_sz = 0;
+        if (tdvd_archive_find(b->archive, filename, &mkv_off, &mkv_sz)) {
+            snprintf(out_buf, out_len, "tdvd://%llu:%llu:%s",
+                     (unsigned long long)mkv_off,
+                     (unsigned long long)mkv_sz,
+                     tdvd_archive_path(b->archive));
+            return true;
+        }
+        return false;
+    }
+    const char *dvd_path = b->dvd_path;
     snprintf(out_buf, out_len, "%s/%s", dvd_path, filename);
     if (file_exists(out_buf)) return true;
     snprintf(out_buf, out_len, "%s/VIDEO_TS/%s", dvd_path, filename);
@@ -718,29 +760,26 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
 
     /* 1. Locate .mvob (or .VOB) files for this domain */
     if (b->domain == DVD_DOMAIN_VMGM) {
-        FILE *f = open_dvd_subfile(b->dvd_path, "VIDEO_TS.mvob");
-        if (!f) f = open_dvd_subfile(b->dvd_path, "VIDEO_TS.VOB");
-        if (f) b->domain_files[b->domain_file_count++] = f;
+        if (!open_domain_subfile(b, "VIDEO_TS.mvob")) {
+            open_domain_subfile(b, "VIDEO_TS.VOB");
+        }
     } else if (b->domain == DVD_DOMAIN_VTSM) {
         char name[64];
         snprintf(name, sizeof(name), "VTS_%02d_0.mvob", b->vts_nr);
-        FILE *f = open_dvd_subfile(b->dvd_path, name);
-        if (!f) {
+        if (!open_domain_subfile(b, name)) {
             snprintf(name, sizeof(name), "VTS_%02d_0.VOB", b->vts_nr);
-            f = open_dvd_subfile(b->dvd_path, name);
+            open_domain_subfile(b, name);
         }
-        if (f) b->domain_files[b->domain_file_count++] = f;
     } else if (b->domain == DVD_DOMAIN_VTSTT) {
         for (int part = 1; part <= 9; part++) {
             char name[64];
             snprintf(name, sizeof(name), "VTS_%02d_%d.mvob", b->vts_nr, part);
-            FILE *f = open_dvd_subfile(b->dvd_path, name);
-            if (!f) {
+            if (!open_domain_subfile(b, name)) {
                 snprintf(name, sizeof(name), "VTS_%02d_%d.VOB", b->vts_nr, part);
-                f = open_dvd_subfile(b->dvd_path, name);
+                if (!open_domain_subfile(b, name)) {
+                    break;
+                }
             }
-            if (!f) break;
-            b->domain_files[b->domain_file_count++] = f;
         }
     }
 
@@ -750,10 +789,14 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
 
     for (int fi = 0; fi < b->domain_file_count; fi++) {
         FILE *f = b->domain_files[fi];
-        fseek(f, 0, SEEK_SET);
-        uint64_t offset = 0;
+        uint64_t base_off = b->domain_file_base_offsets[fi];
+        uint64_t max_bytes = b->domain_file_sizes[fi];
+        fseeko(f, (off_t)base_off, SEEK_SET);
+        uint64_t offset = base_off;
+        uint64_t bytes_read = 0;
 
-        while (fread(sector, 1, DVD_SECTOR_SIZE, f) == DVD_SECTOR_SIZE) {
+        while (bytes_read + DVD_SECTOR_SIZE <= max_bytes &&
+               fread(sector, 1, DVD_SECTOR_SIZE, f) == DVD_SECTOR_SIZE) {
             bool is_nv = (sector[0] == 0x00 && sector[1] == 0x00 && sector[2] == 0x01 && sector[3] == 0xBA &&
                           sector[38] == 0x00 && sector[39] == 0x00 && sector[40] == 0x01 && sector[41] == 0xBF &&
                           sector[44] == 0x00);
@@ -783,6 +826,7 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
                 }
             }
             offset += DVD_SECTOR_SIZE;
+            bytes_read += DVD_SECTOR_SIZE;
         }
     }
 
@@ -797,7 +841,7 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
     }
 
     char mkv_full[1024] = {0};
-    if (mkv_name[0] && resolve_mkv_subfile(b->dvd_path, mkv_name, mkv_full, sizeof(mkv_full))) {
+    if (mkv_name[0] && resolve_mkv_subfile(b, mkv_name, mkv_full, sizeof(mkv_full))) {
         if (strcmp(b->loaded_mkv_path, mkv_full) != 0) {
             strncpy(b->loaded_mkv_path, mkv_full, sizeof(b->loaded_mkv_path) - 1);
             b->expected_next_pts_nanos = -1;
@@ -1361,7 +1405,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
     FILE *f = b->domain_files[entry->file_idx];
     if (!f) return false;
 
-    fseek(f, (long)entry->file_offset, SEEK_SET);
+    fseeko(f, (off_t)entry->file_offset, SEEK_SET);
     uint8_t sector[DVD_SECTOR_SIZE];
 
     for (uint32_t s = 0; s < entry->sector_count; s++) {
@@ -1632,6 +1676,13 @@ static void *vm_thread_func(void *arg) {
  * Public Lifecycle & User Input API
  * ========================================================================= */
 
+static void dvdread_silent_logger(void *priv, dvd_logger_level_t level, const char *fmt, va_list list) {
+    (void)priv;
+    (void)level;
+    (void)fmt;
+    (void)list;
+}
+
 dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, mpv_controller_t *mpv, spu_compositor_t *spu) {
     if (!dvd_path) return NULL;
 
@@ -1661,9 +1712,25 @@ dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, mpv_controller_t *mpv,
     b->sprm[18] = 0x656e; /* Initial subpicture language 'en' */
     b->sprm[20] = 0x01;   /* Player region code 1 */
 
-    b->reader = DVDOpen(dvd_path);
+    const char *ifo_open_path = dvd_path;
+    if (tdvd_is_archive_path(dvd_path)) {
+        b->archive = tdvd_archive_open(dvd_path);
+        if (!b->archive || !tdvd_archive_ifo_dir(b->archive)) {
+            fprintf(stderr, "[dvd_vm] Failed to open .tdvd archive at %s\n", dvd_path);
+            if (b->archive) tdvd_archive_close(b->archive);
+            pthread_mutex_destroy(&b->lock);
+            free(b->dvd_path);
+            free(b);
+            return NULL;
+        }
+        ifo_open_path = tdvd_archive_ifo_dir(b->archive);
+    }
+
+    dvd_logger_cb logcb = { .pf_log = dvdread_silent_logger };
+    b->reader = DVDOpen2(NULL, &logcb, ifo_open_path);
     if (!b->reader) {
-        fprintf(stderr, "[dvd_vm] Failed to open DVD directory at %s\n", dvd_path);
+        fprintf(stderr, "[dvd_vm] Failed to open DVD at %s\n", dvd_path);
+        if (b->archive) tdvd_archive_close(b->archive);
         pthread_mutex_destroy(&b->lock);
         free(b->dvd_path);
         free(b);
@@ -1674,6 +1741,7 @@ dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, mpv_controller_t *mpv,
     if (!b->vmgi) {
         fprintf(stderr, "[dvd_vm] Failed to open VIDEO_TS.IFO in %s\n", dvd_path);
         DVDClose(b->reader);
+        if (b->archive) tdvd_archive_close(b->archive);
         pthread_mutex_destroy(&b->lock);
         free(b->dvd_path);
         free(b);
@@ -1713,6 +1781,7 @@ void dvd_vm_bridge_destroy(dvd_vm_bridge_t *b) {
     }
     if (b->vmgi) ifoClose(b->vmgi);
     if (b->reader) DVDClose(b->reader);
+    if (b->archive) tdvd_archive_close(b->archive);
     pthread_mutex_destroy(&b->lock);
     if (b->dvd_path) free(b->dvd_path);
     free(b);

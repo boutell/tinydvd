@@ -91,7 +91,7 @@ def build_spu_sector(substream=0x20):
 
 
 def main():
-    print("=== Running dvd-hybrid-transcode Integration Test ===")
+    print("=== Running convert-to-tinydvd Integration Test ===")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         input_dir = os.path.join(tmpdir, "in")
@@ -134,10 +134,10 @@ def main():
             f.write(nv3)
             f.write(s1)
 
-        # Import dvd-hybrid-transcode functions
+        # Import convert-to-tinydvd functions
         sys.path.insert(0, os.path.abspath("scripts"))
         import importlib
-        transcoder = importlib.import_module("dvd-hybrid-transcode")
+        transcoder = importlib.import_module("convert-to-tinydvd")
 
         # Test scan
         vobus, keyframes, segments = transcoder.scan_vts_vobus([vob_path], fps=29.97, return_segments=True)
@@ -206,6 +206,21 @@ def main():
         magic, ver, vts, idx, pts, dur, is_idr, _ = transcoder.MVOB_STRUCT.unpack(ref3)
         assert (magic, ver, vts, idx, pts, is_idr) == (transcoder.MVOB_MAGIC, 1, 1, 2, int(1.0 * 1e9), 1)
         print("Video reference descriptors (hollowed & synthetic): OK")
+
+        # Test single-file .tdvd archive packaging (ZIP_STORED)
+        transcoder.copy_ifo_and_bup(input_dir, output_dir)
+        with open(os.path.join(output_dir, "VTS_01_VIDEO.mkv"), "wb") as f:
+            f.write(b"\x1a\x45\xdf\xa3" + b"\x00" * 4096)
+        tdvd_file = os.path.join(tmpdir, "test_movie.tdvd")
+        transcoder.package_tdvd_archive(output_dir, tdvd_file)
+        assert os.path.exists(tdvd_file), ".tdvd archive not created"
+        import zipfile
+        with zipfile.ZipFile(tdvd_file, "r") as zf:
+            names = zf.namelist()
+            assert "VIDEO_TS.IFO" in names and "VTS_01_1.mvob" in names and "VTS_01_VIDEO.mkv" in names
+            for info in zf.infolist():
+                assert info.compress_type == zipfile.ZIP_STORED, f"Expected ZIP_STORED (0), got {info.compress_type}"
+        print("Single-file .tdvd (ZIP_STORED) packaging: OK")
 
     print("\nAll Transcoder integration tests passed successfully!")
 

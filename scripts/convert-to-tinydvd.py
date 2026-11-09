@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-tinydvd Transcoder & Packager CLI
+convert-to-tinydvd: tinydvd Converter & Packager CLI
 Decomposes DVD title sets and menus into compact Meta-VOB (.mvob) sector
 containers (1 video reference sector per VOBU + NV_PCK + SPU) and
 companion H.264 + AAC Matroska (.mkv) streams.
@@ -15,6 +15,7 @@ import subprocess
 import shutil
 import tempfile
 import contextlib
+import zipfile
 
 SECTOR_SIZE = 2048
 MVOB_MAGIC = 0x4D564F42  # "MVOB" in little-endian uint32
@@ -711,40 +712,64 @@ def resolve_dvd_source(input_path):
     raise ValueError(f"Could not resolve DVD source at '{input_path}'. Must be a directory, an ISO image, or a VOB/IFO file.")
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="tinydvd Transcoder: Converts DVD-Video titles into compact Meta-VOB (.mvob) and companion MKVs."
-    )
-    parser.add_argument("input", help="Source DVD directory, ISO file, or VOB directory")
-    parser.add_argument("output", help="Output directory for .mvob and companion .mkv files")
-    parser.add_argument("--vts", type=int, default=None, help="Specific VTS title set ID to process (default: all)")
-    parser.add_argument("--fps", type=float, default=29.97, help="Disc frame rate (default: 29.97)")
-    parser.add_argument("--crf", type=int, default=18, help="x264 CRF quality level (default: 18)")
-    parser.add_argument("--preset", default="slow", help="x264 encoding preset (default: slow)")
-    parser.add_argument("--tune", default="film", help="x264 tune option (default: film)")
-    parser.add_argument("--sar", default="32:27", help="Storage aspect ratio (default: 32:27 for NTSC anamorphic)")
-    parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
+def is_already_converted_dir(path):
+    """Returns True if path is a directory that already contains .mvob and _VIDEO.mkv files."""
+    if not os.path.isdir(path):
+        return False
+    entries = os.listdir(path)
+    has_mvob = any(f.lower().endswith(".mvob") for f in entries)
+    has_mkv  = any(f.lower().endswith("_video.mkv") for f in entries)
+    return has_mvob and has_mkv
 
-    args = parser.parse_args()
 
-    raw_input = os.path.abspath(args.input)
-    output_path = os.path.abspath(args.output)
-    os.makedirs(output_path, exist_ok=True)
+def package_tdvd_archive(staging_dir, output_archive_path):
+    """
+    Packages a tinydvd directory into a single uncompressed ZIP_STORED (.tdvd / .tinydvd)
+    archive with O(1) central directory lookup and contiguous byte ranges for zero-copy playback.
+    """
+    parent_dir = os.path.dirname(os.path.abspath(output_archive_path))
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
-    print("tinydvd Transcoder")
-    print(f"Input:  {raw_input}")
-    print(f"Output: {output_path}")
+    all_files = []
+    for fname in sorted(os.listdir(staging_dir)):
+        fpath = os.path.join(staging_dir, fname)
+        if os.path.islink(fpath) or not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in (".ifo", ".bup"):
+            prio = 0
+        elif ext == ".mvob":
+            prio = 1
+        elif ext == ".mkv":
+            prio = 2
+        elif ext == ".txt":
+            prio = 3
+        else:
+            continue
+        all_files.append((prio, fname, fpath))
 
+    all_files.sort(key=lambda item: (item[0], item[1]))
+    print(f"\n[package] Creating single-file archive {output_archive_path} ({len(all_files)} constituent files, ZIP_STORED)...")
+    with zipfile.ZipFile(output_archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for _, fname, fpath in all_files:
+            zf.write(fpath, arcname=fname)
+    total_mb = os.path.getsize(output_archive_path) / (1024.0 * 1024.0)
+    print(f"[package] Wrote {output_archive_path} ({total_mb:.1f} MB)")
+
+
+def run_conversion_to_dir(raw_input, target_dir, args):
+    os.makedirs(target_dir, exist_ok=True)
     with resolve_dvd_source(raw_input) as input_path:
-        copy_ifo_and_bup(input_path, output_path)
+        copy_ifo_and_bup(input_path, target_dir)
 
         if args.vts is not None:
             if args.vts == 0:
-                process_vmgm(input_path, output_path, args.fps, args.crf, args.preset, args.sar, keep_audio=args.keep_mvob_audio)
+                process_vmgm(input_path, target_dir, args.fps, args.crf, args.preset, args.sar, keep_audio=args.keep_mvob_audio)
             else:
-                process_vts(input_path, output_path, args.vts, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
+                process_vts(input_path, target_dir, args.vts, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
         else:
-            process_vmgm(input_path, output_path, args.fps, args.crf, args.preset, args.sar, keep_audio=args.keep_mvob_audio)
+            process_vmgm(input_path, target_dir, args.fps, args.crf, args.preset, args.sar, keep_audio=args.keep_mvob_audio)
 
             vts_ids = set()
             for root, _, files in os.walk(input_path):
@@ -759,9 +784,47 @@ def main():
                 vts_ids = {1}
 
             for vid in sorted(vts_ids):
-                process_vts(input_path, output_path, vid, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
+                process_vts(input_path, target_dir, vid, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
 
-    print("\nTranscode and packager completed successfully!")
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="convert-to-tinydvd",
+        description="convert-to-tinydvd: Converts a DVD directory or ISO into a single-file .tdvd archive (or directory)."
+    )
+    parser.add_argument("input", help="Source DVD directory, ISO file, or existing tinydvd directory")
+    parser.add_argument("output", help="Output .tdvd / .tinydvd file (or output directory)")
+    parser.add_argument("--vts", type=int, default=None, help="Specific VTS title set ID to process (default: all)")
+    parser.add_argument("--fps", type=float, default=29.97, help="Disc frame rate (default: 29.97)")
+    parser.add_argument("--crf", type=int, default=18, help="x264 CRF quality level (default: 18)")
+    parser.add_argument("--preset", default="slow", help="x264 encoding preset (default: slow)")
+    parser.add_argument("--tune", default="film", help="x264 tune option (default: film)")
+    parser.add_argument("--sar", default="32:27", help="Storage aspect ratio (default: 32:27 for NTSC anamorphic)")
+    parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
+
+    args = parser.parse_args()
+
+    raw_input = os.path.abspath(args.input)
+    output_path = os.path.abspath(args.output)
+    is_single_file = output_path.lower().endswith((".tdvd", ".tinydvd"))
+
+    print("convert-to-tinydvd")
+    print(f"Input:  {raw_input}")
+    print(f"Output: {output_path}")
+
+    if is_single_file:
+        if is_already_converted_dir(raw_input):
+            package_tdvd_archive(raw_input, output_path)
+        else:
+            parent_dir = os.path.dirname(output_path) or "."
+            os.makedirs(parent_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
+                run_conversion_to_dir(raw_input, stage_dir, args)
+                package_tdvd_archive(stage_dir, output_path)
+    else:
+        run_conversion_to_dir(raw_input, output_path, args)
+
+    print("\nConversion completed successfully!")
 
 
 if __name__ == "__main__":

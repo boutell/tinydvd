@@ -5,6 +5,7 @@
 Unlike standard rippers that throw away menus or split a disc into dozens of disconnected files, **tinydvd** keeps everything that makes a DVD a DVD:
 - **Full Interactive DVD Menus:** Root menus, animated transitions, scene selection, language/audio setup, and bonus feature navigation work just like a real DVD player.
 - **Massive Space Savings:** Replaces bulky 1990s MPEG-2 video streams with modern H.264 video in `.mkv` containers, while collapsing the DVD navigation/subtitle stream into tiny `.mvob` ("Meta-VOB") files (~99% smaller than original `.VOB`s).
+- **Single-File `.tdvd` Format:** Packages the entire converted disc into a single `.tdvd` (or `.tinydvd`) file with instant, zero-copy random access—ideal for double-clicking in file managers.
 - **Closed Captions, Subtitles & Multi-Track Audio:** Preserves original DVD Closed Captions (SDH), multi-language subtitles, and multiple audio tracks with instant toggling during playback.
 - **Modern Player Controls:** Navigate menus with keyboard or mouse, jump around the clip timeline (`-10s`/`+10s`, `-60s`/`+60s`, `0%`–`90%`), and step through chapters with On-Screen Display (OSD) feedback.
 
@@ -78,33 +79,36 @@ dvdbackup -M -i /dev/rdisk4 -o ./rips
 dvdbackup -M -i /dev/sr0 -o ./rips
 ```
 
-### Step 2: Transcode to a Compact `tinydvd` Folder
+### Step 2: Convert with `convert-to-tinydvd`
 
-Run [`scripts/dvd-hybrid-transcode.py`](file:///Users/boutell/boutell/tinydvd/scripts/dvd-hybrid-transcode.py) on your ripped DVD folder or `.iso` image:
-
-```bash
-./scripts/dvd-hybrid-transcode.py ./rips/MY_MOVIE ./tinydvds/MY_MOVIE
-```
-
-You can also pass an `.iso` file directly or customize quality settings:
+Run [`scripts/convert-to-tinydvd`](file:///Users/boutell/boutell/tinydvd/scripts/convert-to-tinydvd.py) on your ripped DVD folder or `.iso` image to produce a single `.tdvd` file (or an unpacked folder):
 
 ```bash
-# From an unencrypted ISO image:
-./scripts/dvd-hybrid-transcode.py /path/to/movie.iso ./tinydvds/MY_MOVIE
+# Produce a single-file .tdvd archive:
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd
+
+# Or from an unencrypted ISO image:
+./scripts/convert-to-tinydvd /path/to/movie.iso ./tinydvds/MY_MOVIE.tdvd
+
+# Or package an already-converted tinydvd directory into a single .tdvd file without re-encoding:
+./scripts/convert-to-tinydvd ./tinydvds/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd
 
 # Custom H.264 CRF quality and preset:
-./scripts/dvd-hybrid-transcode.py ./rips/MY_MOVIE ./tinydvds/MY_MOVIE --crf 18 --preset slow
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd --crf 18 --preset slow
 ```
 
 ### Step 3: Play with `tinydvd`
 
-Launch the player pointing to your transcoded folder:
+Launch the player pointing to your `.tdvd` file (or converted directory), or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager:
 
 ```bash
-./build/tinydvd ./tinydvds/MY_MOVIE
+./build/tinydvd ./tinydvds/MY_MOVIE.tdvd
 
 # Or start directly in fullscreen:
-./build/tinydvd --fullscreen ./tinydvds/MY_MOVIE
+./build/tinydvd --fullscreen ./tinydvds/MY_MOVIE.tdvd
+
+# Unpacked tinydvd directories are also supported:
+./build/tinydvd ./tinydvds/MY_MOVIE
 ```
 
 ### Player Controls
@@ -151,6 +155,11 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Replaces `libdvdnav`'s rigid optical sector reader with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots) and compact `.mvob` indexer built on `libdvdread` (`ifoOpen`, `navRead_PCI`, `navRead_DSI`).
    - Tracks expected presentation timestamps across VOBUs: when consecutive VOBUs have contiguous timestamps, `libmpv` ([`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c)) continues playing smoothly without issuing redundant seeks.
    - Composites 2-bit RLE DVD subpictures and menu button highlights over the `libmpv` OpenGL video frame via [`src/spu_compositor.c`](file:///Users/boutell/boutell/tinydvd/src/spu_compositor.c), including timed DCSQ `STP_DSP` expiration for movie Closed Captions and subtitles.
+
+4. **Single-File `.tdvd` / `.tinydvd` Container ([`src/tdvd_archive.c`](file:///Users/boutell/boutell/tinydvd/src/tdvd_archive.c)):**
+   - Uses a standard uncompressed ZIP (`ZIP_STORED`, with automatic `ZIP64` support for files > 4 GB) so the Central Directory at the end of the file provides $O(1)$ lookup of every constituent `.IFO`, `.mvob`, and `.mkv` file's contiguous `[offset, size)` byte range.
+   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows both `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c) using `pread`) to be streamed and seeked **directly in-place from the `.tdvd` file without unpacking video to `/tmp`**.
+   - Any `.tdvd` file can also be inspected with standard tools (`unzip -l MY_MOVIE.tdvd`).
 
 ### Binary Descriptor (`mvob_video_ref_t`)
 

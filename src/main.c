@@ -40,8 +40,8 @@ static void on_mpv_update_cb(void *user_data) {
 
 static void print_usage(const char *prog) {
     printf("tinydvd Player v%s\n", TINYDVD_VERSION);
-    printf("Interactive DVD-Video Hybrid Player (H.264 + Meta-VOB)\n\n");
-    printf("Usage: %s [options] <dvd_directory_or_iso>\n\n", prog);
+    printf("Interactive DVD-Video Hybrid Player (.tdvd / H.264 + Meta-VOB)\n\n");
+    printf("Usage: %s [options] <movie.tdvd | tinydvd_directory>\n\n", prog);
     printf("Options:\n");
     printf("  -f, --fullscreen     Start in fullscreen mode\n");
     printf("  -h, --help           Show this help text\n");
