@@ -34,6 +34,7 @@ typedef enum {
     ACT_MOUSE_MOVE,
     ACT_MOUSE_CLICK,
     ACT_MENU,
+    ACT_ESCAPE,
     ACT_TOGGLE_PAUSE,
     ACT_SEEK_REL,
     ACT_SEEK_FRAC,
@@ -1275,6 +1276,40 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
         return true;
     }
 
+    if (act == ACT_ESCAPE) {
+        if (b->domain == DVD_DOMAIN_VTSTT) {
+            int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
+            vm_save_resume_state(b, b->cell_nr);
+            int pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
+            pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
+            if (!menu_pgc || (menu_pgc->nr_of_cells == 0 && lookup_pgc(b, DVD_DOMAIN_VMGM, 0, 1) != NULL)) {
+                vm_enter_pgc(b, DVD_DOMAIN_VMGM, 0, 1, 1);
+            } else {
+                vm_enter_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn, 1);
+            }
+            return true;
+        } else if (b->domain == DVD_DOMAIN_VTSM) {
+            int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
+            int root_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
+            if (b->current_pgc && b->current_pgc->goup_pgc_nr > 0 &&
+                b->current_pgc->goup_pgc_nr != b->pgc_nr) {
+                vm_enter_pgc(b, DVD_DOMAIN_VTSM, target_vts, b->current_pgc->goup_pgc_nr, 1);
+                return true;
+            } else if (b->pgc_nr != root_pgcn) {
+                vm_enter_pgc(b, DVD_DOMAIN_VTSM, target_vts, root_pgcn, 1);
+                return true;
+            } else {
+                b->domain = DVD_DOMAIN_EXIT;
+                b->running = false;
+                return true;
+            }
+        } else {
+            b->domain = DVD_DOMAIN_EXIT;
+            b->running = false;
+            return true;
+        }
+    }
+
     if (act == ACT_CYCLE_SUBS) {
         vm_cycle_subtitles(b);
         return false;
@@ -1809,6 +1844,45 @@ void dvd_vm_bridge_left_button(dvd_vm_bridge_t *b)               { queue_action(
 void dvd_vm_bridge_right_button(dvd_vm_bridge_t *b)              { queue_action(b, ACT_RIGHT, 0, 0); }
 void dvd_vm_bridge_activate_button(dvd_vm_bridge_t *b)           { queue_action(b, ACT_ACTIVATE, 0, 0); }
 void dvd_vm_bridge_menu(dvd_vm_bridge_t *b)                      { queue_action(b, ACT_MENU, 0, 0); }
+
+bool dvd_vm_bridge_escape(dvd_vm_bridge_t *b) {
+    if (!b || !b->running) return false;
+
+    pthread_mutex_lock(&b->lock);
+
+    /* If playing a movie or title clip, Esc always takes you up to the Root Menu */
+    if (b->domain == DVD_DOMAIN_VTSTT) {
+        b->pending_action = ACT_ESCAPE;
+        pthread_mutex_unlock(&b->lock);
+        return true;
+    }
+
+    /* If inside a Video Title Set Menu, check if we can go up a menu level */
+    if (b->domain == DVD_DOMAIN_VTSM) {
+        int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
+        int root_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
+
+        /* Case A: Menu PGC defines an explicit parent GoUp menu */
+        if (b->current_pgc && b->current_pgc->goup_pgc_nr > 0 &&
+            b->current_pgc->goup_pgc_nr != b->pgc_nr) {
+            b->pending_action = ACT_ESCAPE;
+            pthread_mutex_unlock(&b->lock);
+            return true;
+        }
+
+        /* Case B: Inside a sub-menu (Scene selection, audio, languages, etc.) and not root */
+        if (b->pgc_nr != root_pgcn) {
+            b->pending_action = ACT_ESCAPE;
+            pthread_mutex_unlock(&b->lock);
+            return true;
+        }
+    }
+
+    /* Already at the top-level Root Menu or Title Menu: cannot navigate up any further */
+    pthread_mutex_unlock(&b->lock);
+    return false;
+}
+
 void dvd_vm_bridge_toggle_pause(dvd_vm_bridge_t *b)              { queue_action(b, ACT_TOGGLE_PAUSE, 0, 0); }
 void dvd_vm_bridge_seek_relative(dvd_vm_bridge_t *b, int delta_seconds) {
     queue_action(b, ACT_SEEK_REL, delta_seconds, 0);

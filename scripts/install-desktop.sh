@@ -131,7 +131,7 @@ fi
 echo "Installing desktop entry to ${APP_DIR}..."
 # Set exact binary path in Exec and TryExec so GNOME desktop can always locate
 # tinydvd even if ~/.local/bin is not in the GUI session's PATH.
-sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd %f|" \
+sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd -f %f|" \
     "${ROOT_DIR}/data/tinydvd.desktop" > "${APP_DIR}/tinydvd.desktop"
 if ! grep -q "^TryExec=" "${APP_DIR}/tinydvd.desktop"; then
     sed -i -e "/^Exec=/i TryExec=${BIN_DIR}/tinydvd" "${APP_DIR}/tinydvd.desktop" 2>/dev/null || \

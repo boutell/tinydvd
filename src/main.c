@@ -59,7 +59,8 @@ static void print_usage(const char *prog) {
     printf("  C / S                Cycle Closed Captions / Subtitles (Track 1..N, Off)\n");
     printf("  A                    Cycle Audio tracks\n");
     printf("  Space (in film)      Toggle pause\n");
-    printf("  M / Escape           Jump to DVD Root Menu\n");
+    printf("  M                    Jump to DVD Root Menu\n");
+    printf("  Escape               Go up a menu level (or exit if at root menu)\n");
     printf("  F                    Toggle fullscreen\n");
     printf("  Q                    Quit\n");
 }
@@ -248,8 +249,12 @@ int main(int argc, char *argv[]) {
                             dvd_vm_bridge_toggle_pause(bridge);
                             break;
                         case SDLK_m:
-                        case SDLK_ESCAPE:
                             dvd_vm_bridge_menu(bridge);
+                            break;
+                        case SDLK_ESCAPE:
+                            if (!dvd_vm_bridge_escape(bridge)) {
+                                running = false;
+                            }
                             break;
                         case SDLK_f:
                             is_fullscreen = !is_fullscreen;

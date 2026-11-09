@@ -48,6 +48,12 @@ void dvd_vm_bridge_activate_button(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_menu(dvd_vm_bridge_t *bridge);
 
 /**
+ * Handle Escape key: returns up a menu level if possible.
+ * Returns true if navigated up a menu level; returns false if already at top menu level (meaning exit).
+ */
+bool dvd_vm_bridge_escape(dvd_vm_bridge_t *bridge);
+
+/**
  * Timeline navigation, pause, and Closed Caption / Subtitle / Audio track controls.
  */
 void dvd_vm_bridge_toggle_pause(dvd_vm_bridge_t *bridge);

@@ -151,7 +151,8 @@ sudo ./scripts/install-desktop.sh --uninstall
 | **`C`** or **`S`** | Toggle / cycle **Closed Captions & Subtitles** (`Off` → `Track 1 [CC/SDH]` → `Track 2` → … → `Off`) |
 | **`A`** | Cycle **Audio** tracks (`Track 1` → `Track 2` → …) |
 | **Space** *(in Clip)* | Toggle playback pause |
-| **M** / **Escape** | Return to DVD Root Menu |
+| **M** | Return to DVD Root Menu |
+| **Escape** | Go up a menu level (or exit if at root menu) |
 | **F** | Toggle Fullscreen |
 | **Q** / **Ctrl-C** | Quit |
 
