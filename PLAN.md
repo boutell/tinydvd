@@ -1,9 +1,11 @@
-# TASK SPEC: dvd-hybrid (DVD-AVC) Player & Transcoder
+# TASK SPEC: tinydvd Player & Transcoder
 
 ## 1. System Objective
 Build a cross-platform desktop application and accompanying CLI authoring tool that preserves full interactive DVD-Video functionality (menus, button overlays, multi-angle branching, audio/subtitle selection) while replacing high-bitrate MPEG-2 video payloads with hardware-accelerated H.264/AVC streams stored in Matroska (`.mkv`) files.
 
-Target Platforms: Linux (Debian/X11/Wayland), macOS (Metal), Windows (Direct3D 11).
+Long-Term Target Platforms: Linux (Debian/X11/Wayland), macOS (Metal), Windows (Direct3D 11).
+
+Initial Target Platform: Linux (Debian 13, Wayland). That is what you must build for today.
 
 ---
 
