@@ -34,7 +34,7 @@ brew install cmake pkg-config libdvdnav libdvdread libdvdcss dvdbackup mpv sdl2 
 sudo apt-get update
 sudo apt-get install -y \
     build-essential cmake pkg-config \
-    libdvdnav-dev libdvdread-dev libdvd-pkg dvdbackup \
+    libdvdnav-dev libdvdread-dev dvdbackup \
     libmpv-dev libsdl2-dev libgl1-mesa-dev \
     ffmpeg python3 python3-pip
 ```
@@ -109,6 +109,30 @@ Launch the player pointing to your `.tdvd` file (or converted directory), or map
 
 # Unpacked tinydvd directories are also supported:
 ./build/tinydvd ./tinydvds/MY_MOVIE
+```
+
+### GNOME / Linux Desktop Integration (`.tdvd` File Association)
+
+To install `tinydvd` into your GNOME desktop environment so `.tdvd` and `.tinydvd` files display custom disc icons and open automatically when double-clicked in GNOME Files (Nautilus):
+
+```bash
+# System-wide installation (installs to /usr/local/bin and /usr/local/share):
+sudo ./scripts/install-desktop.sh
+
+# Or install for your user account only (no sudo required, installs to ~/.local):
+./scripts/install-desktop.sh --user
+```
+
+This script:
+1. Installs the `tinydvd` player binary and `convert-to-tinydvd` CLI into your `PATH`.
+2. Registers the `tinydvd.desktop` application launcher in GNOME's application menu.
+3. Installs the FreeDesktop MIME database package for `*.tdvd` and `*.tinydvd` (`video/x-tinydvd`).
+4. Installs the vector application and file icons in `hicolor/scalable`.
+5. Updates `mime-database`, `desktop-database`, and `gtk-update-icon-cache`, setting `tinydvd` as the default double-click handler for `.tdvd` files via `xdg-mime`.
+
+To remove the desktop integration later:
+```bash
+sudo ./scripts/install-desktop.sh --uninstall
 ```
 
 ### Player Controls

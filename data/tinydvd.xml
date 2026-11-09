@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="video/x-tinydvd">
+    <comment>tinydvd Video Package</comment>
+    <comment xml:lang="en">tinydvd Video Package</comment>
+    <generic-icon name="video-x-generic"/>
+    <glob pattern="*.tdvd" weight="60"/>
+    <glob pattern="*.tinydvd" weight="60"/>
+    <glob pattern="*.TDVD" weight="60"/>
+    <glob pattern="*.TINYDVD" weight="60"/>
+    <alias type="application/x-tdvd"/>
+    <alias type="application/x-tinydvd"/>
+  </mime-type>
+</mime-info>

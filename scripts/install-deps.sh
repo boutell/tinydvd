@@ -31,7 +31,7 @@ case "$OS" in
         echo "Detected operating system: Linux"
         if [ -f /etc/debian_version ]; then
             echo "Detected Debian/Ubuntu-based distribution."
-            echo "Running apt-get update and installing packages (may require sudo)..."
+            echo "Refreshing apt package lists and installing packages (may require sudo)..."
             SUDO=""
             if [ "$(id -u)" -ne 0 ]; then
                 SUDO="sudo"
@@ -43,7 +43,6 @@ case "$OS" in
                 pkg-config \
                 libdvdnav-dev \
                 libdvdread-dev \
-                libdvd-pkg \
                 dvdbackup \
                 libmpv-dev \
                 libsdl2-dev \
@@ -51,8 +50,12 @@ case "$OS" in
                 ffmpeg \
                 python3 \
                 python3-pip
-            echo "Configuring libdvd-pkg to build and install libdvdcss..."
-            $SUDO dpkg-reconfigure -f noninteractive libdvd-pkg || true
+            if $SUDO apt-get install -y libdvd-pkg 2>/dev/null; then
+                echo "Configuring libdvd-pkg to build and install libdvdcss..."
+                $SUDO dpkg-reconfigure -f noninteractive libdvd-pkg || true
+            else
+                echo "Note: 'libdvd-pkg' not found (requires Debian 'contrib' repo); skipping optional CSS package."
+            fi
         elif [ -f /etc/fedora-release ] || [ -f /etc/redhat-release ]; then
             echo "Detected Fedora/RHEL-based distribution."
             SUDO=""

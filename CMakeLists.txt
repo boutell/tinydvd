@@ -85,3 +85,32 @@ add_executable(test_dvd_vm tests/test_dvd_vm.c src/dvd_vm_bridge.c src/tdvd_arch
 target_include_directories(test_dvd_vm PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
 target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads)
 target_link_directories(test_dvd_vm PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
+
+# Installation rules for Linux / GNOME desktop integration
+include(GNUInstallDirs)
+
+install(TARGETS tinydvd
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(PROGRAMS scripts/convert-to-tinydvd.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME convert-to-tinydvd
+)
+
+install(FILES data/tinydvd.desktop
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
+)
+
+install(FILES data/tinydvd.xml
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages
+)
+
+install(FILES data/icons/tinydvd.svg
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
+)
+
+install(FILES data/icons/tinydvd.svg
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/mimetypes
+    RENAME video-x-tinydvd.svg
+)

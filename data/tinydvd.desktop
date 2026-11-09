@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=tinydvd
+GenericName=DVD-Video Player
+Comment=Interactive DVD-Video Hybrid Player
+Exec=tinydvd %f
+Icon=tinydvd
+Terminal=false
+Categories=AudioVideo;Video;Player;
+MimeType=video/x-tinydvd;application/x-tdvd;application/x-tinydvd;
+Keywords=DVD;Video;Player;tinydvd;tdvd;
+StartupNotify=true
