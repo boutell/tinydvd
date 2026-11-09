@@ -12,17 +12,14 @@ Initial Target Platform: Linux (Debian 13, Wayland). That is what you must build
 ## 2. Architecture & File Format Specs
 
 ### 2.1 File Separation
-Each DVD title set is decomposed into two paired assets:
-1. `VTS_xx_0.mvob` / `VTS_xx_1.mvob` ("Meta-VOB"):
-   - Strict 2048-byte sector geometry matching original optical layout.
-   - Intact Navigation Packs (`NV_PCK` with PCI button tables and DSI sector search trees).
-   - Intact Subpicture (`SPU`) 2-bit RLE bitmap packs.
-   - Intact Audio packs (`AC-3` / `DTS`).
-   - Video packs (`0x000001E0`) stripped of MPEG-2 data and substituted with `mvob_video_ref_t` descriptor padded to 2048 bytes with zeroes.
-2. `VTS_xx_VIDEO.mkv`:
-   - Pure video stream encoded with `libx264`.
-   - CRF 18, Preset Slow, Tune Film (or Animation).
-   - Enforced IDR keyframes matching every legacy VOBU start timestamp.
+Each DVD title set and menu domain is decomposed into two paired assets:
+1. `VIDEO_TS.mvob` / `VTS_xx_0.mvob` / `VTS_xx_1..N.mvob` ("Compact Meta-VOB"):
+   - Preserves 2048-byte Navigation Packs (`NV_PCK` with PCI button tables and DSI sector metadata).
+   - Preserves Subpicture (`SPU`) 2-bit RLE bitmap packs.
+   - Collapses all video packs (`0x000001E0`) of each VOBU into a **single** 2048-byte sector containing the `mvob_video_ref_t` pointer descriptor (reducing `.mvob` size by ~98.8% instead of padding every original video sector with zeroes).
+2. `VIDEO_TS_VIDEO.mkv` / `VTS_xx_0_VIDEO.mkv` / `VTS_xx_VIDEO.mkv`:
+   - Video stream encoded with `libx264` (`-crf 18 -preset slow -tune film`) + multi-track stereo AAC audio (`-c:a aac -b:a 192k`).
+   - Preserves still-frame menu timelines (`tpad`) and continuous multi-VOB title timelines (`concat:` protocol).
    - Storage aspect ratio preserved at 720x480 (SAR 32:27 or 8:9) to match SPU pixel coordinates 1:1.
 
 ### 2.2 Binary Descriptor (`mvob_video_ref_t`)
@@ -87,23 +84,19 @@ dvd-hybrid/
      -sar 32:27 \
      VTS_01_VIDEO.mkv
    ```
-5. Emit `VTS_xx_*.mvob`:
-   - Iterate through original sectors.
-   - Copy `0x000001BA` pack headers, `NV_PCK`, audio, and subpicture sectors verbatim.
-   - For video stream sectors (`0x000001E0`), write `mvob_video_ref_t` and pad the remaining bytes to 2048 with `0x00`.
+5. Emit Compact `VTS_xx_*.mvob` and `VIDEO_TS.mvob`:
+   - Iterate through original VOBUs.
+   - Copy `NV_PCK` and `SPU` subpicture sectors verbatim.
+   - Collapse all video sectors in each VOBU into a single 2048-byte `mvob_video_ref_t` pointer sector (and omit redundant raw audio sectors that are muxed into the companion `.mkv`).
 
-### Step 2: libdvdnav State Machine Bridge (`src/dvd_vm_bridge.c`)
-1. Initialize `dvdnav_open()` pointing to the `.mvob` + `.IFO` directory.
-2. Run event pump on dedicated background thread:
-   - Handle `DVDNAV_BLOCK_OK`:
-     - Inspect sector stream ID.
-     - If video (`0xE0`), decode `mvob_video_ref_t`.
-     - Check if `pts_nanos` represents sequential playback. If discontinuous, call `mpv_controller_seek_exact(pts_nanos)`.
-   - Handle `DVDNAV_HOP_CHANNEL` / `DVDNAV_VTS_CHANGE`:
-     - Switch active MKV target in `mpv_controller`.
-   - Handle `DVDNAV_HIGHLIGHT`:
-     - Extract active button rect `(X1, Y1, X2, Y2)`.
-     - Pass coordinates to `spu_compositor`.
+### Step 2: Custom DVD Virtual Machine & Compact `.mvob` Navigator (`src/dvd_vm_bridge.c`)
+1. Open `.IFO` tables using `libdvdread` (`DVDOpen`, `ifoOpen`).
+2. Implement the 8-byte DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume state).
+3. Index compact `.mvob` files per domain (`VMGM`, `VTSM`, `VTSTT`), mapping original DVD sector LBNs and `(VOB_ID, C_ID)` cells to compact `.mvob` file offsets and `mvob_video_ref_t` timestamps.
+4. During VOBU playback:
+   - Parse `NV_PCK` PCI/DSI via `navRead_PCI` and update active menu button highlights.
+   - Feed `SPU` sectors to `spu_compositor`.
+   - Check if `pts_nanos` is consecutive with `expected_next_pts_nanos` (within 250ms). When consecutive, allow `mpv` to play continuously without seeking; when discontinuous, call `mpv_controller_seek_exact(pts_nanos)`.
 
 ### Step 3: Media Decoder & Renderer (`src/mpv_controller.c`)
 1. Instantiate `mpv_handle` and configure options:
