@@ -141,7 +141,7 @@ sudo ./scripts/install-desktop.sh --uninstall
 | --- | --- |
 | **Arrow Keys** (`↑` `↓` `←` `→`) *(in Menu)* | Navigate interactive DVD menu buttons |
 | **Enter** / **Space** *(in Menu)* | Activate ("click") highlighted menu button |
-| **Mouse Move / Left Click** | Hover and click DVD menu buttons directly |
+| **Mouse Move / Left Click** | Hover and click DVD menu buttons directly (the cursor hides after 2 seconds without mouse activity) |
 | **Left / Right Arrow** (`←` `→`) *(in Clip)* | Seek **-10s / +10s** along the clip timeline |
 | **Shift + Left / Right** (`⇧←` `⇧→`) | Seek **-60s / +60s** (-1 min / +1 min) along the clip timeline |
 | **Down / Up Arrow** (`↓` `↑`) *(in Clip)* | Seek **-60s / +60s** (-1 min / +1 min) along the clip timeline |

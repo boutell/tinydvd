@@ -17,6 +17,8 @@
 
 #define TINYDVD_VERSION "1.0.0"
 #define WAKEUP_EVENT (SDL_USEREVENT + 1)
+/* Hide the mouse cursor after this long without mouse activity, like most video players */
+#define CURSOR_IDLE_MS 2000
 
 static volatile sig_atomic_t g_quit_requested = 0;
 
@@ -172,10 +174,20 @@ int main(int argc, char *argv[]) {
 
     bool running = true;
     bool is_fullscreen = start_fullscreen;
+    bool cursor_visible = true;
+    Uint32 last_mouse_activity = SDL_GetTicks();
 
     while (running && !g_quit_requested && dvd_vm_bridge_is_running(bridge)) {
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_MOUSEMOTION || ev.type == SDL_MOUSEBUTTONDOWN ||
+                ev.type == SDL_MOUSEBUTTONUP || ev.type == SDL_MOUSEWHEEL) {
+                last_mouse_activity = SDL_GetTicks();
+                if (!cursor_visible) {
+                    SDL_ShowCursor(SDL_ENABLE);
+                    cursor_visible = true;
+                }
+            }
             switch (ev.type) {
                 case SDL_QUIT:
                     running = false;
@@ -312,6 +324,11 @@ int main(int argc, char *argv[]) {
                 default:
                     break;
             }
+        }
+
+        if (cursor_visible && SDL_GetTicks() - last_mouse_activity >= CURSOR_IDLE_MS) {
+            SDL_ShowCursor(SDL_DISABLE);
+            cursor_visible = false;
         }
 
         mpv_controller_poll_events(mpv);
