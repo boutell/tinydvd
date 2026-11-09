@@ -167,5 +167,3 @@ echo ""
 echo "Installation complete!"
 echo "Files ending in .tdvd and .tinydvd are now mapped to tinydvd in GNOME / Nautilus."
 echo "You can now double-click any .tdvd movie in GNOME Files to launch tinydvd."
-EOF
-chmod +x scripts/install-desktop.sh
