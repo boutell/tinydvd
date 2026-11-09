@@ -129,7 +129,17 @@ fi
 
 # 4. Install Desktop entry and MIME package
 echo "Installing desktop entry to ${APP_DIR}..."
-install -m 644 "${ROOT_DIR}/data/tinydvd.desktop" "${APP_DIR}/tinydvd.desktop"
+# Set exact binary path in Exec and TryExec so GNOME desktop can always locate
+# tinydvd even if ~/.local/bin is not in the GUI session's PATH.
+sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd %f|" \
+    "${ROOT_DIR}/data/tinydvd.desktop" > "${APP_DIR}/tinydvd.desktop"
+if ! grep -q "^TryExec=" "${APP_DIR}/tinydvd.desktop"; then
+    sed -i -e "/^Exec=/i TryExec=${BIN_DIR}/tinydvd" "${APP_DIR}/tinydvd.desktop" 2>/dev/null || \
+    sed -i "" -e "/^Exec=/i\\
+TryExec=${BIN_DIR}/tinydvd
+" "${APP_DIR}/tinydvd.desktop"
+fi
+chmod 644 "${APP_DIR}/tinydvd.desktop"
 
 echo "Installing MIME package to ${MIME_DIR}..."
 install -m 644 "${ROOT_DIR}/data/tinydvd.xml" "${MIME_DIR}/tinydvd.xml"
@@ -155,12 +165,71 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
     gtk-update-icon-cache -f -q -t "${PREFIX}/share/icons/hicolor" || true
 fi
 
-# 7. Set default handler for .tdvd MIME types
+# 7. Set default handler for .tdvd MIME types in mimeapps.list and xdg-mime
+echo "Registering tinydvd as default player for .tdvd / .tinydvd..."
+
+update_mimeapps_file() {
+    local target="$1"
+    mkdir -p "$(dirname "$target")"
+    touch "$target"
+    python3 - "$target" << 'PYEOF'
+import sys, configparser, os
+
+path = sys.argv[1]
+cp = configparser.ConfigParser(interpolation=None)
+cp.optionxform = str
+if os.path.exists(path):
+    try:
+        cp.read(path)
+    except Exception:
+        pass
+
+for section in ["Default Applications", "Added Associations"]:
+    if not cp.has_section(section):
+        cp.add_section(section)
+
+mimes = ["video/x-tinydvd", "application/x-tdvd", "application/x-tinydvd"]
+
+for m in mimes:
+    cp.set("Default Applications", m, "tinydvd.desktop")
+    curr = cp.get("Added Associations", m, fallback="")
+    items = [x for x in curr.split(";") if x]
+    if "tinydvd.desktop" not in items:
+        items.insert(0, "tinydvd.desktop")
+    cp.set("Added Associations", m, ";".join(items) + ";")
+
+with open(path, "w") as f:
+    cp.write(f)
+PYEOF
+}
+
+# Update applications mimeapps.list
+update_mimeapps_file "${APP_DIR}/mimeapps.list"
+
+# Update user-specific mimeapps.list
+if [[ "$USER_MODE" -eq 1 ]] || [[ "$PREFIX" == "${HOME}/.local" ]]; then
+    update_mimeapps_file "${HOME}/.config/mimeapps.list"
+fi
+
+# If run via sudo, also configure the calling user's ~/.config/mimeapps.list and /etc/xdg
+if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
+    USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6 || echo "")"
+    if [[ -n "$USER_HOME" ]] && [[ -d "$USER_HOME" ]]; then
+        update_mimeapps_file "${USER_HOME}/.config/mimeapps.list"
+        chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "${USER_HOME}/.config/mimeapps.list" || true
+    fi
+    if [[ -d "/etc/xdg" ]]; then
+        update_mimeapps_file "/etc/xdg/mimeapps.list" || true
+    fi
+fi
+
 if command -v xdg-mime >/dev/null 2>&1; then
-    echo "Registering tinydvd as default player for .tdvd / .tinydvd..."
     xdg-mime default tinydvd.desktop video/x-tinydvd || true
     xdg-mime default tinydvd.desktop application/x-tdvd || true
     xdg-mime default tinydvd.desktop application/x-tinydvd || true
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "$SUDO_USER" != "root" ]]; then
+        su - "$SUDO_USER" -c "xdg-mime default tinydvd.desktop video/x-tinydvd" 2>/dev/null || true
+    fi
 fi
 
 echo ""

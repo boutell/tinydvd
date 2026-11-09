@@ -6,8 +6,10 @@
     <generic-icon name="video-x-generic"/>
     <glob pattern="*.tdvd" weight="60"/>
     <glob pattern="*.tinydvd" weight="60"/>
+    <glob pattern="*.tvd" weight="60"/>
     <glob pattern="*.TDVD" weight="60"/>
     <glob pattern="*.TINYDVD" weight="60"/>
+    <glob pattern="*.TVD" weight="60"/>
     <alias type="application/x-tdvd"/>
     <alias type="application/x-tinydvd"/>
   </mime-type>
