@@ -723,29 +723,22 @@ def is_already_converted_dir(path):
 
 
 def ensure_thumbnail_in_staging(staging_dir):
-    """Ensure a high-quality poster/menu thumbnail.png exists in staging directory."""
+    """Ensure a thumbnail.png exists in the staging directory, picked the same
+    way the Nautilus thumbnailer picks one (see tinydvd-thumbnailer)."""
     thumb_path = os.path.join(staging_dir, "thumbnail.png")
     if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
         return
-    files = [f for f in os.listdir(staging_dir) if f.lower().endswith(".mkv")]
-    if not files:
+    here = os.path.dirname(os.path.realpath(__file__))
+    thumbnailer = next((os.path.join(here, n) for n in ("tinydvd-thumbnailer.py", "tinydvd-thumbnailer")
+                        if os.path.isfile(os.path.join(here, n))), None)
+    if not thumbnailer:
+        print("[package] tinydvd-thumbnailer not found; skipping thumbnail.png")
         return
-    # Prefer menu video with content (> 100KB), else main title video
-    menus = [f for f in files if ("_0_video.mkv" in f.lower() or "video_ts_video.mkv" in f.lower())
-             and os.path.getsize(os.path.join(staging_dir, f)) > 100000]
-    target_mkv = os.path.join(staging_dir, menus[0] if menus else files[0])
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-ss", "00:00:02",
-        "-i", target_mkv,
-        "-vframes", "1",
-        "-q:v", "2",
-        thumb_path
-    ]
-    try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+    cmd = [sys.executable, thumbnailer, "--frame-only", "-s", "0", staging_dir, thumb_path]
+    if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
+        print("[package] Couldn't pick a thumbnail frame; skipping thumbnail.png")
+        if os.path.exists(thumb_path):
+            os.unlink(thumb_path)
 
 
 def package_tdvd_archive(staging_dir, output_archive_path):

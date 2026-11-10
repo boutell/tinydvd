@@ -113,7 +113,9 @@ Launch the player pointing to your `.tdvd` file (or converted directory), or map
 
 ### Thumbnails & Cover Art (`tinydvd-set-thumbnail`)
 
-While new `.tdvd` files automatically include a menu frame thumbnail during conversion, you can embed or update thumbnails in existing `.tdvd` archives at any time without re-encoding or copying video data:
+New `.tdvd` files get a thumbnail during conversion. It's a frame from the disc's main menu: the menu video of the title set that holds the main feature. If there's no such menu, it's a frame 30 seconds into the main feature, past any fade-in. The disc-level menu video is skipped, because it usually holds the copyright warnings.
+
+You can embed or update thumbnails in existing `.tdvd` archives at any time, without re-encoding or copying video data:
 
 ```bash
 # Automatically extract and embed a menu/movie frame in an existing .tdvd:
@@ -130,6 +132,9 @@ While new `.tdvd` files automatically include a menu frame thumbnail during conv
 
 # Overwrite existing thumbnails with --force:
 ./scripts/tinydvd-set-thumbnail --force ./tinydvds/MY_MOVIE.tdvd
+
+# Use a frame 10 minutes into the main feature instead:
+./scripts/tinydvd-set-thumbnail --force --time 00:10:00 ./tinydvds/MY_MOVIE.tdvd
 ```
 
 ### GNOME / Linux Desktop Integration (`.tdvd` File Association)
