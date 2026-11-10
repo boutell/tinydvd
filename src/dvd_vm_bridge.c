@@ -197,9 +197,26 @@ static int find_menu_pgc_by_entry_id(dvd_vm_bridge_t *b, dvd_domain_t dom, int v
     return 1;
 }
 
+/* Frame height of the current domain's video, from its IFO video attributes:
+ * 576 for PAL, 480 for NTSC */
+static int domain_frame_height(dvd_vm_bridge_t *b) {
+    video_attr_t *attr = NULL;
+    if (b->domain == DVD_DOMAIN_VTSM || b->domain == DVD_DOMAIN_VTSTT) {
+        ifo_handle_t *vtsi = get_vtsi(b, b->vts_nr);
+        if (vtsi && vtsi->vtsi_mat) {
+            attr = (b->domain == DVD_DOMAIN_VTSM) ? &vtsi->vtsi_mat->vtsm_video_attr
+                                                  : &vtsi->vtsi_mat->vts_video_attr;
+        }
+    } else if (b->vmgi && b->vmgi->vmgi_mat) {
+        attr = &b->vmgi->vmgi_mat->vmgm_video_attr;
+    }
+    return (attr && attr->video_format == 1) ? SPU_PAL_HEIGHT : SPU_HEIGHT;
+}
+
 static void apply_pgc_clut_and_streams(dvd_vm_bridge_t *b, pgc_t *pgc) {
     if (!b || !pgc) return;
     if (b->spu) {
+        spu_compositor_set_frame_height(b->spu, domain_frame_height(b));
         uint32_t clut[16];
         for (int i = 0; i < 16; i++) {
             clut[i] = pgc->palette[i];

@@ -92,6 +92,8 @@ struct mpv_controller {
     atomic_uint_least64_t cached_pts_nanos;
     atomic_int_least64_t pending_seek_nanos;
     atomic_int pending_aid;
+    /* Display aspect of the current video (width / height) x 10000, 0 if unknown */
+    atomic_int display_aspect_e4;
 };
 
 static void on_mpv_render_update_internal(void *ctx) {
@@ -136,6 +138,7 @@ mpv_controller_t *mpv_controller_init(void *(*get_proc_address)(void *, const ch
     atomic_init(&ctrl->cached_pts_nanos, 0);
     atomic_init(&ctrl->pending_seek_nanos, -1);
     atomic_init(&ctrl->pending_aid, 1);
+    atomic_init(&ctrl->display_aspect_e4, 0);
 
     ctrl->mpv = mpv_create();
     if (!ctrl->mpv) {
@@ -163,6 +166,7 @@ mpv_controller_t *mpv_controller_init(void *(*get_proc_address)(void *, const ch
     /* Observe time-pos and pause asynchronously so background VM thread never blocks on mpv */
     mpv_observe_property(ctrl->mpv, 1, "time-pos", MPV_FORMAT_DOUBLE);
     mpv_observe_property(ctrl->mpv, 2, "pause", MPV_FORMAT_FLAG);
+    mpv_observe_property(ctrl->mpv, 3, "video-params/aspect", MPV_FORMAT_DOUBLE);
 
     /* Register zero-copy tdvd:// byte-slice stream protocol for .tdvd single-file containers */
     mpv_stream_cb_add_ro(ctrl->mpv, "tdvd", ctrl, tdvd_stream_open);
@@ -344,6 +348,11 @@ void mpv_controller_poll_events(mpv_controller_t *ctrl) {
             } else if (strcmp(prop->name, "pause") == 0 && prop->format == MPV_FORMAT_FLAG) {
                 int p = *(int *)prop->data;
                 atomic_store(&ctrl->cached_paused, p != 0);
+            } else if (strcmp(prop->name, "video-params/aspect") == 0 && prop->format == MPV_FORMAT_DOUBLE) {
+                double aspect = *(double *)prop->data;
+                if (aspect > 0.5 && aspect < 4.0) {
+                    atomic_store(&ctrl->display_aspect_e4, (int)(aspect * 10000.0 + 0.5));
+                }
             }
         }
     }
@@ -358,6 +367,11 @@ bool mpv_controller_needs_render(mpv_controller_t *ctrl) {
         }
     }
     return atomic_load(&ctrl->needs_render);
+}
+
+float mpv_controller_get_display_aspect(mpv_controller_t *ctrl) {
+    int e4 = ctrl ? atomic_load(&ctrl->display_aspect_e4) : 0;
+    return e4 > 0 ? (float)e4 / 10000.0f : 16.0f / 9.0f;
 }
 
 mpv_handle *mpv_controller_get_handle(mpv_controller_t *ctrl) {

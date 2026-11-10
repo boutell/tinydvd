@@ -5,8 +5,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define SPU_WIDTH  720
-#define SPU_HEIGHT 480
+#define SPU_WIDTH      720
+#define SPU_HEIGHT     480  /* NTSC frame height, the default */
+#define SPU_PAL_HEIGHT 576  /* PAL frame height */
+#define SPU_MAX_HEIGHT SPU_PAL_HEIGHT
 
 typedef struct spu_highlight {
     bool active;
@@ -62,12 +64,21 @@ void spu_compositor_set_highlight(spu_compositor_t *spu, uint16_t sx, uint16_t s
 void spu_compositor_clear_highlight(spu_compositor_t *spu);
 
 /**
- * Render the current SPU overlay onto the active OpenGL viewport.
+ * Set the height of the video the overlay belongs to: SPU_HEIGHT (480, NTSC)
+ * or SPU_PAL_HEIGHT (576, PAL). Menu and subtitle coordinates use it.
  */
-void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h);
+void spu_compositor_set_frame_height(spu_compositor_t *spu, int height);
+int spu_compositor_get_frame_height(spu_compositor_t *spu);
 
 /**
- * Get pointer to the composite RGBA pixel buffer (720x480 uint32_t).
+ * Render the current SPU overlay onto the active OpenGL viewport, over the
+ * video as mpv letterboxes it: display_aspect is the video's width / height.
+ */
+void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h, float display_aspect);
+
+/**
+ * Get pointer to the composite RGBA pixel buffer: 720 wide, with out_h rows
+ * (the frame height) in use. Rows are SPU_WIDTH pixels apart.
  */
 const uint32_t *spu_compositor_get_rgba(spu_compositor_t *spu, int *out_w, int *out_h);
 

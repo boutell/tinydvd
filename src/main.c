@@ -32,6 +32,27 @@ static void *get_proc_address_sdl(void *ctx, const char *name) {
     return SDL_GL_GetProcAddress(name);
 }
 
+/* Map a window position to DVD menu coordinates (720 x 480 for NTSC, 720 x 576
+ * for PAL), over the video as mpv letterboxes it at its display aspect */
+static bool window_to_dvd(SDL_Window *window, float display_aspect, int frame_height,
+                          int x, int y, int *x_dvd, int *y_dvd) {
+    int win_w, win_h;
+    SDL_GetWindowSize(window, &win_w, &win_h);
+    if (win_w <= 0 || win_h <= 0) return false;
+    float win_aspect = (float)win_w / (float)win_h;
+    float vp_x = 0.0f, vp_y = 0.0f, vp_w = (float)win_w, vp_h = (float)win_h;
+    if (win_aspect > display_aspect) {
+        vp_w = (float)win_h * display_aspect;
+        vp_x = ((float)win_w - vp_w) * 0.5f;
+    } else if (win_aspect < display_aspect) {
+        vp_h = (float)win_w / display_aspect;
+        vp_y = ((float)win_h - vp_h) * 0.5f;
+    }
+    *x_dvd = (int)(((x - vp_x) * 720.0f) / vp_w);
+    *y_dvd = (int)(((y - vp_y) * (float)frame_height) / vp_h);
+    return true;
+}
+
 static void on_mpv_update_cb(void *user_data) {
     (void)user_data;
     SDL_Event ev;
@@ -278,45 +299,20 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDL_MOUSEMOTION: {
-                    int win_w, win_h;
-                    SDL_GetWindowSize(window, &win_w, &win_h);
-                    if (win_w > 0 && win_h > 0) {
-                        float target_aspect = 16.0f / 9.0f;
-                        float win_aspect = (float)win_w / (float)win_h;
-                        float vp_x = 0.0f, vp_y = 0.0f, vp_w = (float)win_w, vp_h = (float)win_h;
-                        if (win_aspect > target_aspect) {
-                            vp_w = (float)win_h * target_aspect;
-                            vp_x = ((float)win_w - vp_w) * 0.5f;
-                        } else if (win_aspect < target_aspect) {
-                            vp_h = (float)win_w / target_aspect;
-                            vp_y = ((float)win_h - vp_h) * 0.5f;
-                        }
-                        int x_dvd = (int)(((ev.motion.x - vp_x) * 720.0f) / vp_w);
-                        int y_dvd = (int)(((ev.motion.y - vp_y) * 480.0f) / vp_h);
+                    int x_dvd, y_dvd;
+                    if (window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
+                                      spu_compositor_get_frame_height(spu), ev.motion.x, ev.motion.y, &x_dvd, &y_dvd)) {
                         dvd_vm_bridge_mouse_move(bridge, x_dvd, y_dvd);
                     }
                     break;
                 }
 
                 case SDL_MOUSEBUTTONDOWN: {
-                    if (ev.button.button == SDL_BUTTON_LEFT) {
-                        int win_w, win_h;
-                        SDL_GetWindowSize(window, &win_w, &win_h);
-                        if (win_w > 0 && win_h > 0) {
-                            float target_aspect = 16.0f / 9.0f;
-                            float win_aspect = (float)win_w / (float)win_h;
-                            float vp_x = 0.0f, vp_y = 0.0f, vp_w = (float)win_w, vp_h = (float)win_h;
-                            if (win_aspect > target_aspect) {
-                                vp_w = (float)win_h * target_aspect;
-                                vp_x = ((float)win_w - vp_w) * 0.5f;
-                            } else if (win_aspect < target_aspect) {
-                                vp_h = (float)win_w / target_aspect;
-                                vp_y = ((float)win_h - vp_h) * 0.5f;
-                            }
-                            int x_dvd = (int)(((ev.button.x - vp_x) * 720.0f) / vp_w);
-                            int y_dvd = (int)(((ev.button.y - vp_y) * 480.0f) / vp_h);
-                            dvd_vm_bridge_mouse_click(bridge, x_dvd, y_dvd);
-                        }
+                    int x_dvd, y_dvd;
+                    if (ev.button.button == SDL_BUTTON_LEFT &&
+                        window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
+                                      spu_compositor_get_frame_height(spu), ev.button.x, ev.button.y, &x_dvd, &y_dvd)) {
+                        dvd_vm_bridge_mouse_click(bridge, x_dvd, y_dvd);
                     }
                     break;
                 }
@@ -341,7 +337,7 @@ int main(int argc, char *argv[]) {
         glClear(GL_COLOR_BUFFER_BIT);
 
         mpv_controller_render(mpv, draw_w, draw_h);
-        spu_compositor_render_gl(spu, draw_w, draw_h);
+        spu_compositor_render_gl(spu, draw_w, draw_h, mpv_controller_get_display_aspect(mpv));
 
         SDL_GL_SwapWindow(window);
 

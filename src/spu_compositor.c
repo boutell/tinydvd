@@ -1,4 +1,5 @@
 #include "spu_compositor.h"
+#include <stdatomic.h>
 #include "mvob_parser.h"
 #include <stdlib.h>
 #include <string.h>
@@ -59,8 +60,9 @@ static inline void br_align_byte(bit_reader_t *br) {
 
 struct spu_compositor {
     uint32_t clut_rgba[16];
-    uint8_t pixel_buf[SPU_WIDTH * SPU_HEIGHT]; /* 2-bit raw pixels: values 0..3 */
-    uint32_t rgba_buf[SPU_WIDTH * SPU_HEIGHT]; /* 32-bit composite buffer */
+    uint8_t pixel_buf[SPU_WIDTH * SPU_MAX_HEIGHT]; /* 2-bit raw pixels: values 0..3 */
+    uint32_t rgba_buf[SPU_WIDTH * SPU_MAX_HEIGHT]; /* 32-bit composite buffer */
+    atomic_int frame_height; /* SPU_HEIGHT (NTSC) or SPU_PAL_HEIGHT; set by the VM thread */
 
     /* Active display commands */
     bool display_on;
@@ -114,6 +116,7 @@ spu_compositor_t *spu_compositor_create(void) {
     spu->display_on = true;
     spu->end_col = SPU_WIDTH - 1;
     spu->end_row = SPU_HEIGHT - 1;
+    atomic_init(&spu->frame_height, SPU_HEIGHT);
     spu->contrast[0] = 0;  /* Background is transparent */
     spu->contrast[1] = 15;
     spu->contrast[2] = 15;
@@ -189,7 +192,7 @@ static void decode_rle_field(spu_compositor_t *spu, const uint8_t *data, size_t 
     if (width <= 0 || width > SPU_WIDTH) width = SPU_WIDTH;
 
     for (int line = start_line; line <= end_line; line += line_step) {
-        if (line >= SPU_HEIGHT) break;
+        if (line >= SPU_MAX_HEIGHT) break;
         int x = 0;
         while (x < width && br.byte_pos < data_len) {
             uint32_t code = br_read_bits(&br, 4);
@@ -454,7 +457,7 @@ void spu_compositor_update(spu_compositor_t *spu) {
     }
 
     int highlighted_spu_pixels = 0;
-    for (int y = 0; y < SPU_HEIGHT; y++) {
+    for (int y = 0; y < SPU_MAX_HEIGHT; y++) {
         for (int x = 0; x < SPU_WIDTH; x++) {
             uint8_t px = spu->pixel_buf[y * SPU_WIDTH + x];
             bool in_hl = hl_on && (x >= spu->highlight.sx && x <= spu->highlight.ex &&
@@ -482,12 +485,12 @@ void spu_compositor_update(spu_compositor_t *spu) {
         int y1 = spu->highlight.sy;
         int x2 = spu->highlight.ex;
         int y2 = spu->highlight.ey;
-        if (x1 < SPU_WIDTH && y1 < SPU_HEIGHT && x2 > x1 && y2 > y1) {
+        if (x1 < SPU_WIDTH && y1 < SPU_MAX_HEIGHT && x2 > x1 && y2 > y1) {
             if (x2 >= SPU_WIDTH) x2 = SPU_WIDTH - 1;
-            if (y2 >= SPU_HEIGHT) y2 = SPU_HEIGHT - 1;
+            if (y2 >= SPU_MAX_HEIGHT) y2 = SPU_MAX_HEIGHT - 1;
             uint32_t border_color = 0xCC00D4FFU; /* Warm gold/amber semi-transparent border (ABGR) */
             for (int t = 0; t < 2; t++) {
-                int yt1 = (y1 + t < SPU_HEIGHT) ? (y1 + t) : y1;
+                int yt1 = (y1 + t < SPU_MAX_HEIGHT) ? (y1 + t) : y1;
                 int yt2 = (y2 - t >= 0) ? (y2 - t) : y2;
                 for (int x = x1; x <= x2; x++) {
                     spu->rgba_buf[yt1 * SPU_WIDTH + x] = border_color;
@@ -509,11 +512,20 @@ void spu_compositor_update(spu_compositor_t *spu) {
 const uint32_t *spu_compositor_get_rgba(spu_compositor_t *spu, int *out_w, int *out_h) {
     if (!spu) return NULL;
     if (out_w) *out_w = SPU_WIDTH;
-    if (out_h) *out_h = SPU_HEIGHT;
+    if (out_h) *out_h = atomic_load(&spu->frame_height);
     return spu->rgba_buf;
 }
 
-void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h) {
+void spu_compositor_set_frame_height(spu_compositor_t *spu, int height) {
+    if (!spu) return;
+    atomic_store(&spu->frame_height, height == SPU_PAL_HEIGHT ? SPU_PAL_HEIGHT : SPU_HEIGHT);
+}
+
+int spu_compositor_get_frame_height(spu_compositor_t *spu) {
+    return spu ? atomic_load(&spu->frame_height) : SPU_HEIGHT;
+}
+
+void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h, float display_aspect) {
     if (!spu) return;
 
     /* Expire timed movie subtitles (delayed STP_DSP) when their duration elapses */
@@ -543,12 +555,12 @@ void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPU_WIDTH, SPU_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, spu->rgba_buf);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPU_WIDTH, SPU_MAX_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, spu->rgba_buf);
         spu->gl_initialized = true;
         spu->tex_dirty = false;
     } else if (spu->tex_dirty) {
         glBindTexture(GL_TEXTURE_2D, spu->gl_tex_id);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SPU_WIDTH, SPU_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, spu->rgba_buf);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, SPU_WIDTH, SPU_MAX_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, spu->rgba_buf);
         spu->tex_dirty = false;
     }
 
@@ -567,8 +579,8 @@ void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h) {
     glPushMatrix();
     glLoadIdentity();
 
-    /* Match libmpv's 16:9 keepaspect viewport inside (win_w, win_h) */
-    float target_aspect = 16.0f / 9.0f;
+    /* Match libmpv's keepaspect viewport inside (win_w, win_h) */
+    float target_aspect = (display_aspect > 0.0f) ? display_aspect : 16.0f / 9.0f;
     float win_aspect = (win_h > 0) ? ((float)win_w / (float)win_h) : target_aspect;
     float vp_x = 0.0f, vp_y = 0.0f, vp_w = (float)win_w, vp_h = (float)win_h;
     if (win_aspect > target_aspect) {
@@ -579,12 +591,15 @@ void spu_compositor_render_gl(spu_compositor_t *spu, int win_w, int win_h) {
         vp_y = ((float)win_h - vp_h) * 0.5f;
     }
 
+    /* The texture holds SPU_MAX_HEIGHT rows; only the frame's rows cover the video */
+    float tex_v = (float)atomic_load(&spu->frame_height) / (float)SPU_MAX_HEIGHT;
+
     glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
     glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 0.0f); glVertex2f(vp_x,        vp_y);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(vp_x + vp_w, vp_y);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(vp_x + vp_w, vp_y + vp_h);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(vp_x,        vp_y + vp_h);
+    glTexCoord2f(0.0f, 0.0f);  glVertex2f(vp_x,        vp_y);
+    glTexCoord2f(1.0f, 0.0f);  glVertex2f(vp_x + vp_w, vp_y);
+    glTexCoord2f(1.0f, tex_v); glVertex2f(vp_x + vp_w, vp_y + vp_h);
+    glTexCoord2f(0.0f, tex_v); glVertex2f(vp_x,        vp_y + vp_h);
     glEnd();
 
     glPopMatrix();

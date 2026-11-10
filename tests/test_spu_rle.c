@@ -42,6 +42,22 @@ int main(void) {
     assert(rgba[100 * SPU_WIDTH + 100] == 0);
     printf("OK\n");
 
+    /* PAL: a 576-line frame, with a button below NTSC's last line */
+    printf("Testing PAL frame height... ");
+    spu_compositor_set_frame_height(spu, SPU_PAL_HEIGHT);
+    assert(spu_compositor_get_frame_height(spu) == SPU_PAL_HEIGHT);
+    spu_compositor_set_highlight(spu, 100, 500, 200, 560, hl_palette);
+    rgba = spu_compositor_get_rgba(spu, &w, &h);
+    assert(h == SPU_PAL_HEIGHT);
+    assert((rgba[500 * SPU_WIDTH + 100] >> 24) > 0);
+    spu_compositor_clear_highlight(spu);
+    rgba = spu_compositor_get_rgba(spu, &w, &h);
+    assert(rgba[500 * SPU_WIDTH + 100] == 0);
+    /* Anything else is treated as NTSC */
+    spu_compositor_set_frame_height(spu, 1234);
+    assert(spu_compositor_get_frame_height(spu) == SPU_HEIGHT);
+    printf("OK\n");
+
     spu_compositor_destroy(spu);
     printf("All SPU Compositor tests passed!\n");
     return 0;

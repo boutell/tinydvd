@@ -36,7 +36,8 @@ void dvd_vm_bridge_stop(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_destroy(dvd_vm_bridge_t *bridge);
 
 /**
- * User input handlers. Coordinates (x, y) must be in 720x480 DVD coordinates.
+ * User input handlers. Coordinates (x, y) are DVD pixel coordinates: 720 wide,
+ * and 480 (NTSC) or 576 (PAL) high, see spu_compositor_get_frame_height().
  */
 void dvd_vm_bridge_mouse_move(dvd_vm_bridge_t *bridge, int x, int y);
 void dvd_vm_bridge_mouse_click(dvd_vm_bridge_t *bridge, int x, int y);

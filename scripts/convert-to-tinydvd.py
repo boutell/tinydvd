@@ -288,7 +288,40 @@ def generate_qpfile(keyframes, output_path):
     print(f"[transcode] Wrote {len(keyframes)} keyframe points to {output_path}")
 
 
-def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar="32:27"):
+VIDEO_RATES = {"ntsc": (30000 / 1001, "30000/1001"), "pal": (25.0, "25")}
+
+
+def ifo_video_standard(input_dir, ifo_name, attr_offset):
+    """
+    Return "ntsc" or "pal" from a video attributes field of an IFO file:
+    0x100 is the menu video (VMGM in VIDEO_TS.IFO, VTSM in VTS_NN_0.IFO) and
+    0x200 the title video (VTS_NN_0.IFO). Bits 5-4 of its first byte are the
+    video standard, 0 = NTSC (525/60) and 1 = PAL (625/50). None if unreadable.
+    """
+    for sdir in (input_dir, os.path.join(input_dir, "VIDEO_TS")):
+        for name in (ifo_name, ifo_name.lower()):
+            path = os.path.join(sdir, name)
+            if os.path.isfile(path):
+                try:
+                    with open(path, "rb") as f:
+                        f.seek(attr_offset)
+                        b = f.read(1)
+                except OSError:
+                    return None
+                if len(b) == 1:
+                    return "pal" if ((b[0] >> 4) & 0x03) == 1 else "ntsc"
+    return None
+
+
+def video_rate(input_dir, ifo_name, attr_offset, fps_override=None):
+    """(frames per second, ffmpeg rate string) for one menu or title video."""
+    if fps_override:
+        return fps_override, f"{fps_override:.6f}".rstrip("0").rstrip(".")
+    standard = ifo_video_standard(input_dir, ifo_name, attr_offset) or "ntsc"
+    return VIDEO_RATES[standard]
+
+
+def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=None, rate="30000/1001"):
     """
     Transcodes a menu or multi-segment VOB where individual VOB_IDs may be
     still-frame menus (1 I-frame held for N seconds) or have discontinuous PTS.
@@ -312,7 +345,9 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar="3
                     fout.write(chunk)
                     remaining -= len(chunk)
 
-            vf = f"tpad=stop_mode=clone:stop_duration={dur:.6f},fps=30000/1001,trim=duration={dur:.6f},setpts=PTS-STARTPTS"
+            vf = f"tpad=stop_mode=clone:stop_duration={dur:.6f},fps={rate},trim=duration={dur:.6f},setpts=PTS-STARTPTS"
+            if sar:
+                vf += f",setsar={sar.replace(':', '/')}"
             if seg["audio_sectors"] > 0:
                 cmd = [
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -323,7 +358,6 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar="3
                     "-map", "0:v:0", "-map", "0:a:0",
                     "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                     "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
-                    "-sar", sar,
                     "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
                     seg_mkv
                 ]
@@ -338,7 +372,6 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar="3
                     "-t", f"{dur:.6f}",
                     "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                     "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
-                    "-sar", sar,
                     "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
                     seg_mkv
                 ]
@@ -367,7 +400,7 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar="3
     print(f"[transcode] Output generated (segmented): {output_mkv}")
 
 
-def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf=18, preset="slow", tune="film", sar="32:27", segments=None, is_menu=False):
+def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf=18, preset="slow", tune="film", sar=None, segments=None, is_menu=False, rate="30000/1001"):
     """
     Run ffmpeg to encode companion video + audio into an MKV container.
     - Uses per-segment tpad encoding for menus or still-frame VOBs so every VOB_ID
@@ -379,7 +412,7 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
         is_menu or os.path.getsize(vob_paths[0]) < 5 * 1024 * 1024
     ):
         print(f"[ffmpeg] Encoding {len(segments)} VOB_ID segment(s) with still-frame/menu timeline preservation -> {os.path.basename(output_mkv)}")
-        _transcode_segmented_vob(segments, output_mkv, crf=crf, preset=preset, sar=sar)
+        _transcode_segmented_vob(segments, output_mkv, crf=crf, preset=preset, sar=sar, rate=rate)
         return
 
     if len(vob_paths) == 1:
@@ -409,7 +442,7 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
         "-tune", tune,
         *keyframe_args,
         "-x264-params", "keyint=30:min-keyint=1:open-gop=0:scenecut=0",
-        "-sar", sar,
+        *(["-vf", f"setsar={sar.replace(':', '/')}"] if sar else []),
         "-c:a", "aac",
         "-b:a", "192k",
         "-ac", "2",
@@ -529,7 +562,7 @@ def copy_ifo_and_bup(input_dir, output_dir):
     print(f"[transcode] Copied {copied} IFO/BUP navigation metadata files.")
 
 
-def process_vmgm(input_dir, output_dir, fps=29.97, crf=18, preset="slow", sar="32:27", keep_audio=False):
+def process_vmgm(input_dir, output_dir, fps=None, crf=18, preset="slow", sar=None, keep_audio=False):
     """Process VIDEO_TS.VOB (VMGM domain) if present."""
     search_dirs = [input_dir]
     if os.path.isdir(os.path.join(input_dir, "VIDEO_TS")):
@@ -546,6 +579,7 @@ def process_vmgm(input_dir, output_dir, fps=29.97, crf=18, preset="slow", sar="3
         return
 
     print("\n=== Processing VMGM Menu (VIDEO_TS.VOB) ===")
+    fps, rate = video_rate(input_dir, "VIDEO_TS.IFO", 0x100, fps)
     vobus, _, segments = scan_vts_vobus(vmgm_vobs, fps, return_segments=True)
     if vobus:
         output_mkv = os.path.join(output_dir, "VIDEO_TS_VIDEO.mkv")
@@ -557,12 +591,13 @@ def process_vmgm(input_dir, output_dir, fps=29.97, crf=18, preset="slow", sar="3
             preset=preset,
             sar=sar,
             segments=segments,
-            is_menu=True
+            is_menu=True,
+            rate=rate
         )
         emit_mvob_files(vmgm_vobs, 0, vobus, output_dir, keep_audio=keep_audio)
 
 
-def process_vts(input_dir, output_dir, vts_id, fps=29.97, crf=18, preset="slow", tune="film", sar="32:27", keep_audio=False):
+def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", tune="film", sar=None, keep_audio=False):
     print(f"\n=== Processing Video Title Set VTS_{vts_id:02d} ===")
 
     search_dirs = [input_dir]
@@ -592,7 +627,8 @@ def process_vts(input_dir, output_dir, vts_id, fps=29.97, crf=18, preset="slow",
     # If menu VOB exists, transcode VTS_xx_0_VIDEO.mkv and emit compact VTS_xx_0.mvob
     if menu_vobs:
         print(f"[transcode] Processing menu VOB: {menu_vobs[0]}")
-        menu_vobus, _, menu_segments = scan_vts_vobus(menu_vobs, fps, return_segments=True)
+        menu_fps, menu_rate = video_rate(input_dir, f"VTS_{vts_id:02d}_0.IFO", 0x100, fps)
+        menu_vobus, _, menu_segments = scan_vts_vobus(menu_vobs, menu_fps, return_segments=True)
         if menu_vobus:
             menu_mkv = os.path.join(output_dir, f"VTS_{vts_id:02d}_0_VIDEO.mkv")
             transcode_video(
@@ -603,7 +639,8 @@ def process_vts(input_dir, output_dir, vts_id, fps=29.97, crf=18, preset="slow",
                 preset=preset,
                 sar=sar,
                 segments=menu_segments,
-                is_menu=True
+                is_menu=True,
+                rate=menu_rate
             )
             emit_mvob_files(menu_vobs, vts_id, menu_vobus, output_dir, keep_audio=keep_audio)
 
@@ -611,7 +648,8 @@ def process_vts(input_dir, output_dir, vts_id, fps=29.97, crf=18, preset="slow",
         return
 
     # Scan VOBU keyframes and segments
-    vobus, keyframes, segments = scan_vts_vobus(vob_files, fps, return_segments=True)
+    title_fps, title_rate = video_rate(input_dir, f"VTS_{vts_id:02d}_0.IFO", 0x200, fps)
+    vobus, keyframes, segments = scan_vts_vobus(vob_files, title_fps, return_segments=True)
     if not keyframes:
         keyframes = [0]
 
@@ -638,7 +676,8 @@ def process_vts(input_dir, output_dir, vts_id, fps=29.97, crf=18, preset="slow",
         tune=tune,
         sar=sar,
         segments=segments,
-        is_menu=False
+        is_menu=False,
+        rate=title_rate
     )
 
     # Emit compact MVOB files
@@ -818,11 +857,16 @@ def main():
     parser.add_argument("input", help="Source DVD directory, ISO file, or existing tinydvd directory")
     parser.add_argument("output", help="Output .tdvd / .tinydvd file (or output directory)")
     parser.add_argument("--vts", type=int, default=None, help="Specific VTS title set ID to process (default: all)")
-    parser.add_argument("--fps", type=float, default=29.97, help="Disc frame rate (default: 29.97)")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Force this frame rate. By default it's read from the disc: "
+                             "29.97 for NTSC, 25 for PAL.")
     parser.add_argument("--crf", type=int, default=18, help="x264 CRF quality level (default: 18)")
     parser.add_argument("--preset", default="slow", help="x264 encoding preset (default: slow)")
     parser.add_argument("--tune", default="film", help="x264 tune option (default: film)")
-    parser.add_argument("--sar", default="32:27", help="Storage aspect ratio (default: 32:27 for NTSC anamorphic)")
+    parser.add_argument("--sar", default=None,
+                        help="Force this sample (pixel) aspect ratio on every video, e.g. 32:27. "
+                             "By default each video keeps its own: discs mix 4:3 and 16:9 video, "
+                             "often 4:3 warning screens before a widescreen movie.")
     parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
 
     args = parser.parse_args()

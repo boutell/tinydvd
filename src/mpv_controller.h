@@ -92,6 +92,12 @@ bool mpv_controller_needs_render(mpv_controller_t *ctrl);
 /**
  * Underlying mpv handle.
  */
+/**
+ * Display aspect ratio (width / height) of the current video, as mpv shows it:
+ * 4:3 or 16:9 depending on the menu or title. 16:9 until mpv knows.
+ */
+float mpv_controller_get_display_aspect(mpv_controller_t *ctrl);
+
 mpv_handle *mpv_controller_get_handle(mpv_controller_t *ctrl);
 
 #ifdef __cplusplus
