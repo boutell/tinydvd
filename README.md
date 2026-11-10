@@ -134,27 +134,26 @@ While new `.tdvd` files automatically include a menu frame thumbnail during conv
 
 ### GNOME / Linux Desktop Integration (`.tdvd` File Association)
 
-To install `tinydvd` into your GNOME desktop environment so `.tdvd` and `.tinydvd` files display custom disc icons and open automatically when double-clicked in GNOME Files (Nautilus):
+To install `tinydvd` so `.tdvd` and `.tinydvd` files show thumbnails and disc icons in GNOME Files (Nautilus) and play when double-clicked:
 
 ```bash
-# System-wide installation (installs to /usr/local/bin and /usr/local/share):
-sudo ./scripts/install-desktop.sh
-
-# Or install for your user account only (no sudo required, installs to ~/.local):
-./scripts/install-desktop.sh --user
+./install
 ```
 
-This script:
-1. Installs the `tinydvd` player binary, `convert-to-tinydvd`, and `tinydvd-set-thumbnail` CLIs into your `PATH`.
-2. Registers the `tinydvd.desktop` application launcher in GNOME's application menu.
-3. Installs the FreeDesktop MIME database package for `*.tdvd` and `*.tinydvd` (`video/x-tinydvd`).
-4. Installs the vector application and file icons in `hicolor/scalable`.
-5. Installs the GNOME/FreeDesktop thumbnailer (`tinydvd.thumbnailer`) so Nautilus displays rich movie/menu thumbnails on `.tdvd` files.
-6. Updates `mime-database`, `desktop-database`, and `gtk-update-icon-cache`, setting `tinydvd` as the default double-click handler for `.tdvd` files via `xdg-mime`.
+It builds `tinydvd`, then asks for your password (via `sudo`) and installs under `/usr/local`:
+1. The `tinydvd` player, `convert-to-tinydvd`, `tinydvd-set-thumbnail` and `tinydvd-thumbnailer` in `/usr/local/bin`.
+2. The `tinydvd` application launcher.
+3. The `video/x-tinydvd` file type for `*.tdvd` and `*.tinydvd`, with `tinydvd` as its default application.
+4. The application and file icons.
+5. The Nautilus thumbnailer, which shows each disc's embedded thumbnail (see `tinydvd-set-thumbnail` above).
 
-To remove the desktop integration later:
+Everything goes under `/usr/local` because GNOME runs thumbnailers in a sandbox that can't see your home folder, so a thumbnailer installed in `~/.local/bin` never runs.
+
+If GNOME Files was already open, restart it with `nautilus -q` to see thumbnails.
+
+To remove it all again:
 ```bash
-sudo ./scripts/install-desktop.sh --uninstall
+./install --uninstall
 ```
 
 ### Player Controls

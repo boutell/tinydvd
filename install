@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# install: build tinydvd and install it, with its GNOME / freedesktop
+# integration (launcher, .tdvd file type, icons and Nautilus thumbnailer),
+# under /usr/local.
+#
+# Everything goes under /usr/local on purpose: GNOME runs thumbnailers in a
+# sandbox that can only see system paths such as /usr, so a thumbnailer in a
+# home folder (~/.local/bin) can't run and .tdvd files get no thumbnails.
+#
+#   ./install              Build, then install (asks for your password via sudo)
+#   ./install --uninstall  Remove everything this script installed
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX="/usr/local"
+BIN_DIR="${PREFIX}/bin"
+SHARE_DIR="${PREFIX}/share"
+APP_DIR="${SHARE_DIR}/applications"
+MIME_DIR="${SHARE_DIR}/mime/packages"
+THUMB_DIR="${SHARE_DIR}/thumbnailers"
+ICON_DIR="${SHARE_DIR}/icons/hicolor"
+MIME_TYPES=(video/x-tinydvd application/x-tdvd application/x-tinydvd)
+
+UNINSTALL=0
+for arg in "$@"; do
+    case "$arg" in
+        --uninstall) UNINSTALL=1 ;;
+        -h|--help)
+            sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg (try --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Build as the invoking user, so build/ never ends up owned by root, then
+# rerun this script with sudo for the installation itself.
+if [[ "$(id -u)" -ne 0 ]]; then
+    if [[ "$UNINSTALL" -eq 0 ]]; then
+        echo "=== Building tinydvd ==="
+        cmake -B "${ROOT_DIR}/build" -S "${ROOT_DIR}" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "${ROOT_DIR}/build" --target tinydvd
+    fi
+    exec sudo "${BASH_SOURCE[0]}" "$@"
+fi
+
+refresh_caches() {
+    if command -v update-mime-database >/dev/null 2>&1; then
+        update-mime-database "${SHARE_DIR}/mime" || true
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "${APP_DIR}" || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f -q -t "${ICON_DIR}" || true
+    fi
+}
+
+# Make tinydvd the default application for .tdvd files ("add"), or undo that
+# ("remove"), in /usr/local/share/applications/mimeapps.list. That is the
+# system-wide default; nobody's own ~/.config/mimeapps.list is touched.
+set_default_handler() {
+    python3 - "${APP_DIR}/mimeapps.list" "$1" "${MIME_TYPES[@]}" <<'PYEOF'
+import configparser, os, sys
+
+path, action, mimes = sys.argv[1], sys.argv[2], sys.argv[3:]
+cp = configparser.ConfigParser(interpolation=None)
+cp.optionxform = str
+if os.path.exists(path):
+    cp.read(path)
+section = "Default Applications"
+if action == "add":
+    if not cp.has_section(section):
+        cp.add_section(section)
+    for m in mimes:
+        cp.set(section, m, "tinydvd.desktop")
+elif cp.has_section(section):
+    for m in mimes:
+        if cp.get(section, m, fallback="") == "tinydvd.desktop":
+            cp.remove_option(section, m)
+    if not cp.options(section):
+        cp.remove_section(section)
+if cp.sections():
+    with open(path, "w") as f:
+        cp.write(f, space_around_delimiters=False)
+elif os.path.exists(path):
+    os.remove(path)
+PYEOF
+}
+
+if [[ "$UNINSTALL" -eq 1 ]]; then
+    echo "=== Uninstalling tinydvd from ${PREFIX} ==="
+    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" \
+          "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer" \
+          "${BIN_DIR}/tinydvd-set-thumbnail" "${BIN_DIR}/tinydvd-add-thumbnail"
+    rm -f "${APP_DIR}/tinydvd.desktop" "${MIME_DIR}/tinydvd.xml" \
+          "${THUMB_DIR}/tinydvd.thumbnailer" \
+          "${ICON_DIR}/scalable/apps/tinydvd.svg" \
+          "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+    if [[ -f "${APP_DIR}/mimeapps.list" ]]; then
+        set_default_handler remove
+    fi
+    refresh_caches
+    echo "tinydvd uninstalled."
+    exit 0
+fi
+
+TINYDVD_BIN="${ROOT_DIR}/build/tinydvd"
+if [[ ! -x "$TINYDVD_BIN" ]]; then
+    echo "Error: ${TINYDVD_BIN} not found. Run ./install without sudo so it can build first." >&2
+    exit 1
+fi
+
+echo "=== Installing tinydvd to ${PREFIX} ==="
+install -d "${BIN_DIR}" "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}" \
+           "${ICON_DIR}/scalable/apps" "${ICON_DIR}/scalable/mimetypes"
+
+echo "Programs -> ${BIN_DIR}"
+install -m 755 "${TINYDVD_BIN}" "${BIN_DIR}/tinydvd"
+ln -sf tinydvd "${BIN_DIR}/tinydvd-player"
+install -m 755 "${ROOT_DIR}/scripts/convert-to-tinydvd.py" "${BIN_DIR}/convert-to-tinydvd"
+install -m 755 "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" "${BIN_DIR}/tinydvd-thumbnailer"
+install -m 755 "${ROOT_DIR}/scripts/tinydvd-set-thumbnail.py" "${BIN_DIR}/tinydvd-set-thumbnail"
+ln -sf tinydvd-set-thumbnail "${BIN_DIR}/tinydvd-add-thumbnail"
+
+# Absolute paths in Exec / TryExec, so neither the launcher nor the
+# thumbnailer sandbox depends on PATH
+echo "Launcher -> ${APP_DIR}/tinydvd.desktop"
+{
+    grep -v '^TryExec=' "${ROOT_DIR}/data/tinydvd.desktop" |
+        sed -e "s|^Exec=.*|TryExec=${BIN_DIR}/tinydvd\\
+Exec=${BIN_DIR}/tinydvd -f %f|"
+} > "${APP_DIR}/tinydvd.desktop"
+chmod 644 "${APP_DIR}/tinydvd.desktop"
+
+echo "File type -> ${MIME_DIR}/tinydvd.xml"
+install -m 644 "${ROOT_DIR}/data/tinydvd.xml" "${MIME_DIR}/tinydvd.xml"
+
+echo "Thumbnailer -> ${THUMB_DIR}/tinydvd.thumbnailer"
+sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd-thumbnailer -s %s %i %o|" \
+    -e "s|^TryExec=.*|TryExec=${BIN_DIR}/tinydvd-thumbnailer|" \
+    "${ROOT_DIR}/data/tinydvd.thumbnailer" > "${THUMB_DIR}/tinydvd.thumbnailer"
+chmod 644 "${THUMB_DIR}/tinydvd.thumbnailer"
+
+echo "Icons -> ${ICON_DIR}"
+install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/apps/tinydvd.svg"
+install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+
+set_default_handler add
+refresh_caches
+
+echo ""
+echo "Installed. Double-click any .tdvd file in GNOME Files to play it."
+echo "If Nautilus was already open, restart it (nautilus -q) to pick up thumbnails."
