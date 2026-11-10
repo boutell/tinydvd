@@ -201,6 +201,7 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Preserves still-frame menu timelines (`tpad`) so every menu `VOB_ID` maps 1:1 to its `NV_PCK` presentation timestamps.
    - Uses byte-level `concat:` protocol on multi-file title VOBs (`VTS_xx_1..N.VOB`) to preserve continuous MPEG-PS timestamps across 1 GB VOB splits.
    - Keeps each video's frame size (720x480 NTSC or 720x576 PAL), frame rate (29.97 or 25, read from the disc's IFO files) and aspect ratio (4:3 or 16:9), so menu button and subtitle coordinates match the video 1:1.
+   - Keeps film at its exact timing, including soft-telecined NTSC film's 3:2 cadence, and deinterlaces only the frames the disc marks as interlaced (one frame per field, 59.94 or 50 per second), so mixed film and video titles play like they do on a DVD player.
 
 3. **Custom DVD Virtual Machine & Smooth Playback Engine ([`src/dvd_vm_bridge.c`](file:///Users/boutell/boutell/tinydvd/src/dvd_vm_bridge.c)):**
    - Replaces `libdvdnav`'s rigid optical sector reader with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots) and compact `.mvob` indexer built on `libdvdread` (`ifoOpen`, `navRead_PCI`, `navRead_DSI`).

@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import contextlib
 import zipfile
+from fractions import Fraction
 
 SECTOR_SIZE = 2048
 MVOB_MAGIC = 0x4D564F42  # "MVOB" in little-endian uint32
@@ -321,6 +322,26 @@ def video_rate(input_dir, ifo_name, attr_offset, fps_override=None):
     return VIDEO_RATES[standard]
 
 
+# Deinterlace only the frames the disc marks as interlaced (hard-telecined or
+# native interlaced video); progressive frames, such as soft-telecined film,
+# pass through untouched. Titles get one frame per field (59.94 or 50 per
+# second), as a DVD player shows interlaced video; menus, which are resampled
+# to the frame rate anyway, get one frame per frame.
+DEINTERLACE_TITLE = "bwdif=mode=send_field:parity=auto:deint=interlaced"
+DEINTERLACE_MENU = "bwdif=mode=send_frame:parity=auto:deint=interlaced"
+
+
+def field_time_base(rate):
+    """
+    Encoder time base of one field (1001/60000 s for NTSC, 1/50 s for PAL).
+    Every DVD picture starts on a field, so this keeps soft-telecined film at
+    its exact 3:2 cadence and mixed film / video titles exact, where a frame
+    time base rounds film frames to an uneven 1-1-1-2 frame pattern.
+    """
+    field = 1 / (2 * Fraction(rate).limit_denominator(1001))
+    return f"{field.numerator}/{field.denominator}"
+
+
 def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=None, rate="30000/1001"):
     """
     Transcodes a menu or multi-segment VOB where individual VOB_IDs may be
@@ -345,7 +366,7 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
                     fout.write(chunk)
                     remaining -= len(chunk)
 
-            vf = f"tpad=stop_mode=clone:stop_duration={dur:.6f},fps={rate},trim=duration={dur:.6f},setpts=PTS-STARTPTS"
+            vf = f"{DEINTERLACE_MENU},tpad=stop_mode=clone:stop_duration={dur:.6f},fps={rate},trim=duration={dur:.6f},setpts=PTS-STARTPTS"
             if sar:
                 vf += f",setsar={sar.replace(':', '/')}"
             if seg["audio_sectors"] > 0:
@@ -442,7 +463,8 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
         "-tune", tune,
         *keyframe_args,
         "-x264-params", "keyint=30:min-keyint=1:open-gop=0:scenecut=0",
-        *(["-vf", f"setsar={sar.replace(':', '/')}"] if sar else []),
+        "-vf", DEINTERLACE_TITLE + (f",setsar={sar.replace(':', '/')}" if sar else ""),
+        "-enc_time_base:v", field_time_base(rate),
         "-c:a", "aac",
         "-b:a", "192k",
         "-ac", "2",
