@@ -722,6 +722,32 @@ def is_already_converted_dir(path):
     return has_mvob and has_mkv
 
 
+def ensure_thumbnail_in_staging(staging_dir):
+    """Ensure a high-quality poster/menu thumbnail.png exists in staging directory."""
+    thumb_path = os.path.join(staging_dir, "thumbnail.png")
+    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        return
+    files = [f for f in os.listdir(staging_dir) if f.lower().endswith(".mkv")]
+    if not files:
+        return
+    # Prefer menu video with content (> 100KB), else main title video
+    menus = [f for f in files if ("_0_video.mkv" in f.lower() or "video_ts_video.mkv" in f.lower())
+             and os.path.getsize(os.path.join(staging_dir, f)) > 100000]
+    target_mkv = os.path.join(staging_dir, menus[0] if menus else files[0])
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", "00:00:02",
+        "-i", target_mkv,
+        "-vframes", "1",
+        "-q:v", "2",
+        thumb_path
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def package_tdvd_archive(staging_dir, output_archive_path):
     """
     Packages a tinydvd directory into a single uncompressed ZIP_STORED (.tdvd / .tinydvd)
@@ -731,6 +757,8 @@ def package_tdvd_archive(staging_dir, output_archive_path):
     if parent_dir:
         os.makedirs(parent_dir, exist_ok=True)
 
+    ensure_thumbnail_in_staging(staging_dir)
+
     all_files = []
     for fname in sorted(os.listdir(staging_dir)):
         fpath = os.path.join(staging_dir, fname)
@@ -739,12 +767,14 @@ def package_tdvd_archive(staging_dir, output_archive_path):
         ext = os.path.splitext(fname)[1].lower()
         if ext in (".ifo", ".bup"):
             prio = 0
-        elif ext == ".mvob":
+        elif ext in (".png", ".jpg", ".jpeg"):
             prio = 1
-        elif ext == ".mkv":
+        elif ext == ".mvob":
             prio = 2
-        elif ext == ".txt":
+        elif ext == ".mkv":
             prio = 3
+        elif ext == ".txt":
+            prio = 4
         else:
             continue
         all_files.append((prio, fname, fpath))

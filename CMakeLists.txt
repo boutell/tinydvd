@@ -114,3 +114,12 @@ install(FILES data/icons/tinydvd.svg
     DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/mimetypes
     RENAME video-x-tinydvd.svg
 )
+
+install(PROGRAMS scripts/tinydvd-thumbnailer.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME tinydvd-thumbnailer
+)
+
+install(FILES data/tinydvd.thumbnailer
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/thumbnailers
+)

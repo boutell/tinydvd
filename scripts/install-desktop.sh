@@ -70,14 +70,16 @@ fi
 BIN_DIR="${PREFIX}/bin"
 APP_DIR="${PREFIX}/share/applications"
 MIME_DIR="${PREFIX}/share/mime/packages"
+THUMB_DIR="${PREFIX}/share/thumbnailers"
 ICON_APPS_DIR="${PREFIX}/share/icons/hicolor/scalable/apps"
 ICON_MIME_DIR="${PREFIX}/share/icons/hicolor/scalable/mimetypes"
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "=== Uninstalling tinydvd from ${PREFIX} ==="
-    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" "${BIN_DIR}/convert-to-tinydvd"
+    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer"
     rm -f "${APP_DIR}/tinydvd.desktop"
     rm -f "${MIME_DIR}/tinydvd.xml"
+    rm -f "${THUMB_DIR}/tinydvd.thumbnailer"
     rm -f "${ICON_APPS_DIR}/tinydvd.svg"
     rm -f "${ICON_MIME_DIR}/video-x-tinydvd.svg"
 
@@ -116,7 +118,7 @@ if [[ ! -f "$TINYDVD_BIN" ]]; then
 fi
 
 # 2. Create destination directories
-mkdir -p "${BIN_DIR}" "${APP_DIR}" "${MIME_DIR}" "${ICON_APPS_DIR}" "${ICON_MIME_DIR}"
+mkdir -p "${BIN_DIR}" "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}" "${ICON_APPS_DIR}" "${ICON_MIME_DIR}"
 
 # 3. Install binaries
 echo "Installing binaries to ${BIN_DIR}..."
@@ -127,7 +129,11 @@ if [[ -f "${ROOT_DIR}/scripts/convert-to-tinydvd.py" ]]; then
     install -m 755 "${ROOT_DIR}/scripts/convert-to-tinydvd.py" "${BIN_DIR}/convert-to-tinydvd"
 fi
 
-# 4. Install Desktop entry and MIME package
+if [[ -f "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" ]]; then
+    install -m 755 "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" "${BIN_DIR}/tinydvd-thumbnailer"
+fi
+
+# 4. Install Desktop entry, MIME package, and Thumbnailer
 echo "Installing desktop entry to ${APP_DIR}..."
 # Set exact binary path in Exec and TryExec so GNOME desktop can always locate
 # tinydvd even if ~/.local/bin is not in the GUI session's PATH.
@@ -143,6 +149,12 @@ chmod 644 "${APP_DIR}/tinydvd.desktop"
 
 echo "Installing MIME package to ${MIME_DIR}..."
 install -m 644 "${ROOT_DIR}/data/tinydvd.xml" "${MIME_DIR}/tinydvd.xml"
+
+echo "Installing GNOME thumbnailer to ${THUMB_DIR}..."
+sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd-thumbnailer -s %s %i %o|" \
+    -e "s|^TryExec=.*|TryExec=${BIN_DIR}/tinydvd-thumbnailer|" \
+    "${ROOT_DIR}/data/tinydvd.thumbnailer" > "${THUMB_DIR}/tinydvd.thumbnailer"
+chmod 644 "${THUMB_DIR}/tinydvd.thumbnailer"
 
 # 5. Install Icons
 echo "Installing icons to ${PREFIX}/share/icons/hicolor..."

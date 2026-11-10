@@ -1,0 +1,4 @@
+[Thumbnailer Entry]
+TryExec=tinydvd-thumbnailer
+Exec=tinydvd-thumbnailer -s %s %i %o
+MimeType=video/x-tinydvd;application/x-tdvd;application/x-tinydvd;

@@ -128,7 +128,8 @@ This script:
 2. Registers the `tinydvd.desktop` application launcher in GNOME's application menu.
 3. Installs the FreeDesktop MIME database package for `*.tdvd` and `*.tinydvd` (`video/x-tinydvd`).
 4. Installs the vector application and file icons in `hicolor/scalable`.
-5. Updates `mime-database`, `desktop-database`, and `gtk-update-icon-cache`, setting `tinydvd` as the default double-click handler for `.tdvd` files via `xdg-mime`.
+5. Installs the GNOME/FreeDesktop thumbnailer (`tinydvd.thumbnailer`) so Nautilus displays rich movie/menu thumbnails on `.tdvd` files.
+6. Updates `mime-database`, `desktop-database`, and `gtk-update-icon-cache`, setting `tinydvd` as the default double-click handler for `.tdvd` files via `xdg-mime`.
 
 To remove the desktop integration later:
 ```bash
