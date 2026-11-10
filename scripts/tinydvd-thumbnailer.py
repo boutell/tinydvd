@@ -87,19 +87,34 @@ def extract_frame_from_mkv(zip_path_or_dir, out_path, max_size):
             menus = [m for m in mkvs if "_0_video.mkv" in m.lower() or "video_ts_video.mkv" in m.lower()]
             target_mkv = menus[0] if menus else mkvs[0]
 
-            # Read first 8 MB of the MKV which contains video headers and initial frames
-            with zf.open(target_mkv) as mkv_stream:
-                header_data = mkv_stream.read(8 * 1024 * 1024)
-
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", "pipe:0",
-                "-vf", scale_filter,
-                "-vframes", "1",
-                out_path
-            ]
-            proc = subprocess.run(cmd, input=header_data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return proc.returncode == 0
+            for t in ["00:00:02", "00:00:00"]:
+                cmd = [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", "pipe:0",
+                    "-ss", t,
+                    "-vf", scale_filter,
+                    "-vframes", "1",
+                    out_path
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with zf.open(target_mkv) as stream:
+                    try:
+                        while True:
+                            chunk = stream.read(65536)
+                            if not chunk:
+                                break
+                            proc.stdin.write(chunk)
+                    except (BrokenPipeError, IOError):
+                        pass
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except Exception:
+                            pass
+                proc.wait()
+                if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return True
+            return False
 
     return False
 

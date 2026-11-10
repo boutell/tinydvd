@@ -76,7 +76,7 @@ ICON_MIME_DIR="${PREFIX}/share/icons/hicolor/scalable/mimetypes"
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "=== Uninstalling tinydvd from ${PREFIX} ==="
-    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer"
+    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer" "${BIN_DIR}/tinydvd-set-thumbnail" "${BIN_DIR}/tinydvd-add-thumbnail"
     rm -f "${APP_DIR}/tinydvd.desktop"
     rm -f "${MIME_DIR}/tinydvd.xml"
     rm -f "${THUMB_DIR}/tinydvd.thumbnailer"
@@ -131,6 +131,11 @@ fi
 
 if [[ -f "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" ]]; then
     install -m 755 "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" "${BIN_DIR}/tinydvd-thumbnailer"
+fi
+
+if [[ -f "${ROOT_DIR}/scripts/tinydvd-set-thumbnail.py" ]]; then
+    install -m 755 "${ROOT_DIR}/scripts/tinydvd-set-thumbnail.py" "${BIN_DIR}/tinydvd-set-thumbnail"
+    ln -sf tinydvd-set-thumbnail "${BIN_DIR}/tinydvd-add-thumbnail"
 fi
 
 # 4. Install Desktop entry, MIME package, and Thumbnailer

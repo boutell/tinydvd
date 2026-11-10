@@ -111,6 +111,27 @@ Launch the player pointing to your `.tdvd` file (or converted directory), or map
 ./build/tinydvd ./tinydvds/MY_MOVIE
 ```
 
+### Thumbnails & Cover Art (`tinydvd-set-thumbnail`)
+
+While new `.tdvd` files automatically include a menu frame thumbnail during conversion, you can embed or update thumbnails in existing `.tdvd` archives at any time without re-encoding or copying video data:
+
+```bash
+# Automatically extract and embed a menu/movie frame in an existing .tdvd:
+./scripts/tinydvd-set-thumbnail ./tinydvds/MY_MOVIE.tdvd
+
+# Embed a custom movie poster or cover image:
+./scripts/tinydvd-set-thumbnail ./tinydvds/MY_MOVIE.tdvd ./posters/cover.jpg
+
+# Batch-add thumbnails to an entire folder of .tdvd files:
+./scripts/tinydvd-set-thumbnail ./tinydvds/*.tdvd
+
+# Check which .tdvd archives already have embedded thumbnails:
+./scripts/tinydvd-set-thumbnail --check ./tinydvds/*.tdvd
+
+# Overwrite existing thumbnails with --force:
+./scripts/tinydvd-set-thumbnail --force ./tinydvds/MY_MOVIE.tdvd
+```
+
 ### GNOME / Linux Desktop Integration (`.tdvd` File Association)
 
 To install `tinydvd` into your GNOME desktop environment so `.tdvd` and `.tinydvd` files display custom disc icons and open automatically when double-clicked in GNOME Files (Nautilus):
@@ -124,7 +145,7 @@ sudo ./scripts/install-desktop.sh
 ```
 
 This script:
-1. Installs the `tinydvd` player binary and `convert-to-tinydvd` CLI into your `PATH`.
+1. Installs the `tinydvd` player binary, `convert-to-tinydvd`, and `tinydvd-set-thumbnail` CLIs into your `PATH`.
 2. Registers the `tinydvd.desktop` application launcher in GNOME's application menu.
 3. Installs the FreeDesktop MIME database package for `*.tdvd` and `*.tinydvd` (`video/x-tinydvd`).
 4. Installs the vector application and file icons in `hicolor/scalable`.

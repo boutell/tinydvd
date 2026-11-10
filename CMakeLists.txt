@@ -120,6 +120,11 @@ install(PROGRAMS scripts/tinydvd-thumbnailer.py
     RENAME tinydvd-thumbnailer
 )
 
+install(PROGRAMS scripts/tinydvd-set-thumbnail.py
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    RENAME tinydvd-set-thumbnail
+)
+
 install(FILES data/tinydvd.thumbnailer
     DESTINATION ${CMAKE_INSTALL_DATADIR}/thumbnailers
 )
