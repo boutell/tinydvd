@@ -1,6 +1,7 @@
 #include "dvd_vm_bridge.h"
 #include "mvob_parser.h"
 #include "tdvd_archive.h"
+#include "spu_png.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -117,7 +118,10 @@ struct dvd_vm_bridge {
     size_t       vobu_capacity;
 
     char         loaded_mkv_path[1024];
+    char         current_video_name[64];
     int64_t      expected_next_pts_nanos;
+    int64_t      external_pts_nanos;
+    int64_t      current_pts_nanos;
     size_t       current_vobu_idx;
     int64_t      seek_target_vobu_idx;
     bool         user_paused;
@@ -125,6 +129,10 @@ struct dvd_vm_bridge {
     /* Active NV_PCK highlight state */
     bool         has_active_hli;
     hli_t        active_hli;
+
+    /* Web streaming & event callback */
+    dvd_vm_event_callback_t event_cb;
+    void        *event_user_data;
 
     /* Threading & user input */
     pthread_t    thread;
@@ -137,6 +145,8 @@ struct dvd_vm_bridge {
     int          action_y;
     double       action_frac;
 };
+
+static void emit_highlight_event(dvd_vm_bridge_t *b);
 
 /* TINYDVD_TRACE=1 logs navigation to stderr: every PGC entered and every
  * navigation command run, with the general registers. For diagnosing discs
@@ -898,13 +908,24 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
     if (mkv_name[0] && resolve_mkv_subfile(b, mkv_name, mkv_full, sizeof(mkv_full))) {
         if (strcmp(b->loaded_mkv_path, mkv_full) != 0) {
             strncpy(b->loaded_mkv_path, mkv_full, sizeof(b->loaded_mkv_path) - 1);
+            strncpy(b->current_video_name, mkv_name, sizeof(b->current_video_name) - 1);
             b->expected_next_pts_nanos = -1;
+            b->external_pts_nanos = 0;
             if (b->mpv) {
                 fprintf(stderr, "[dvd_vm] Loading companion MKV: %s\n", mkv_full);
                 mpv_controller_load_file(b->mpv, mkv_full, NULL);
                 if (b->domain == DVD_DOMAIN_VTSTT) {
                     mpv_controller_set_audio_track(b->mpv, (int)(b->sprm[1] & 0x0F) + 1);
                 }
+            }
+            if (b->event_cb) {
+                dvd_vm_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DVD_VM_EVENT_LOAD_VIDEO;
+                ev.video_name = b->current_video_name;
+                ev.pts_nanos = 0;
+                ev.paused = b->user_paused;
+                b->event_cb(b->event_user_data, &ev);
             }
         }
     }
@@ -958,6 +979,7 @@ static bool vm_enter_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int p
     if (b->spu) {
         spu_compositor_clear(b->spu);
     }
+    emit_highlight_event(b);
 
     /* Execute PGC Pre-commands on PGC entry before indexing/loading MKV */
     if (pgc->command_tbl && pgc->command_tbl->nr_of_pre > 0) {
@@ -1006,16 +1028,66 @@ static int get_selected_button_1based(dvd_vm_bridge_t *b) {
     return btn;
 }
 
+static void emit_highlight_event(dvd_vm_bridge_t *b) {
+    if (!b || !b->event_cb) return;
+    dvd_vm_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.type = DVD_VM_EVENT_HIGHLIGHT;
+    ev.frame_w = 720;
+    ev.frame_h = domain_frame_height(b);
+    ev.active_button = (b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) ? get_selected_button_1based(b) : 0;
+    if (b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) {
+        ev.button_count = b->active_hli.hl_gi.btn_ns;
+        if (ev.button_count > 36) ev.button_count = 36;
+        for (int i = 0; i < ev.button_count; i++) {
+            ev.buttons[i].btn_id = i + 1;
+            ev.buttons[i].x1 = b->active_hli.btnit[i].x_start;
+            ev.buttons[i].y1 = b->active_hli.btnit[i].y_start;
+            ev.buttons[i].x2 = b->active_hli.btnit[i].x_end;
+            ev.buttons[i].y2 = b->active_hli.btnit[i].y_end;
+        }
+        if (b->spu) {
+            int w = 0, h = 0;
+            const uint32_t *rgba = spu_compositor_get_rgba(b->spu, &w, &h);
+            if (rgba && w > 0 && h > 0) {
+                ev.highlight_data_url = spu_rgba_to_data_url(rgba, w, h);
+                ev.frame_w = w;
+                ev.frame_h = h;
+            }
+        }
+    }
+    b->event_cb(b->event_user_data, &ev);
+    if (ev.highlight_data_url) {
+        free(ev.highlight_data_url);
+    }
+}
+
+static void vm_osd_message(dvd_vm_bridge_t *b, const char *msg) {
+    if (!b || !msg) return;
+    if (b->mpv) {
+        mpv_controller_osd_message(b->mpv, msg);
+    }
+    if (b->event_cb) {
+        dvd_vm_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = DVD_VM_EVENT_OSD;
+        ev.osd_message = msg;
+        b->event_cb(b->event_user_data, &ev);
+    }
+}
+
 static void refresh_button_highlight_on_spu(dvd_vm_bridge_t *b, bool action_palette) {
-    if (!b || !b->spu) return;
+    if (!b) return;
     if (!b->has_active_hli || b->active_hli.hl_gi.btn_ns == 0) {
-        spu_compositor_clear_highlight(b->spu);
+        if (b->spu) spu_compositor_clear_highlight(b->spu);
+        emit_highlight_event(b);
         return;
     }
 
     int btn_idx = get_selected_button_1based(b);
     if (btn_idx < 1 || btn_idx > 36) {
-        spu_compositor_clear_highlight(b->spu);
+        if (b->spu) spu_compositor_clear_highlight(b->spu);
+        emit_highlight_event(b);
         return;
     }
 
@@ -1025,12 +1097,15 @@ static void refresh_button_highlight_on_spu(dvd_vm_bridge_t *b, bool action_pale
         palette = b->active_hli.btn_colit.btn_coli[bt->btn_coln - 1][action_palette ? 1 : 0];
     }
 
-    spu_compositor_set_highlight(b->spu,
-                                 (uint16_t)bt->x_start,
-                                 (uint16_t)bt->y_start,
-                                 (uint16_t)bt->x_end,
-                                 (uint16_t)bt->y_end,
-                                 palette);
+    if (b->spu) {
+        spu_compositor_set_highlight(b->spu,
+                                     (uint16_t)bt->x_start,
+                                     (uint16_t)bt->y_start,
+                                     (uint16_t)bt->x_end,
+                                     (uint16_t)bt->y_end,
+                                     palette);
+    }
+    emit_highlight_event(b);
 }
 
 /* =========================================================================
@@ -1097,7 +1172,7 @@ static int get_chapter_for_cell(pgc_t *pgc, int cell_nr, int *out_total_chapters
 }
 
 static void show_timeline_osd(dvd_vm_bridge_t *b, uint64_t cur_pts, uint64_t min_pts, uint64_t max_pts, int cell_nr) {
-    if (!b || !b->mpv || !b->current_pgc) return;
+    if (!b || !b->current_pgc) return;
     uint64_t rel_cur = (cur_pts >= min_pts) ? ((cur_pts - min_pts) / 1000000000ULL) : 0;
     uint64_t rel_tot = (max_pts >= min_pts) ? ((max_pts - min_pts) / 1000000000ULL) : 0;
     char cur_str[32], tot_str[32], osd[128];
@@ -1106,7 +1181,7 @@ static void show_timeline_osd(dvd_vm_bridge_t *b, uint64_t cur_pts, uint64_t min
     int total_chaps = 1;
     int chap = get_chapter_for_cell(b->current_pgc, cell_nr, &total_chaps);
     snprintf(osd, sizeof(osd), "Timeline: %s / %s  (Chapter %d/%d)", cur_str, tot_str, chap, total_chaps);
-    mpv_controller_osd_message(b->mpv, osd);
+    vm_osd_message(b, osd);
 }
 
 static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_seconds, double fraction) {
@@ -1164,6 +1239,7 @@ static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_sec
     if (b->spu) {
         spu_compositor_clear(b->spu);
     }
+    emit_highlight_event(b);
 
     int total_chaps = 1;
     b->sprm[7] = (uint16_t)get_chapter_for_cell(pgc, best_cell, &total_chaps);
@@ -1197,6 +1273,7 @@ static bool vm_step_chapter(dvd_vm_bridge_t *b, int delta_chap) {
     if (b->spu) {
         spu_compositor_clear(b->spu);
     }
+    emit_highlight_event(b);
 
     /* Find first VOBU of target_cell for OSD timestamp */
     uint64_t min_pts = 0, max_pts = 0;
@@ -1248,8 +1325,8 @@ static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
         b->sprm[2] = on ? 0x0040 : 0x0000;
         if (b->mpv) {
             mpv_controller_set_subtitle_track(b->mpv, on ? 1 : 0);
-            mpv_controller_osd_message(b->mpv, on ? "Closed Captions / Subtitles: On" : "Closed Captions / Subtitles: Off");
         }
+        vm_osd_message(b, on ? "Closed Captions / Subtitles: On" : "Closed Captions / Subtitles: Off");
         return;
     }
 
@@ -1266,33 +1343,32 @@ static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
 
     if (b->spu && b->domain == DVD_DOMAIN_VTSTT) {
         spu_compositor_clear(b->spu);
+        emit_highlight_event(b);
     }
     if (b->current_pgc) {
         apply_pgc_clut_and_streams(b, b->current_pgc);
     }
 
-    if (b->mpv) {
-        if ((b->sprm[2] & 0x0040) == 0) {
-            mpv_controller_osd_message(b->mpv, "Closed Captions / Subtitles: Off");
-            fprintf(stderr, "[dvd_vm] Closed Captions / Subtitles: Off\n");
-        } else {
-            int t = b->sprm[2] & 0x1F;
-            subp_attr_t attr = vtsi->vtsi_mat->vts_subp_attr[t];
-            char code[4];
-            const char *lang_name = iso639_name(attr.lang_code, code);
-            const char *ext = "";
-            if (attr.code_extension == 5 || attr.code_extension == 6 || attr.code_extension == 7 ||
-                (t == 0 && strcmp(code, "en") == 0)) {
-                ext = " [CC / SDH]";
-            } else if (attr.code_extension == 9) {
-                ext = " [Forced]";
-            }
-            char osd[128];
-            snprintf(osd, sizeof(osd), "Closed Captions / Subtitles: Track %d - %s (%s)%s",
-                     t + 1, lang_name, code, ext);
-            mpv_controller_osd_message(b->mpv, osd);
-            fprintf(stderr, "[dvd_vm] %s\n", osd);
+    if ((b->sprm[2] & 0x0040) == 0) {
+        vm_osd_message(b, "Closed Captions / Subtitles: Off");
+        fprintf(stderr, "[dvd_vm] Closed Captions / Subtitles: Off\n");
+    } else {
+        int t = b->sprm[2] & 0x1F;
+        subp_attr_t attr = vtsi->vtsi_mat->vts_subp_attr[t];
+        char code[4];
+        const char *lang_name = iso639_name(attr.lang_code, code);
+        const char *ext = "";
+        if (attr.code_extension == 5 || attr.code_extension == 6 || attr.code_extension == 7 ||
+            (t == 0 && strcmp(code, "en") == 0)) {
+            ext = " [CC / SDH]";
+        } else if (attr.code_extension == 9) {
+            ext = " [Forced]";
         }
+        char osd[128];
+        snprintf(osd, sizeof(osd), "Closed Captions / Subtitles: Track %d - %s (%s)%s",
+                 t + 1, lang_name, code, ext);
+        vm_osd_message(b, osd);
+        fprintf(stderr, "[dvd_vm] %s\n", osd);
     }
 }
 
@@ -1307,18 +1383,18 @@ static void vm_cycle_audio(dvd_vm_bridge_t *b) {
 
     if (b->mpv) {
         mpv_controller_set_audio_track(b->mpv, next_aud + 1);
-        char osd[128];
-        if (vtsi && vtsi->vtsi_mat && next_aud < vtsi->vtsi_mat->nr_of_vts_audio_streams) {
-            audio_attr_t attr = vtsi->vtsi_mat->vts_audio_attr[next_aud];
-            char code[4];
-            const char *lang_name = iso639_name(attr.lang_code, code);
-            snprintf(osd, sizeof(osd), "Audio: Track %d/%d - %s (%s)", next_aud + 1, nr_aud, lang_name, code);
-        } else {
-            snprintf(osd, sizeof(osd), "Audio: Track %d/%d", next_aud + 1, nr_aud);
-        }
-        mpv_controller_osd_message(b->mpv, osd);
-        fprintf(stderr, "[dvd_vm] %s\n", osd);
     }
+    char osd[128];
+    if (vtsi && vtsi->vtsi_mat && next_aud < vtsi->vtsi_mat->nr_of_vts_audio_streams) {
+        audio_attr_t attr = vtsi->vtsi_mat->vts_audio_attr[next_aud];
+        char code[4];
+        const char *lang_name = iso639_name(attr.lang_code, code);
+        snprintf(osd, sizeof(osd), "Audio: Track %d/%d - %s (%s)", next_aud + 1, nr_aud, lang_name, code);
+    } else {
+        snprintf(osd, sizeof(osd), "Audio: Track %d/%d", next_aud + 1, nr_aud);
+    }
+    vm_osd_message(b, osd);
+    fprintf(stderr, "[dvd_vm] %s\n", osd);
 }
 
 static bool is_dummy_rsm_menu(const pgc_t *pgc) {
@@ -1445,7 +1521,14 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
             b->user_paused = !b->user_paused;
             if (b->mpv) {
                 mpv_controller_pause(b->mpv, b->user_paused);
-                mpv_controller_osd_message(b->mpv, b->user_paused ? "Paused" : "Playing");
+            }
+            vm_osd_message(b, b->user_paused ? "Paused" : "Playing");
+            if (b->event_cb) {
+                dvd_vm_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = DVD_VM_EVENT_PAUSE;
+                ev.paused = b->user_paused;
+                b->event_cb(b->event_user_data, &ev);
             }
             return false;
         }
@@ -1583,6 +1666,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
             } else if (pci.hli.hl_gi.hli_ss == 0) {
                 b->has_active_hli = false;
                 if (b->spu) spu_compositor_clear_highlight(b->spu);
+                emit_highlight_event(b);
             }
         } else {
             /* Feed SPU sectors to compositor */
@@ -1602,11 +1686,26 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
     }
 
     if (is_static_still_cell) {
+        b->current_pts_nanos = (int64_t)entry->pts_nanos;
         if (b->mpv) {
             fprintf(stderr, "[dvd_vm] Seeking to %.3fs (Still Cell %d, LBN %u)\n",
                     (double)entry->pts_nanos / 1e9, b->cell_nr, entry->orig_lbn);
             mpv_controller_pause(b->mpv, true);
             mpv_controller_seek_exact(b->mpv, entry->pts_nanos);
+        }
+        if (b->event_cb) {
+            dvd_vm_event_t ev_seek;
+            memset(&ev_seek, 0, sizeof(ev_seek));
+            ev_seek.type = DVD_VM_EVENT_SEEK;
+            ev_seek.pts_nanos = entry->pts_nanos;
+            ev_seek.paused = true;
+            b->event_cb(b->event_user_data, &ev_seek);
+
+            dvd_vm_event_t ev_pause;
+            memset(&ev_pause, 0, sizeof(ev_pause));
+            ev_pause.type = DVD_VM_EVENT_PAUSE;
+            ev_pause.paused = true;
+            b->event_cb(b->event_user_data, &ev_pause);
         }
         b->expected_next_pts_nanos = -1;
         return false;
@@ -1635,11 +1734,22 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
         }
     }
 
-    if (need_seek && b->mpv) {
-        fprintf(stderr, "[dvd_vm] Seeking to %.3fs (Cell %d, LBN %u)\n",
-                (double)entry->pts_nanos / 1e9, b->cell_nr, entry->orig_lbn);
-        mpv_controller_seek_exact(b->mpv, entry->pts_nanos);
-        mpv_controller_pause(b->mpv, b->user_paused);
+    b->current_pts_nanos = (int64_t)entry->pts_nanos;
+    if (need_seek) {
+        if (b->mpv) {
+            fprintf(stderr, "[dvd_vm] Seeking to %.3fs (Cell %d, LBN %u)\n",
+                    (double)entry->pts_nanos / 1e9, b->cell_nr, entry->orig_lbn);
+            mpv_controller_seek_exact(b->mpv, entry->pts_nanos);
+            mpv_controller_pause(b->mpv, b->user_paused);
+        }
+        if (b->event_cb) {
+            dvd_vm_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.type = DVD_VM_EVENT_SEEK;
+            ev.pts_nanos = entry->pts_nanos;
+            ev.paused = b->user_paused;
+            b->event_cb(b->event_user_data, &ev);
+        }
     } else if (b->mpv && !b->user_paused && mpv_controller_is_paused(b->mpv)) {
         mpv_controller_pause(b->mpv, false);
     }
@@ -1665,15 +1775,34 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
             continue;
         }
 
-        uint64_t elapsed_wall = monotonic_nanos() - start_wall;
-        if (elapsed_wall >= target_dur) {
+        if (getenv("TINYDVD_FAST_TEST") != NULL) {
             break;
         }
 
-        /* Also check mpv's media clock after initial seek settle window (80ms) */
-        if (b->mpv && elapsed_wall >= 80000000ULL) {
-            uint64_t mpv_pts = mpv_controller_get_pts_nanos(b->mpv);
-            if (mpv_pts >= vobu_end_pts && mpv_pts <= vobu_end_pts + 1500000000ULL) {
+        if (b->mpv) {
+            uint64_t elapsed_wall = monotonic_nanos() - start_wall;
+            if (elapsed_wall >= target_dur) {
+                break;
+            }
+            if (elapsed_wall >= 80000000ULL) {
+                uint64_t cur_pts = mpv_controller_get_pts_nanos(b->mpv);
+                if (cur_pts >= vobu_end_pts && cur_pts <= vobu_end_pts + 1500000000ULL) {
+                    break;
+                }
+            }
+        } else if (b->event_cb) {
+            uint64_t elapsed_wall = monotonic_nanos() - start_wall;
+            /* Web server mode: advance strictly synchronized to external browser media clock */
+            if (b->external_pts_nanos > 0 && (uint64_t)b->external_pts_nanos >= vobu_end_pts) {
+                break;
+            }
+            /* Safety fallback: if no external progress for > 60 seconds and not paused, advance */
+            if (elapsed_wall >= 60000000000ULL) {
+                break;
+            }
+        } else {
+            uint64_t elapsed_wall = monotonic_nanos() - start_wall;
+            if (elapsed_wall >= target_dur) {
                 break;
             }
         }
@@ -2056,4 +2185,43 @@ void dvd_vm_bridge_cycle_audio(dvd_vm_bridge_t *b)               { queue_action(
 
 bool dvd_vm_bridge_is_running(dvd_vm_bridge_t *b) {
     return b ? b->running : false;
+}
+
+void dvd_vm_bridge_set_event_callback(dvd_vm_bridge_t *b, dvd_vm_event_callback_t cb, void *user_data) {
+    if (!b) return;
+    pthread_mutex_lock(&b->lock);
+    b->event_cb = cb;
+    b->event_user_data = user_data;
+    pthread_mutex_unlock(&b->lock);
+}
+
+void dvd_vm_bridge_report_pts(dvd_vm_bridge_t *b, int64_t pts_nanos) {
+    if (!b) return;
+    b->external_pts_nanos = pts_nanos;
+}
+
+spu_compositor_t *dvd_vm_bridge_get_spu(dvd_vm_bridge_t *b) {
+    return b ? b->spu : NULL;
+}
+
+const char *dvd_vm_bridge_get_loaded_video(dvd_vm_bridge_t *b) {
+    return b ? b->current_video_name : "";
+}
+
+int64_t dvd_vm_bridge_get_current_pts_nanos(dvd_vm_bridge_t *b) {
+    return b ? b->current_pts_nanos : 0;
+}
+
+bool dvd_vm_bridge_is_paused(dvd_vm_bridge_t *b) {
+    return b ? b->user_paused : false;
+}
+
+void dvd_vm_bridge_set_paused(dvd_vm_bridge_t *b, bool paused) {
+    if (!b) return;
+    pthread_mutex_lock(&b->lock);
+    b->user_paused = paused;
+    if (b->mpv) {
+        mpv_controller_pause(b->mpv, paused);
+    }
+    pthread_mutex_unlock(&b->lock);
 }

@@ -19,6 +19,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(ZLIB REQUIRED)
 
 pkg_check_modules(DVDREAD REQUIRED dvdread)
 pkg_check_modules(MPV REQUIRED mpv)
@@ -41,6 +42,9 @@ set(TINYDVD_SOURCES
     src/dvd_vm_bridge.c
     src/mpv_controller.c
     src/spu_compositor.c
+    src/spu_png.c
+    src/sha1.c
+    src/web_server.c
 )
 
 add_executable(tinydvd ${TINYDVD_SOURCES})
@@ -52,6 +56,7 @@ target_link_libraries(tinydvd
     ${SDL2_LIBRARIES}
     ${OPENGL_LIBRARIES}
     Threads::Threads
+    ZLIB::ZLIB
 )
 
 target_link_directories(tinydvd
@@ -81,10 +86,15 @@ add_executable(test_spu tests/test_spu_rle.c src/spu_compositor.c)
 target_include_directories(test_spu PRIVATE src ${OPENGL_INCLUDE_DIRS})
 target_link_libraries(test_spu PRIVATE ${OPENGL_LIBRARIES})
 
-add_executable(test_dvd_vm tests/test_dvd_vm.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/mpv_controller.c)
+add_executable(test_dvd_vm tests/test_dvd_vm.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/mpv_controller.c)
 target_include_directories(test_dvd_vm PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
-target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads)
+target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
 target_link_directories(test_dvd_vm PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
+
+add_executable(test_web tests/test_web_server.c src/web_server.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/sha1.c src/mpv_controller.c)
+target_include_directories(test_web PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
+target_link_libraries(test_web PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
+target_link_directories(test_web PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
 
 # Installation rules for Linux / GNOME desktop integration
 include(GNUInstallDirs)

@@ -9,11 +9,13 @@
 #include <stdbool.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 
 #include "mvob_parser.h"
 #include "mpv_controller.h"
 #include "spu_compositor.h"
 #include "dvd_vm_bridge.h"
+#include "web_server.h"
 
 #define TINYDVD_VERSION "1.0.0"
 #define WAKEUP_EVENT (SDL_USEREVENT + 1)
@@ -66,6 +68,9 @@ static void print_usage(const char *prog) {
     printf("Interactive DVD-Video Hybrid Player (.tdvd / H.264 + Meta-VOB)\n\n");
     printf("Usage: %s [options] <movie.tdvd | tinydvd_directory>\n\n", prog);
     printf("Options:\n");
+    printf("  -s, --serve          Start embedded web streaming server\n");
+    printf("  -p, --port <port>    Web server port (default: 8080)\n");
+    printf("  -b, --bind <ip>      Web server bind address (default: 0.0.0.0)\n");
     printf("  -f, --fullscreen     Start in fullscreen mode\n");
     printf("  -h, --help           Show this help text\n");
     printf("  -v, --version        Show version information\n\n");
@@ -91,6 +96,9 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     const char *dvd_path = NULL;
     bool start_fullscreen = false;
+    bool serve_mode = false;
+    int port = 8080;
+    const char *bind_addr = "0.0.0.0";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -99,6 +107,16 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
             printf("tinydvd v%s\n", TINYDVD_VERSION);
             return 0;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--serve") == 0) {
+            serve_mode = true;
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--port") == 0) {
+            if (i + 1 < argc) {
+                port = atoi(argv[++i]);
+            }
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--bind") == 0) {
+            if (i + 1 < argc) {
+                bind_addr = argv[++i];
+            }
         } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--fullscreen") == 0) {
             start_fullscreen = true;
         } else if (argv[i][0] != '-') {
@@ -114,6 +132,27 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: No DVD path specified.\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (serve_mode) {
+        signal(SIGINT, handle_sigint);
+        signal(SIGTERM, handle_sigint);
+        web_server_config_t config = {
+            .bind_addr = bind_addr,
+            .port = port,
+            .target_path = dvd_path
+        };
+        web_server_t *server = web_server_start(&config);
+        if (!server) {
+            fprintf(stderr, "Failed to start web server.\n");
+            return 1;
+        }
+        while (!g_quit_requested) {
+            sleep(1);
+        }
+        printf("\nStopping web server...\n");
+        web_server_destroy(server);
+        return 0;
     }
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
