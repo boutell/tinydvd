@@ -157,6 +157,9 @@ int main(int argc, char *argv[]) {
     SDL_GL_MakeCurrent(window, gl_ctx);
     SDL_GL_SetSwapInterval(1); /* vsync */
 
+    /* Prevent screensaver / screen blanking / idle sleep during playback */
+    SDL_DisableScreenSaver();
+
     /* Initialize subsystems */
     mpv_controller_t *mpv = mpv_controller_init(get_proc_address_sdl, on_mpv_update_cb, NULL);
     if (!mpv) {
@@ -345,6 +348,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("[main] Cleaning up...\n");
+    SDL_EnableScreenSaver();
     dvd_vm_bridge_destroy(bridge);
     spu_compositor_destroy(spu);
     mpv_controller_destroy(mpv);
