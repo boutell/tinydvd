@@ -67,7 +67,71 @@ This builds the player binary at `./build/tinydvd`.
 
 ## 2. How to Use It in Practice
 
-### Step 1: Rip a DVD (If Starting from a Physical Disc)
+### Common End-to-End Linux Desktop Use Cases
+
+If you (or an automated assistant) are looking to get from a physical disc to watching your movies with zero friction, follow these two standard recipes:
+
+#### Recipe 1: "How do I just import a DVD and put it with my other videos?"
+
+1. **Rip the physical disc into `./rips`:**
+   Linux optical disc drives are well-known as `/dev/sr0` (often symlinked as `/dev/cdrom` or `/dev/dvd`). The `./rips` folder in this repository is already `.gitignore`d, making it the perfect temporary staging ground:
+   ```bash
+   mkdir -p ./rips
+   dvdbackup -M -i /dev/sr0 -o ./rips
+   ```
+   *Note: `dvdbackup -M` creates a folder inside `./rips` matching the disc's volume label (e.g. `./rips/DUNE`).*
+
+2. **Convert directly to a `.tdvd` file in `~/Videos`:**
+   Convert the ripped folder into a single, self-contained `.tdvd` archive saved directly to your standard `~/Videos` directory:
+   ```bash
+   ./scripts/convert-to-tinydvd ./rips/DUNE ~/Videos/Dune.tdvd
+   ```
+   - **Automatic Enrichment:** Metadata enrichment (director, cast, genres, year, plot overview) runs **by default** during conversion. (To opt out of network metadata lookup, pass `--skip-enrichment`).
+   - **Automatic Thumbnail:** An optimal menu thumbnail is embedded automatically so GNOME Files / Nautilus displays rich cover art.
+   - **Clean up the raw rip:** Once conversion finishes, delete the temporary raw rip to reclaim space:
+     ```bash
+     rm -rf ./rips/DUNE
+     ```
+
+3. **Browse and play in Videos:**
+   Tell the user to open their standard `~/Videos` folder in their desktop file manager (e.g. GNOME Files / Nautilus):
+   ```bash
+   xdg-open ~/Videos
+   ```
+   The `.tdvd` file appears right alongside your other media files with its generated video thumbnail. Simply double-click it to play in `tinydvd` (if you ran `./install`), or run:
+   ```bash
+   tinydvd ~/Videos/Dune.tdvd
+   ```
+
+---
+
+#### Recipe 2: "How do I just serve my tinydvds with the web player?"
+
+To stream your collection to any web browser, tablet, phone, or smart TV on your local network:
+
+1. **Point the player app directly at `~/Videos`:**
+   ```bash
+   # Run the server on ~/Videos:
+   tinydvd --serve ~/Videos
+
+   # Or bind to 0.0.0.0 on port 8080 for access from other devices on your LAN:
+   tinydvd --serve ~/Videos --port 8080 --bind 0.0.0.0
+   ```
+
+2. **Graceful Tolerance of Non-TinyDVD Files:**
+   You do not need to separate your `.tdvd` files into their own isolated folder. TinyDVD expands `~` automatically and scans `~/Videos`, **tolerating and silently ignoring** any non-TinyDVD files (such as `.mp4`, `.mkv`, `.avi`, `.srt`, or downloads) and other subdirectories. Only `.tdvd` archives (and unpacked TinyDVD folders) are added to the library catalog.
+
+3. **Enjoy in Your Browser:**
+   Open `http://localhost:8080` (or `http://<your-ip>:8080` from any other device). You can:
+   - Search your catalog live by **actor, director, genre, title, or year**.
+   - Click any card to launch the interactive DVD player in full cinema mode.
+   - Enjoy multi-session isolation: multiple family members or tabs can watch different movies or menus at the same time without interfering with each other.
+
+---
+
+### Step-by-Step Manual Workflow
+
+#### Step 1: Rip a DVD (If Starting from a Physical Disc)
 
 If you are starting from a commercial encrypted DVD in an optical drive, use `dvdbackup` to rip a decrypted copy to disk first (if you already have a decrypted DVD folder or `.iso`, skip to Step 2):
 
@@ -79,36 +143,80 @@ dvdbackup -M -i /dev/rdisk4 -o ./rips
 dvdbackup -M -i /dev/sr0 -o ./rips
 ```
 
-### Step 2: Convert with `convert-to-tinydvd`
+#### Step 2: Convert with `convert-to-tinydvd`
 
 Run [`scripts/convert-to-tinydvd`](file:///Users/boutell/boutell/tinydvd/scripts/convert-to-tinydvd.py) on your ripped DVD folder or `.iso` image to produce a single `.tdvd` file (or an unpacked folder):
 
 ```bash
-# Produce a single-file .tdvd archive:
-./scripts/convert-to-tinydvd ./rips/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd
+# Produce a single-file .tdvd archive (metadata enrichment is enabled by default):
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd
+
+# Skip online metadata enrichment if offline or desired:
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --skip-enrichment
+
+# Supply TMDb API key for enhanced metadata lookup:
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --tmdb-key "your_api_key"
 
 # Or from an unencrypted ISO image:
-./scripts/convert-to-tinydvd /path/to/movie.iso ./tinydvds/MY_MOVIE.tdvd
+./scripts/convert-to-tinydvd /path/to/movie.iso ~/Videos/MY_MOVIE.tdvd
 
 # Or package an already-converted tinydvd directory into a single .tdvd file without re-encoding:
-./scripts/convert-to-tinydvd ./tinydvds/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd
+./scripts/convert-to-tinydvd ./tinydvds/MY_MOVIE ~/Videos/MY_MOVIE.tdvd
 
 # Custom H.264 CRF quality and preset:
-./scripts/convert-to-tinydvd ./rips/MY_MOVIE ./tinydvds/MY_MOVIE.tdvd --crf 18 --preset slow
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --crf 18 --preset slow
 ```
 
-### Step 3: Play with `tinydvd`
+#### Step 3: Play with `tinydvd`
 
 Launch the player pointing to your `.tdvd` file (or converted directory), or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager:
 
 ```bash
-./build/tinydvd ./tinydvds/MY_MOVIE.tdvd
+./build/tinydvd ~/Videos/MY_MOVIE.tdvd
 
 # Or start directly in fullscreen:
-./build/tinydvd --fullscreen ./tinydvds/MY_MOVIE.tdvd
+./build/tinydvd --fullscreen ~/Videos/MY_MOVIE.tdvd
 
 # Unpacked tinydvd directories are also supported:
 ./build/tinydvd ./tinydvds/MY_MOVIE
+```
+
+#### Step 4: Web Player & Library Catalog (`--serve`)
+
+You can stream any `.tdvd` movie or an entire folder of movies to modern web browsers over HTTP/WebSocket with **full interactive DVD menu navigation, seeking, chapter stepping, and subtitle controls**:
+
+```bash
+# Play a single movie in direct web cinema mode:
+./build/tinydvd --serve ./tinydvds/MY_MOVIE.tdvd
+
+# Or serve an entire collection with catalog browsing and search:
+./build/tinydvd --serve ./tinydvds/
+
+# Custom port and network bind (e.g. for access across your local LAN):
+./build/tinydvd --serve ./tinydvds/ --port 8080 --bind 0.0.0.0
+```
+
+* **Multi-Session Isolation**: Every browser tab and device gets its own independent DVD VM and playback timeline—different family members can watch or browse different movies at the same time without interfering with each other.
+* **Instant Fast Remuxing & Caching**: Video chunks are remuxed on-demand into fast-start MP4 with HTTP 206 byte-range seeking and cached on disk.
+* **Live Catalog Search**: Search your collection instantly by **actor, director, genre, title, year**, or plot summary.
+
+### Movie Metadata & Search Enrichment (`tinydvd_metadata.py`)
+
+To enrich your `.tdvd` collection with cast, directors, release years, and plot summaries from public movie databases:
+
+```bash
+# Automatically compute disc ID and enrich from public databases:
+./scripts/tinydvd_metadata.py ./tinydvds/MY_MOVIE.tdvd
+
+# Scan and enrich an entire directory of movies:
+./scripts/tinydvd_metadata.py ./tinydvds/
+
+# Use a TMDb API key for full director, top cast, and genre metadata:
+export TMDB_API_KEY="your_api_key_here"
+./scripts/tinydvd_metadata.py ./tinydvds/Dune.tdvd
+
+# Or manually supply/override metadata fields:
+./scripts/tinydvd_metadata.py ./tinydvds/Dune.tdvd --director "Denis Villeneuve" --year 2021 --cast "Timothée Chalamet, Zendaya"
 ```
 
 ### Thumbnails & Cover Art (`tinydvd-set-thumbnail`)

@@ -1035,8 +1035,8 @@ static void emit_highlight_event(dvd_vm_bridge_t *b) {
     ev.type = DVD_VM_EVENT_HIGHLIGHT;
     ev.frame_w = 720;
     ev.frame_h = domain_frame_height(b);
-    ev.active_button = (b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) ? get_selected_button_1based(b) : 0;
-    if (b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) {
+    ev.active_button = (b->domain != DVD_DOMAIN_VTSTT && b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) ? get_selected_button_1based(b) : 0;
+    if (b->domain != DVD_DOMAIN_VTSTT && b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) {
         ev.button_count = b->active_hli.hl_gi.btn_ns;
         if (ev.button_count > 36) ev.button_count = 36;
         for (int i = 0; i < ev.button_count; i++) {
@@ -1078,7 +1078,7 @@ static void vm_osd_message(dvd_vm_bridge_t *b, const char *msg) {
 
 static void refresh_button_highlight_on_spu(dvd_vm_bridge_t *b, bool action_palette) {
     if (!b) return;
-    if (!b->has_active_hli || b->active_hli.hl_gi.btn_ns == 0) {
+    if (b->domain == DVD_DOMAIN_VTSTT || !b->has_active_hli || b->active_hli.hl_gi.btn_ns == 0) {
         if (b->spu) spu_compositor_clear_highlight(b->spu);
         emit_highlight_event(b);
         return;

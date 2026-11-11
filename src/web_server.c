@@ -37,6 +37,11 @@ typedef struct catalog_item {
     uint64_t size_bytes;
     char size_str[32];
     bool has_thumbnail;
+    int year;
+    char director[128];
+    char cast[512];
+    char genres[128];
+    char overview[1024];
 } catalog_item_t;
 
 typedef struct ws_client {
@@ -111,6 +116,8 @@ static void sanitize_id(const char *in, char *out, size_t out_len) {
     out[j] = '\0';
 }
 
+static void json_escape_copy(const char *in, char *out, size_t out_len);
+
 static void format_size(uint64_t bytes, char *buf, size_t len) {
     if (bytes >= 1073741824ULL) {
         snprintf(buf, len, "%.1f GB", (double)bytes / 1073741824.0);
@@ -122,8 +129,22 @@ static void format_size(uint64_t bytes, char *buf, size_t len) {
 }
 
 static bool is_tdvd_file(const char *path) {
+    if (!path) return false;
     size_t len = strlen(path);
-    return (len > 5 && strcmp(path + len - 5, ".tdvd") == 0);
+    if (len > 5 && strcasecmp(path + len - 5, ".tdvd") == 0) return true;
+    if (len > 8 && strcasecmp(path + len - 8, ".tinydvd") == 0) return true;
+    return false;
+}
+
+static bool is_tinydvd_dir(const char *dir_path) {
+    if (!dir_path) return false;
+    char ifo[1024];
+    struct stat st;
+    snprintf(ifo, sizeof(ifo), "%s/VIDEO_TS.IFO", dir_path);
+    if (stat(ifo, &st) == 0) return true;
+    snprintf(ifo, sizeof(ifo), "%s/video_ts.ifo", dir_path);
+    if (stat(ifo, &st) == 0) return true;
+    return false;
 }
 
 /* =========================================================================
@@ -958,18 +979,27 @@ static void handle_client_request(web_server_t *s, int client_fd) {
 
     /* Route: /api/library */
     if (strncmp(uri, "/api/library", 12) == 0) {
-        char json[16384];
+        char json[65536];
         int pos = snprintf(json, sizeof(json), "{\"is_directory\":%s,\"items\":[", s->is_library ? "true" : "false");
 
         for (int i = 0; i < s->catalog_count; i++) {
             catalog_item_t *item = &s->catalog[i];
-            char elem[512];
+            char e_title[512] = {0}, e_dir[256] = {0}, e_cast[1024] = {0}, e_gen[256] = {0}, e_ov[2048] = {0};
+            json_escape_copy(item->title, e_title, sizeof(e_title));
+            json_escape_copy(item->director, e_dir, sizeof(e_dir));
+            json_escape_copy(item->cast, e_cast, sizeof(e_cast));
+            json_escape_copy(item->genres, e_gen, sizeof(e_gen));
+            json_escape_copy(item->overview, e_ov, sizeof(e_ov));
+
+            char elem[4096];
             snprintf(elem, sizeof(elem),
-                     "%s{\"id\":\"%s\",\"title\":\"%s\",\"size_bytes\":%llu,\"size_str\":\"%s\",\"has_thumbnail\":%s}",
+                     "%s{\"id\":\"%s\",\"title\":\"%s\",\"size_bytes\":%llu,\"size_str\":\"%s\",\"has_thumbnail\":%s,"
+                     "\"year\":%d,\"director\":\"%s\",\"cast\":\"%s\",\"genres\":\"%s\",\"overview\":\"%s\"}",
                      (i > 0) ? "," : "",
-                     item->id, item->title,
+                     item->id, e_title,
                      (unsigned long long)item->size_bytes, item->size_str,
-                     item->has_thumbnail ? "true" : "false");
+                     item->has_thumbnail ? "true" : "false",
+                     item->year, e_dir, e_cast, e_gen, e_ov);
             int elen = strlen(elem);
             if (pos + elen + 10 < (int)sizeof(json)) {
                 strcpy(json + pos, elem);
@@ -1180,6 +1210,93 @@ static void *accept_loop(void *arg) {
  * Catalog Scanner & Public Lifecycle API
  * ========================================================================= */
 
+static void json_escape_copy(const char *in, char *out, size_t out_len) {
+    if (!in || !out || out_len == 0) return;
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j + 2 < out_len; i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\') {
+            out[j++] = '\\';
+            out[j++] = c;
+        } else if (c == '\n' || c == '\r' || c == '\t') {
+            out[j++] = ' ';
+        } else if ((unsigned char)c >= 32) {
+            out[j++] = c;
+        }
+    }
+    out[j] = '\0';
+}
+
+static void json_get_string(const char *json, const char *key, char *out, size_t out_len) {
+    if (!json || !key || !out || out_len == 0) return;
+    out[0] = '\0';
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return;
+    p += strlen(needle);
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
+    if (*p == '"') {
+        p++;
+        size_t i = 0;
+        while (*p && *p != '"' && i + 1 < out_len) {
+            if (*p == '\\' && *(p + 1)) p++;
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+    } else if (*p == '[') {
+        p++;
+        size_t i = 0;
+        bool in_str = false;
+        while (*p && *p != ']' && i + 4 < out_len) {
+            if (*p == '"') {
+                if (in_str) {
+                    in_str = false;
+                    const char *next = p + 1;
+                    while (*next && (*next == ' ' || *next == '\t' || *next == '\r' || *next == '\n')) next++;
+                    if (*next == ',') {
+                        out[i++] = ',';
+                        out[i++] = ' ';
+                    }
+                } else {
+                    in_str = true;
+                }
+            } else if (in_str) {
+                if (*p == '\\' && *(p + 1)) p++;
+                out[i++] = *p;
+            }
+            p++;
+        }
+        out[i] = '\0';
+    }
+}
+
+static int json_get_int(const char *json, const char *key) {
+    if (!json || !key) return 0;
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) return 0;
+    p += strlen(needle);
+    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
+    return atoi(p);
+}
+
+static void parse_catalog_metadata(catalog_item_t *item, const char *json) {
+    if (!item || !json) return;
+    char temp[256] = {0};
+    json_get_string(json, "title", temp, sizeof(temp));
+    if (temp[0]) strncpy(item->title, temp, sizeof(item->title) - 1);
+
+    int yr = json_get_int(json, "year");
+    if (yr > 0) item->year = yr;
+
+    json_get_string(json, "director", item->director, sizeof(item->director));
+    json_get_string(json, "cast", item->cast, sizeof(item->cast));
+    json_get_string(json, "genres", item->genres, sizeof(item->genres));
+    json_get_string(json, "overview", item->overview, sizeof(item->overview));
+}
+
 static void add_catalog_item(web_server_t *s, const char *path, const char *title) {
     if (s->catalog_count >= s->catalog_cap) {
         s->catalog_cap = s->catalog_cap ? (s->catalog_cap * 2) : 16;
@@ -1210,9 +1327,55 @@ static void add_catalog_item(web_server_t *s, const char *path, const char *titl
     if (is_tdvd_file(path)) {
         tdvd_archive_t *arc = tdvd_archive_open(path);
         if (arc) {
-            uint64_t off, sz;
-            item->has_thumbnail = tdvd_archive_find(arc, "thumbnail.png", &off, &sz);
+            uint64_t toff = 0, tsz = 0;
+            item->has_thumbnail = tdvd_archive_find(arc, "thumbnail.png", &toff, &tsz);
+
+            uint64_t moff = 0, msz = 0;
+            if (tdvd_archive_find(arc, "metadata.json", &moff, &msz) && msz > 0 && msz < 65536) {
+                FILE *mf = fopen(path, "rb");
+                if (mf) {
+                    fseeko(mf, (off_t)moff, SEEK_SET);
+                    char *mjson = (char *)malloc(msz + 1);
+                    if (mjson) {
+                        size_t nr = fread(mjson, 1, msz, mf);
+                        mjson[nr] = '\0';
+                        parse_catalog_metadata(item, mjson);
+                        free(mjson);
+                    }
+                    fclose(mf);
+                }
+            }
             tdvd_archive_close(arc);
+        }
+    }
+
+    /* Fallback: check for sidecar <path_without_ext>.json or metadata.json */
+    if (item->director[0] == '\0') {
+        char sidecar[1024];
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(sidecar, sizeof(sidecar), "%s/metadata.json", path);
+        } else {
+            snprintf(sidecar, sizeof(sidecar), "%s", path);
+            char *dot = strrchr(sidecar, '.');
+            if (dot) strcpy(dot, ".json");
+            else strncat(sidecar, ".json", sizeof(sidecar) - strlen(sidecar) - 1);
+        }
+
+        FILE *sf = fopen(sidecar, "rb");
+        if (sf) {
+            fseek(sf, 0, SEEK_END);
+            long ssz = ftell(sf);
+            if (ssz > 0 && ssz < 65536) {
+                fseek(sf, 0, SEEK_SET);
+                char *sbuf = (char *)malloc(ssz + 1);
+                if (sbuf) {
+                    size_t sn = fread(sbuf, 1, ssz, sf);
+                    sbuf[sn] = '\0';
+                    parse_catalog_metadata(item, sbuf);
+                    free(sbuf);
+                }
+            }
+            fclose(sf);
         }
     }
 }
@@ -1225,33 +1388,56 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     web_server_t *s = (web_server_t *)calloc(1, sizeof(web_server_t));
     s->port = config->port ? config->port : 8080;
     strncpy(s->bind_addr, config->bind_addr ? config->bind_addr : "0.0.0.0", sizeof(s->bind_addr) - 1);
-    strncpy(s->target_path, config->target_path, sizeof(s->target_path) - 1);
+
+    char expanded_path[1024];
+    if (config->target_path[0] == '~' && (config->target_path[1] == '/' || config->target_path[1] == '\0')) {
+        const char *home = getenv("HOME");
+        if (home) {
+            snprintf(expanded_path, sizeof(expanded_path), "%s%s", home, config->target_path + 1);
+        } else {
+            strncpy(expanded_path, config->target_path, sizeof(expanded_path) - 1);
+        }
+    } else {
+        strncpy(expanded_path, config->target_path, sizeof(expanded_path) - 1);
+    }
+    strncpy(s->target_path, expanded_path, sizeof(s->target_path) - 1);
 
     pthread_mutex_init(&s->sessions_lock, NULL);
 
     /* Determine mode: directory library scan vs single movie */
     struct stat st;
     if (stat(s->target_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        DIR *dir = opendir(s->target_path);
-        if (dir) {
-            struct dirent *de;
-            while ((de = readdir(dir)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                if (is_tdvd_file(de->d_name)) {
-                    char full[1024];
-                    snprintf(full, sizeof(full), "%s/%s", s->target_path, de->d_name);
-                    add_catalog_item(s, full, NULL);
-                }
-            }
-            closedir(dir);
-        }
-        if (s->catalog_count > 0) {
-            s->is_library = true;
-        } else {
+        if (is_tinydvd_dir(s->target_path)) {
+            /* Single movie raw directory mode (e.g. ./tinydvds/Dune with VIDEO_TS.IFO) */
             s->is_library = false;
             add_catalog_item(s, s->target_path, NULL);
+        } else {
+            /* Library collection directory mode (e.g. ~/Videos or ./tinydvds) */
+            s->is_library = true;
+            DIR *dir = opendir(s->target_path);
+            if (dir) {
+                struct dirent *de;
+                while ((de = readdir(dir)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    char full[1024];
+                    snprintf(full, sizeof(full), "%s/%s", s->target_path, de->d_name);
+                    struct stat entry_st;
+                    if (stat(full, &entry_st) != 0) continue;
+                    if (S_ISREG(entry_st.st_mode)) {
+                        if (is_tdvd_file(de->d_name)) {
+                            add_catalog_item(s, full, NULL);
+                        }
+                    } else if (S_ISDIR(entry_st.st_mode)) {
+                        if (is_tinydvd_dir(full)) {
+                            add_catalog_item(s, full, NULL);
+                        }
+                    }
+                }
+                closedir(dir);
+            }
         }
     } else {
+        /* Single file mode (e.g. /path/to/Movie.tdvd) */
         s->is_library = false;
         add_catalog_item(s, s->target_path, NULL);
     }

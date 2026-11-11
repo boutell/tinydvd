@@ -18,6 +18,20 @@ import contextlib
 import zipfile
 from fractions import Fraction
 
+try:
+    from . import tinydvd_metadata
+except (ImportError, ValueError):
+    try:
+        import tinydvd_metadata
+    except ImportError:
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        try:
+            import tinydvd_metadata
+        except ImportError:
+            tinydvd_metadata = None
+
 SECTOR_SIZE = 2048
 MVOB_MAGIC = 0x4D564F42  # "MVOB" in little-endian uint32
 MVOB_VERSION = 1
@@ -890,6 +904,10 @@ def main():
                              "By default each video keeps its own: discs mix 4:3 and 16:9 video, "
                              "often 4:3 warning screens before a widescreen movie.")
     parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
+    parser.add_argument("--skip-enrichment", action="store_true",
+                        help="Skip automatic metadata enrichment (director, cast, genres, overview, year)")
+    parser.add_argument("--tmdb-key", default=os.environ.get("TMDB_API_KEY", ""),
+                        help="TMDb API v3 key (or set TMDB_API_KEY environment variable)")
 
     args = parser.parse_args()
 
@@ -901,17 +919,39 @@ def main():
     print(f"Input:  {raw_input}")
     print(f"Output: {output_path}")
 
+    def do_enrich(target, hint=None):
+        if args.skip_enrichment:
+            return
+        try:
+            if tinydvd_metadata:
+                print("\n[metadata] Automatically enriching movie metadata & disc ID...")
+                tinydvd_metadata.enrich_movie(target, title_hint_path=hint or target, tmdb_key=args.tmdb_key)
+            else:
+                scripts_dir = os.path.dirname(os.path.abspath(__file__))
+                meta_script = os.path.join(scripts_dir, "tinydvd_metadata.py")
+                if os.path.isfile(meta_script):
+                    print("\n[metadata] Automatically enriching movie metadata & disc ID...")
+                    cmd = [sys.executable, meta_script, target]
+                    if args.tmdb_key:
+                        cmd += ["--tmdb-key", args.tmdb_key]
+                    subprocess.run(cmd, check=False)
+        except Exception as e:
+            print(f"[warning] Metadata enrichment failed: {e}", file=sys.stderr)
+
     if is_single_file:
         if is_already_converted_dir(raw_input):
             package_tdvd_archive(raw_input, output_path)
+            do_enrich(output_path, hint=output_path)
         else:
             parent_dir = os.path.dirname(output_path) or "."
             os.makedirs(parent_dir, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
                 run_conversion_to_dir(raw_input, stage_dir, args)
+                do_enrich(stage_dir, hint=output_path)
                 package_tdvd_archive(stage_dir, output_path)
     else:
         run_conversion_to_dir(raw_input, output_path, args)
+        do_enrich(output_path, hint=output_path)
 
     print("\nConversion completed successfully!")
 

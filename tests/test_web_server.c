@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 #include "sha1.h"
@@ -131,9 +132,12 @@ static void test_http_and_websocket_endpoints(const char *tdvd_path) {
         assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
         assert(strstr(resp, "application/json") != NULL);
         assert(strstr(resp, "\"items\":[") != NULL);
+        assert(strstr(resp, "Denis Villeneuve") != NULL);
+        assert(strstr(resp, "Timoth") != NULL);
+        assert(strstr(resp, "\"year\":2021") != NULL);
         close(fd);
         pthread_join(tid, NULL);
-        printf("  - GET /api/library: OK (JSON movie catalog)\n");
+        printf("  - GET /api/library: OK (JSON movie catalog with director, cast, year metadata)\n");
     }
 
     /* 3. Test GET /api/thumbnail */
@@ -280,12 +284,88 @@ static void test_http_and_websocket_endpoints(const char *tdvd_path) {
     printf("Web Server tests passed!\n");
 }
 
+static void test_library_directory_filtering(const char *tdvd_path) {
+    printf("Testing Web Server Directory Scanning & Non-TinyDVD Filtering...\n");
+
+    char abs_tdvd[1024];
+    assert(realpath(tdvd_path, abs_tdvd) != NULL);
+
+    /* Create a temporary mixed folder */
+    char test_dir[] = "/tmp/tinydvd_test_mixed_XXXXXX";
+    assert(mkdtemp(test_dir) != NULL);
+
+    /* 1. Add valid .tdvd (symlink to existing Dune.tdvd) */
+    char valid_tdvd[512];
+    snprintf(valid_tdvd, sizeof(valid_tdvd), "%s/Dune.tdvd", test_dir);
+    symlink(abs_tdvd, valid_tdvd);
+
+    /* 2. Add non-TinyDVD files: .mp4, .mkv, .txt */
+    char dummy_mp4[512], dummy_mkv[512], dummy_txt[512];
+    snprintf(dummy_mp4, sizeof(dummy_mp4), "%s/home_video.mp4", test_dir);
+    snprintf(dummy_mkv, sizeof(dummy_mkv), "%s/holiday_movie.mkv", test_dir);
+    snprintf(dummy_txt, sizeof(dummy_txt), "%s/readme.txt", test_dir);
+    FILE *f1 = fopen(dummy_mp4, "w"); if (f1) { fputs("dummy mp4", f1); fclose(f1); }
+    FILE *f2 = fopen(dummy_mkv, "w"); if (f2) { fputs("dummy mkv", f2); fclose(f2); }
+    FILE *f3 = fopen(dummy_txt, "w"); if (f3) { fputs("notes", f3); fclose(f3); }
+
+    /* 3. Add non-TinyDVD subdirectory */
+    char sub_dir[512];
+    snprintf(sub_dir, sizeof(sub_dir), "%s/OtherFolder", test_dir);
+    mkdir(sub_dir, 0755);
+
+    /* Start web server pointing at the mixed directory */
+    web_server_config_t cfg = {
+        .bind_addr = "127.0.0.1",
+        .port = 8992,
+        .target_path = test_dir
+    };
+    web_server_t *server = web_server_start(&cfg);
+    assert(server != NULL);
+
+    /* Query /api/library */
+    pthread_t tid;
+    int fd = start_client_session(server, &tid);
+    const char req[] = "GET /api/library HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    send(fd, req, sizeof(req) - 1, 0);
+
+    char resp[16384];
+    size_t total_recv = 0;
+    ssize_t n;
+    while ((n = recv(fd, resp + total_recv, sizeof(resp) - 1 - total_recv, 0)) > 0) {
+        total_recv += n;
+    }
+    resp[total_recv] = '\0';
+    close(fd);
+    pthread_join(tid, NULL);
+
+    /* Assert Dune is present, but .mp4, .mkv, .txt and OtherFolder are absent */
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "Dune") != NULL);
+    assert(strstr(resp, "home_video") == NULL);
+    assert(strstr(resp, "holiday_movie") == NULL);
+    assert(strstr(resp, "readme.txt") == NULL);
+    assert(strstr(resp, "OtherFolder") == NULL);
+
+    web_server_destroy(server);
+
+    /* Cleanup temporary files */
+    unlink(valid_tdvd);
+    unlink(dummy_mp4);
+    unlink(dummy_mkv);
+    unlink(dummy_txt);
+    rmdir(sub_dir);
+    rmdir(test_dir);
+
+    printf("  - Directory Filtering: OK (Tolerates & ignores non-TinyDVD files/folders, only lists .tdvd)\n");
+}
+
 int main(int argc, char *argv[]) {
     const char *tdvd = (argc > 1) ? argv[1] : "./tinydvds/Dune.tdvd";
     printf("=== Running TinyDVD Web Server & Protocol Tests ===\n");
     test_sha1_and_websocket_key();
     test_spu_png_encoding();
     test_http_and_websocket_endpoints(tdvd);
+    test_library_directory_filtering(tdvd);
     printf("All Web Server tests completed successfully!\n");
     return 0;
 }
