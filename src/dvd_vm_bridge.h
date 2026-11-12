@@ -117,6 +117,11 @@ void dvd_vm_bridge_set_event_callback(dvd_vm_bridge_t *bridge, dvd_vm_event_call
 void dvd_vm_bridge_report_pts(dvd_vm_bridge_t *bridge, int64_t pts_nanos);
 
 /**
+ * Report that the current video stream has ended in an external player.
+ */
+void dvd_vm_bridge_report_video_ended(dvd_vm_bridge_t *bridge);
+
+/**
  * Get the underlying SPU compositor.
  */
 spu_compositor_t *dvd_vm_bridge_get_spu(dvd_vm_bridge_t *bridge);

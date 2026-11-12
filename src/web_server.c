@@ -311,10 +311,15 @@ static void on_session_vm_event(void *user_data, const dvd_vm_event_t *ev) {
                     free(dyn);
                 }
             } else {
-                snprintf(buf, sizeof(buf),
-                         "{\"type\":\"highlight\",\"data_url\":null,\"w\":%d,\"h\":%d,\"active_btn\":0,\"buttons\":[]}",
-                         ev->frame_w, ev->frame_h);
-                session_ws_broadcast(sess, buf);
+                size_t msg_len = strlen(btn_json) + 256;
+                char *dyn = (char *)malloc(msg_len);
+                if (dyn) {
+                    snprintf(dyn, msg_len,
+                             "{\"type\":\"highlight\",\"data_url\":null,\"w\":%d,\"h\":%d,\"active_btn\":%d,\"buttons\":%s}",
+                             ev->frame_w, ev->frame_h, ev->active_button, btn_json);
+                    session_ws_broadcast(sess, dyn);
+                    free(dyn);
+                }
             }
             break;
         }
@@ -767,6 +772,7 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
                 char *pt = strstr(payload, "\"pts\":");
                 if (pt) {
                     double pts = atof(pt + 6);
+                    sess->last_pts_nanos = (int64_t)(pts * 1e9);
                     dvd_vm_bridge_report_pts(sess->vm, (int64_t)(pts * 1e9));
                 }
             } else if (strstr(payload, "\"client_playback\"")) {
@@ -778,10 +784,11 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
                 char *pt = strstr(payload, "\"pts\":");
                 if (pt) {
                     double pts = atof(pt + 6);
+                    sess->last_pts_nanos = (int64_t)(pts * 1e9);
                     dvd_vm_bridge_report_pts(sess->vm, (int64_t)(pts * 1e9));
                 }
             } else if (strstr(payload, "\"video_ended\"")) {
-                dvd_vm_bridge_report_pts(sess->vm, (int64_t)(sess->last_pts_nanos + 2000000000LL));
+                dvd_vm_bridge_report_video_ended(sess->vm);
             }
         }
         pthread_mutex_unlock(&sess->lock);
