@@ -59,13 +59,18 @@ struct web_session {
     char disc_title[256];
 
     dvd_vm_bridge_t *vm;
+    player_adapter_t adapter;   /* web backend of the shared player state machine */
     spu_compositor_t *spu;
-    pthread_mutex_t lock;
+    pthread_mutex_t lock;       /* guards vm/spu lifetime and disc identity */
 
     ws_client_t *ws_clients;
     pthread_mutex_t ws_lock;
     int client_count;
 
+    /* Snapshot of what clients should be showing, replayed to (re)connecting
+     * clients. Guarded by state_lock, which adapter ops take; adapter ops must
+     * never take `lock` (the ws thread holds it while notifying the adapter). */
+    pthread_mutex_t state_lock;
     char last_video[128];
     int64_t last_pts_nanos;
     bool last_paused;
@@ -194,147 +199,196 @@ static void session_ws_broadcast(web_session_t *sess, const char *json) {
     pthread_mutex_unlock(&sess->ws_lock);
 }
 
-/* =========================================================================
- * Per-Session Event Callback & Dispatcher
- * ========================================================================= */
+/* Forward declarations for web player adapter */
+static int web_adapter_load_file(void *ctx, const char *video_path, const char *subfile_name, const char *audio_path, uint64_t seq);
+static void web_adapter_seek_exact(void *ctx, uint64_t pts_nanos, bool paused, uint64_t seq);
+static void web_adapter_set_paused(void *ctx, bool paused);
+static void web_adapter_set_audio_track(void *ctx, int aid);
+static void web_adapter_set_subtitle_track(void *ctx, int sid);
+static void web_adapter_osd_message(void *ctx, const char *msg);
+static void web_adapter_on_highlight(void *ctx, const dvd_vm_highlight_info_t *hl);
+static void web_adapter_on_state(void *ctx, int domain, int vts_nr, int pgc_nr, int cell_nr, int chapter_nr);
 
-static void on_session_vm_event(void *user_data, const dvd_vm_event_t *ev) {
-    web_session_t *sess = (web_session_t *)user_data;
-    if (!sess || !ev) return;
+static const player_adapter_ops_t s_web_player_ops = {
+    .load_file = web_adapter_load_file,
+    .seek_exact = web_adapter_seek_exact,
+    .set_paused = web_adapter_set_paused,
+    .set_audio_track = web_adapter_set_audio_track,
+    .set_subtitle_track = web_adapter_set_subtitle_track,
+    .osd_message = web_adapter_osd_message,
+    .on_highlight = web_adapter_on_highlight,
+    .on_state = web_adapter_on_state,
+};
 
-    pthread_mutex_lock(&sess->lock);
-    if (!sess->vm) {
-        pthread_mutex_unlock(&sess->lock);
-        return;
+static void session_ws_broadcast(web_session_t *sess, const char *text);
+
+static int web_adapter_load_file(void *ctx, const char *video_path, const char *subfile_name, const char *audio_path, uint64_t seq) {
+    (void)audio_path;
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess) return -1;
+
+    char base[64] = {0};
+    const char *target_name = (subfile_name && subfile_name[0]) ? subfile_name : video_path;
+    if (target_name) {
+        const char *slash = strrchr(target_name, '/');
+        const char *fn = slash ? slash + 1 : target_name;
+        strncpy(base, fn, sizeof(base) - 1);
+        char *dot = strrchr(base, '.');
+        if (dot) *dot = '\0';
     }
-    pthread_mutex_unlock(&sess->lock);
 
-    char buf[8192];
-    switch (ev->type) {
-        case DVD_VM_EVENT_LOAD_VIDEO: {
-            char base[64] = {0};
-            if (ev->video_name) {
-                strncpy(base, ev->video_name, sizeof(base) - 1);
-                char *dot = strrchr(base, '.');
-                if (dot) *dot = '\0';
-            }
-            pthread_mutex_lock(&sess->lock);
-            strncpy(sess->last_video, base, sizeof(sess->last_video) - 1);
-            sess->last_pts_nanos = ev->pts_nanos;
-            sess->last_paused = ev->paused;
-            if (sess->last_highlight_url) {
-                free(sess->last_highlight_url);
-                sess->last_highlight_url = NULL;
-            }
-            sess->last_button_count = 0;
-            sess->last_active_btn = 0;
-            pthread_mutex_unlock(&sess->lock);
-
-            snprintf(buf, sizeof(buf),
-                     "{\"type\":\"video_load\",\"src\":\"/api/media/%s.mp4?disc=%s\",\"pts\":%.3f,\"paused\":%s}",
-                     base, sess->disc_id, (double)ev->pts_nanos / 1e9, ev->paused ? "true" : "false");
-            session_ws_broadcast(sess, buf);
-            session_ws_broadcast(sess, "{\"type\":\"highlight\",\"data_url\":null,\"w\":720,\"h\":480,\"active_btn\":0,\"buttons\":[]}");
-            break;
-        }
-
-        case DVD_VM_EVENT_SEEK: {
-            pthread_mutex_lock(&sess->lock);
-            sess->last_pts_nanos = ev->pts_nanos;
-            sess->last_paused = ev->paused;
-            pthread_mutex_unlock(&sess->lock);
-
-            snprintf(buf, sizeof(buf),
-                     "{\"type\":\"seek\",\"pts\":%.3f,\"paused\":%s}",
-                     (double)ev->pts_nanos / 1e9, ev->paused ? "true" : "false");
-            session_ws_broadcast(sess, buf);
-            break;
-        }
-
-        case DVD_VM_EVENT_PAUSE: {
-            pthread_mutex_lock(&sess->lock);
-            sess->last_paused = ev->paused;
-            pthread_mutex_unlock(&sess->lock);
-
-            snprintf(buf, sizeof(buf),
-                     "{\"type\":\"pause\",\"paused\":%s}",
-                     ev->paused ? "true" : "false");
-            session_ws_broadcast(sess, buf);
-            break;
-        }
-
-        case DVD_VM_EVENT_HIGHLIGHT: {
-            pthread_mutex_lock(&sess->lock);
-            if (sess->last_highlight_url) {
-                free(sess->last_highlight_url);
-                sess->last_highlight_url = NULL;
-            }
-            if (ev->highlight_data_url) {
-                sess->last_highlight_url = strdup(ev->highlight_data_url);
-            }
-            sess->last_frame_w = ev->frame_w;
-            sess->last_frame_h = ev->frame_h;
-            sess->last_active_btn = ev->active_button;
-            sess->last_button_count = ev->button_count;
-            for (int i = 0; i < ev->button_count && i < 36; i++) {
-                sess->last_buttons[i] = ev->buttons[i];
-            }
-            pthread_mutex_unlock(&sess->lock);
-
-            /* Build JSON array of buttons */
-            char btn_json[4096] = "[";
-            size_t bpos = 1;
-            for (int i = 0; i < ev->button_count && i < 36; i++) {
-                char item[128];
-                snprintf(item, sizeof(item), "%s{\"btn\":%d,\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d}",
-                         (i > 0) ? "," : "",
-                         ev->buttons[i].btn_id,
-                         ev->buttons[i].x1, ev->buttons[i].y1,
-                         ev->buttons[i].x2, ev->buttons[i].y2);
-                size_t ilen = strlen(item);
-                if (bpos + ilen + 2 < sizeof(btn_json)) {
-                    strcpy(btn_json + bpos, item);
-                    bpos += ilen;
-                }
-            }
-            strcpy(btn_json + bpos, "]");
-
-            if (ev->highlight_data_url) {
-                size_t dlen = strlen(ev->highlight_data_url);
-                size_t msg_len = dlen + strlen(btn_json) + 256;
-                char *dyn = (char *)malloc(msg_len);
-                if (dyn) {
-                    snprintf(dyn, msg_len,
-                             "{\"type\":\"highlight\",\"data_url\":\"%s\",\"w\":%d,\"h\":%d,\"active_btn\":%d,\"buttons\":%s}",
-                             ev->highlight_data_url, ev->frame_w, ev->frame_h, ev->active_button, btn_json);
-                    session_ws_broadcast(sess, dyn);
-                    free(dyn);
-                }
-            } else {
-                size_t msg_len = strlen(btn_json) + 256;
-                char *dyn = (char *)malloc(msg_len);
-                if (dyn) {
-                    snprintf(dyn, msg_len,
-                             "{\"type\":\"highlight\",\"data_url\":null,\"w\":%d,\"h\":%d,\"active_btn\":%d,\"buttons\":%s}",
-                             ev->frame_w, ev->frame_h, ev->active_button, btn_json);
-                    session_ws_broadcast(sess, dyn);
-                    free(dyn);
-                }
-            }
-            break;
-        }
-
-        case DVD_VM_EVENT_OSD: {
-            if (ev->osd_message) {
-                snprintf(buf, sizeof(buf), "{\"type\":\"osd\",\"text\":\"%s\"}", ev->osd_message);
-                session_ws_broadcast(sess, buf);
-            }
-            break;
-        }
-
-        default:
-            break;
+    pthread_mutex_lock(&sess->state_lock);
+    strncpy(sess->last_video, base, sizeof(sess->last_video) - 1);
+    sess->last_pts_nanos = 0;
+    sess->last_paused = false;
+    if (sess->last_highlight_url) {
+        free(sess->last_highlight_url);
+        sess->last_highlight_url = NULL;
     }
+    sess->last_button_count = 0;
+    sess->last_active_btn = 0;
+    pthread_mutex_unlock(&sess->state_lock);
+
+    char buf[1024];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"video_load\",\"src\":\"/api/media/%s.mp4?disc=%s\",\"pts\":0.000,\"paused\":false,\"seq\":%llu}",
+             base, sess->disc_id, (unsigned long long)seq);
+    session_ws_broadcast(sess, buf);
+    session_ws_broadcast(sess, "{\"type\":\"highlight\",\"data_url\":null,\"w\":720,\"h\":480,\"active_btn\":0,\"buttons\":[]}");
+    return 0;
+}
+
+static void web_adapter_seek_exact(void *ctx, uint64_t pts_nanos, bool paused, uint64_t seq) {
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess) return;
+
+    pthread_mutex_lock(&sess->state_lock);
+    sess->last_pts_nanos = (int64_t)pts_nanos;
+    sess->last_paused = paused;
+    pthread_mutex_unlock(&sess->state_lock);
+
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"seek\",\"pts\":%.3f,\"paused\":%s,\"seq\":%llu}",
+             (double)pts_nanos / 1e9, paused ? "true" : "false", (unsigned long long)seq);
+    session_ws_broadcast(sess, buf);
+}
+
+static void web_adapter_set_paused(void *ctx, bool paused) {
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess) return;
+
+    pthread_mutex_lock(&sess->state_lock);
+    sess->last_paused = paused;
+    pthread_mutex_unlock(&sess->state_lock);
+
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"type\":\"pause\",\"paused\":%s}", paused ? "true" : "false");
+    session_ws_broadcast(sess, buf);
+}
+
+static void web_adapter_set_audio_track(void *ctx, int aid) {
+    (void)ctx;
+    (void)aid;
+}
+
+static void web_adapter_set_subtitle_track(void *ctx, int sid) {
+    (void)ctx;
+    (void)sid;
+}
+
+static void web_adapter_osd_message(void *ctx, const char *msg) {
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess || !msg) return;
+    char buf[512];
+    snprintf(buf, sizeof(buf), "{\"type\":\"osd\",\"text\":\"%s\"}", msg);
+    session_ws_broadcast(sess, buf);
+}
+
+static void web_adapter_on_highlight(void *ctx, const dvd_vm_highlight_info_t *hl) {
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess || !hl) return;
+
+    pthread_mutex_lock(&sess->state_lock);
+    /* The VM refreshes highlights every VOBU; only tell clients about changes */
+    bool same_url = (!hl->highlight_data_url && !sess->last_highlight_url) ||
+                    (hl->highlight_data_url && sess->last_highlight_url &&
+                     strcmp(hl->highlight_data_url, sess->last_highlight_url) == 0);
+    bool unchanged = same_url &&
+                     sess->last_frame_w == hl->frame_w && sess->last_frame_h == hl->frame_h &&
+                     sess->last_active_btn == hl->active_button &&
+                     sess->last_button_count == hl->button_count &&
+                     memcmp(sess->last_buttons, hl->buttons,
+                            sizeof(hl->buttons[0]) * (size_t)(hl->button_count > 36 ? 36 : hl->button_count)) == 0;
+    pthread_mutex_unlock(&sess->state_lock);
+    if (unchanged) return;
+
+    char *hl_url_copy = hl->highlight_data_url ? strdup(hl->highlight_data_url) : NULL;
+
+    pthread_mutex_lock(&sess->state_lock);
+    if (sess->last_highlight_url) {
+        free(sess->last_highlight_url);
+        sess->last_highlight_url = NULL;
+    }
+    sess->last_highlight_url = hl_url_copy;
+    sess->last_frame_w = hl->frame_w;
+    sess->last_frame_h = hl->frame_h;
+    sess->last_active_btn = hl->active_button;
+    sess->last_button_count = hl->button_count;
+    for (int i = 0; i < hl->button_count && i < 36; i++) {
+        sess->last_buttons[i] = hl->buttons[i];
+    }
+    pthread_mutex_unlock(&sess->state_lock);
+
+    char btn_json[4096] = "[";
+    size_t bpos = 1;
+    for (int i = 0; i < hl->button_count && i < 36; i++) {
+        char item[128];
+        snprintf(item, sizeof(item), "%s{\"btn\":%d,\"x1\":%d,\"y1\":%d,\"x2\":%d,\"y2\":%d}",
+                 (i > 0) ? "," : "",
+                 hl->buttons[i].btn_id,
+                 hl->buttons[i].x1, hl->buttons[i].y1,
+                 hl->buttons[i].x2, hl->buttons[i].y2);
+        size_t ilen = strlen(item);
+        if (bpos + ilen + 2 < sizeof(btn_json)) {
+            strcpy(btn_json + bpos, item);
+            bpos += ilen;
+        }
+    }
+    strcpy(btn_json + bpos, "]");
+
+    if (hl->highlight_data_url) {
+        size_t dlen = strlen(hl->highlight_data_url);
+        size_t msg_len = dlen + strlen(btn_json) + 256;
+        char *dyn = (char *)malloc(msg_len);
+        if (dyn) {
+            snprintf(dyn, msg_len,
+                     "{\"type\":\"highlight\",\"data_url\":\"%s\",\"w\":%d,\"h\":%d,\"active_btn\":%d,\"buttons\":%s}",
+                     hl->highlight_data_url, hl->frame_w, hl->frame_h, hl->active_button, btn_json);
+            session_ws_broadcast(sess, dyn);
+            free(dyn);
+        }
+    } else {
+        size_t msg_len = strlen(btn_json) + 256;
+        char *dyn = (char *)malloc(msg_len);
+        if (dyn) {
+            snprintf(dyn, msg_len,
+                     "{\"type\":\"highlight\",\"data_url\":null,\"w\":%d,\"h\":%d,\"active_btn\":%d,\"buttons\":%s}",
+                     hl->frame_w, hl->frame_h, hl->active_button, btn_json);
+            session_ws_broadcast(sess, dyn);
+            free(dyn);
+        }
+    }
+}
+
+static void web_adapter_on_state(void *ctx, int domain, int vts_nr, int pgc_nr, int cell_nr, int chapter_nr) {
+    web_session_t *sess = (web_session_t *)ctx;
+    if (!sess) return;
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"domain_state\",\"domain\":%d,\"vts\":%d,\"pgc\":%d,\"cell\":%d,\"chapter\":%d}",
+             domain, vts_nr, pgc_nr, cell_nr, chapter_nr);
+    session_ws_broadcast(sess, buf);
 }
 
 /* =========================================================================
@@ -373,6 +427,8 @@ static void session_destroy(web_session_t *sess) {
     pthread_mutex_unlock(&sess->ws_lock);
 
     if (sess->last_highlight_url) free(sess->last_highlight_url);
+    player_adapter_destroy(&sess->adapter);
+    pthread_mutex_destroy(&sess->state_lock);
     pthread_mutex_destroy(&sess->lock);
     pthread_mutex_destroy(&sess->ws_lock);
     free(sess);
@@ -408,8 +464,14 @@ static web_session_t *get_or_create_session(web_server_t *s, const char *session
     sess->last_active_time = time(NULL);
     pthread_mutex_init(&sess->lock, NULL);
     pthread_mutex_init(&sess->ws_lock, NULL);
+    pthread_mutex_init(&sess->state_lock, NULL);
+    player_adapter_init(&sess->adapter, &s_web_player_ops, sess);
 
-    const char *target_disc = (disc_path && disc_path[0]) ? disc_path : s->default_disc_path;
+    /* Single-disc mode auto-starts its only disc. In library mode a new session
+     * (e.g. a fresh tab connecting its WebSocket) stays idle on the library
+     * until the user picks a disc via /api/play. */
+    const char *fallback_disc = s->is_library ? NULL : s->default_disc_path;
+    const char *target_disc = (disc_path && disc_path[0]) ? disc_path : fallback_disc;
     const char *target_title = (disc_title && disc_title[0]) ? disc_title : s->default_disc_title;
 
     if (target_disc && target_disc[0]) {
@@ -420,9 +482,8 @@ static web_session_t *get_or_create_session(web_server_t *s, const char *session
         strncpy(sess->disc_title, (target_title && target_title[0]) ? target_title : sess->disc_id, sizeof(sess->disc_title) - 1);
 
         sess->spu = spu_compositor_create();
-        sess->vm = dvd_vm_bridge_init(sess->disc_path, NULL, sess->spu);
+        sess->vm = dvd_vm_bridge_init(sess->disc_path, &sess->adapter, sess->spu);
         if (sess->vm) {
-            dvd_vm_bridge_set_event_callback(sess->vm, on_session_vm_event, sess);
             dvd_vm_bridge_start(sess->vm);
             fprintf(stderr, "[web_server] Started independent session %s for %s\n", sess->id, sess->disc_title);
         } else {
@@ -465,6 +526,7 @@ static bool session_load_movie(web_session_t *sess, const char *disc_path, const
         strncpy(sess->disc_title, sess->disc_id, sizeof(sess->disc_title) - 1);
     }
 
+    pthread_mutex_lock(&sess->state_lock);
     sess->last_video[0] = '\0';
     sess->last_pts_nanos = 0;
     sess->last_paused = false;
@@ -474,9 +536,12 @@ static bool session_load_movie(web_session_t *sess, const char *disc_path, const
     }
     sess->last_button_count = 0;
     sess->last_active_btn = 0;
+    pthread_mutex_unlock(&sess->state_lock);
 
+    /* Old VM is gone; the new one starts with a clean playback state */
+    player_adapter_reset(&sess->adapter);
     sess->spu = spu_compositor_create();
-    sess->vm = dvd_vm_bridge_init(sess->disc_path, NULL, sess->spu);
+    sess->vm = dvd_vm_bridge_init(sess->disc_path, &sess->adapter, sess->spu);
     if (!sess->vm) {
         if (sess->spu) {
             spu_compositor_destroy(sess->spu);
@@ -486,7 +551,6 @@ static bool session_load_movie(web_session_t *sess, const char *disc_path, const
         return false;
     }
 
-    dvd_vm_bridge_set_event_callback(sess->vm, on_session_vm_event, sess);
     dvd_vm_bridge_start(sess->vm);
 
     pthread_mutex_unlock(&sess->lock);
@@ -590,6 +654,59 @@ static bool ensure_remuxed_mp4(web_server_t *s, const char *disc_path, const cha
  * HTTP Request Handler
  * ========================================================================= */
 
+/* Remember the client's position so a reconnecting client resumes in place */
+static void session_set_last_pts(web_session_t *sess, int64_t pts_nanos) {
+    pthread_mutex_lock(&sess->state_lock);
+    sess->last_pts_nanos = pts_nanos;
+    pthread_mutex_unlock(&sess->state_lock);
+}
+
+static uint64_t json_get_u64(const char *payload, const char *key_with_colon) {
+    const char *p = strstr(payload, key_with_colon);
+    return p ? strtoull(p + strlen(key_with_colon), NULL, 10) : 0;
+}
+
+static bool json_get_pts_nanos(const char *payload, int64_t *out) {
+    const char *p = strstr(payload, "\"pts\":");
+    if (!p) return false;
+    double pts = atof(p + 6);
+    if (pts < 0) pts = 0;
+    *out = (int64_t)(pts * 1e9);
+    return true;
+}
+
+/* Browser <video> reports -> shared player adapter (the web backend's half of
+ * what mpv_controller_poll_events does for the native player) */
+static void handle_client_playback_report(web_session_t *sess, const char *payload) {
+    player_adapter_t *a = &sess->adapter;
+    uint64_t seq = json_get_u64(payload, "\"seq\":");
+    int64_t pts_ns = -1;
+
+    if (strstr(payload, "\"file_loaded\"")) {
+        player_adapter_notify_file_loaded(a, seq);
+    } else if (strstr(payload, "\"seek_completed\"")) {
+        if (json_get_pts_nanos(payload, &pts_ns)) session_set_last_pts(sess, pts_ns);
+        player_adapter_notify_seek_completed(a, seq, pts_ns);
+    } else if (strstr(payload, "\"time_update\"")) {
+        if (json_get_pts_nanos(payload, &pts_ns)) {
+            session_set_last_pts(sess, pts_ns);
+            player_adapter_notify_time_pos(a, seq, pts_ns);
+        }
+    } else if (strstr(payload, "\"client_playback\"")) {
+        if (strstr(payload, "\"state\":\"paused\"")) {
+            player_adapter_notify_paused(a, true);
+        } else if (strstr(payload, "\"state\":\"playing\"")) {
+            player_adapter_notify_paused(a, false);
+        }
+        if (json_get_pts_nanos(payload, &pts_ns)) {
+            session_set_last_pts(sess, pts_ns);
+            player_adapter_notify_time_pos(a, seq, pts_ns);
+        }
+    } else if (strstr(payload, "\"video_ended\"")) {
+        player_adapter_notify_ended(a, seq);
+    }
+}
+
 static void handle_client_websocket(web_server_t *s, int client_fd, const char *ws_key, const char *session_id) {
     /* Compute RFC 6455 Sec-WebSocket-Accept */
     char combined[256];
@@ -627,23 +744,29 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
     sess->ws_clients = wc;
     sess->client_count++;
     sess->last_active_time = time(NULL);
-    pthread_mutex_lock(&sess->lock);
-    if (sess->vm) dvd_vm_bridge_set_paused(sess->vm, false);
-    pthread_mutex_unlock(&sess->lock);
     pthread_mutex_unlock(&sess->ws_lock);
 
-    /* Send initial session state to newly connected client */
     pthread_mutex_lock(&sess->lock);
+    if (sess->vm) dvd_vm_bridge_set_paused(sess->vm, false);
+
+    /* Send initial session state to newly connected client. The client reports
+     * file_loaded / seek_completed for the replayed video_load like for any
+     * other, which is what lets the adapter consider the backend ready. */
     char init_msg[2048];
     snprintf(init_msg, sizeof(init_msg),
              "{\"type\":\"state\",\"movie_title\":\"%s\",\"session_id\":\"%s\"}",
              sess->disc_title, sess->id);
     ws_send_text(client_fd, init_msg, strlen(init_msg));
+    pthread_mutex_unlock(&sess->lock);
+
+    /* Read before taking state_lock: adapter ops take state_lock under the adapter lock */
+    uint64_t seq = player_adapter_get_seq(&sess->adapter);
+    pthread_mutex_lock(&sess->state_lock);
 
     if (sess->last_video[0]) {
         snprintf(init_msg, sizeof(init_msg),
-                 "{\"type\":\"video_load\",\"src\":\"/api/media/%s.mp4?disc=%s\",\"pts\":%.3f,\"paused\":%s}",
-                 sess->last_video, sess->disc_id, (double)sess->last_pts_nanos / 1e9, sess->last_paused ? "true" : "false");
+                 "{\"type\":\"video_load\",\"src\":\"/api/media/%s.mp4?disc=%s\",\"pts\":%.3f,\"paused\":%s,\"seq\":%llu}",
+                 sess->last_video, sess->disc_id, (double)sess->last_pts_nanos / 1e9, sess->last_paused ? "true" : "false", (unsigned long long)seq);
         ws_send_text(client_fd, init_msg, strlen(init_msg));
     }
 
@@ -676,12 +799,15 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
             free(hdyn);
         }
     }
-    pthread_mutex_unlock(&sess->lock);
+    pthread_mutex_unlock(&sess->state_lock);
 
     /* Read client frame loop */
     while (s->running && wc->active) {
         uint8_t hdr[2];
-        if (recv(client_fd, hdr, 2, MSG_WAITALL) != 2) break;
+        ssize_t hrec = recv(client_fd, hdr, 2, MSG_WAITALL);
+        if (hrec != 2) {
+            break;
+        }
 
         uint8_t opcode = hdr[0] & 0x0F;
         bool is_masked = (hdr[1] & 0x80) != 0;
@@ -768,27 +894,8 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
                     y = atoi(py + 4);
                     dvd_vm_bridge_mouse_click(sess->vm, x, y);
                 }
-            } else if (strstr(payload, "\"time_update\"")) {
-                char *pt = strstr(payload, "\"pts\":");
-                if (pt) {
-                    double pts = atof(pt + 6);
-                    sess->last_pts_nanos = (int64_t)(pts * 1e9);
-                    dvd_vm_bridge_report_pts(sess->vm, (int64_t)(pts * 1e9));
-                }
-            } else if (strstr(payload, "\"client_playback\"")) {
-                if (strstr(payload, "\"state\":\"paused\"")) {
-                    dvd_vm_bridge_set_paused(sess->vm, true);
-                } else if (strstr(payload, "\"state\":\"playing\"")) {
-                    dvd_vm_bridge_set_paused(sess->vm, false);
-                }
-                char *pt = strstr(payload, "\"pts\":");
-                if (pt) {
-                    double pts = atof(pt + 6);
-                    sess->last_pts_nanos = (int64_t)(pts * 1e9);
-                    dvd_vm_bridge_report_pts(sess->vm, (int64_t)(pts * 1e9));
-                }
-            } else if (strstr(payload, "\"video_ended\"")) {
-                dvd_vm_bridge_report_video_ended(sess->vm);
+            } else {
+                handle_client_playback_report(sess, payload);
             }
         }
         pthread_mutex_unlock(&sess->lock);
@@ -800,12 +907,14 @@ static void handle_client_websocket(web_server_t *s, int client_fd, const char *
     pthread_mutex_lock(&sess->ws_lock);
     sess->client_count--;
     sess->last_active_time = time(NULL);
-    if (sess->client_count <= 0) {
+    bool should_pause = (sess->client_count <= 0);
+    pthread_mutex_unlock(&sess->ws_lock);
+
+    if (should_pause) {
         pthread_mutex_lock(&sess->lock);
         if (sess->vm) dvd_vm_bridge_set_paused(sess->vm, true);
         pthread_mutex_unlock(&sess->lock);
     }
-    pthread_mutex_unlock(&sess->ws_lock);
     close(client_fd);
 }
 

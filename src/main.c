@@ -219,7 +219,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    dvd_vm_bridge_t *bridge = dvd_vm_bridge_init(dvd_path, mpv, spu);
+    dvd_vm_bridge_t *bridge = dvd_vm_bridge_init(dvd_path, mpv_controller_get_adapter(mpv), spu);
     if (!bridge) {
         fprintf(stderr, "Failed to initialize DVD VM bridge for '%s'\n", dvd_path);
         spu_compositor_destroy(spu);

@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
+#include "player_adapter.h"
 
 typedef struct mpv_controller mpv_controller_t;
 
@@ -29,50 +30,11 @@ mpv_controller_t *mpv_controller_init(void *(*get_proc_address)(void *, const ch
  */
 void mpv_controller_destroy(mpv_controller_t *ctrl);
 
-/**
- * Load an MKV video file and optional companion audio file (or .mvob).
+/*
+ * Playback commands (load, seek, pause, audio/subtitle tracks, OSD) and
+ * playback state are reached through the player_adapter returned by
+ * mpv_controller_get_adapter(); this header only covers rendering and events.
  */
-int mpv_controller_load_file(mpv_controller_t *ctrl, const char *video_path, const char *audio_path);
-
-/**
- * Select 1-based audio track ID in mpv (or 0 to disable audio).
- */
-void mpv_controller_set_audio_track(mpv_controller_t *ctrl, int aid);
-
-/**
- * Select 1-based internal subtitle/CC track ID in mpv (or 0 to disable).
- */
-void mpv_controller_set_subtitle_track(mpv_controller_t *ctrl, int sid);
-
-/**
- * Display a temporary On-Screen Display (OSD) status message in the video window.
- */
-void mpv_controller_osd_message(mpv_controller_t *ctrl, const char *msg);
-
-/**
- * Perform exact asynchronous seek to pts_nanos.
- */
-void mpv_controller_seek_exact(mpv_controller_t *ctrl, uint64_t pts_nanos);
-
-/**
- * Pause or resume playback.
- */
-void mpv_controller_pause(mpv_controller_t *ctrl, bool pause);
-
-/**
- * Query whether playback is currently paused.
- */
-bool mpv_controller_is_paused(mpv_controller_t *ctrl);
-
-/**
- * Get current presentation timestamp in nanoseconds.
- */
-uint64_t mpv_controller_get_pts_nanos(mpv_controller_t *ctrl);
-
-/**
- * Get current playback position in seconds.
- */
-double mpv_controller_get_time_pos(mpv_controller_t *ctrl);
 
 /**
  * Render the current video frame into the active OpenGL viewport / FBO.
@@ -80,7 +42,8 @@ double mpv_controller_get_time_pos(mpv_controller_t *ctrl);
 void mpv_controller_render(mpv_controller_t *ctrl, int width, int height);
 
 /**
- * Poll mpv events.
+ * Poll mpv events and forward them to the player adapter. Call regularly
+ * from the main loop.
  */
 void mpv_controller_poll_events(mpv_controller_t *ctrl);
 
@@ -90,15 +53,20 @@ void mpv_controller_poll_events(mpv_controller_t *ctrl);
 bool mpv_controller_needs_render(mpv_controller_t *ctrl);
 
 /**
- * Underlying mpv handle.
- */
-/**
  * Display aspect ratio (width / height) of the current video, as mpv shows it:
  * 4:3 or 16:9 depending on the menu or title. 16:9 until mpv knows.
  */
 float mpv_controller_get_display_aspect(mpv_controller_t *ctrl);
 
+/**
+ * Underlying mpv handle.
+ */
 mpv_handle *mpv_controller_get_handle(mpv_controller_t *ctrl);
+
+/**
+ * Get the unified player adapter backed by this mpv_controller.
+ */
+player_adapter_t *mpv_controller_get_adapter(mpv_controller_t *ctrl);
 
 #ifdef __cplusplus
 }

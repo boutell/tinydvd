@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "mpv_controller.h"
+#include "player_adapter.h"
 #include "spu_compositor.h"
 
 typedef struct dvd_vm_bridge dvd_vm_bridge_t;
@@ -17,11 +17,6 @@ typedef enum {
     DVD_VM_EVENT_OSD,           /* osd_message */
     DVD_VM_EVENT_STATE          /* domain, vts_nr, pgc_nr, cell_nr, chapter_nr */
 } dvd_vm_event_type_t;
-
-typedef struct {
-    int btn_id;
-    int x1, y1, x2, y2;
-} dvd_vm_button_rect_t;
 
 typedef struct {
     dvd_vm_event_type_t type;
@@ -51,10 +46,10 @@ extern "C" {
 /**
  * Initialize dvd_vm_bridge.
  * @param dvd_path Path to the DVD root directory containing .mvob/.VOB and .IFO files.
- * @param mpv Pointer to initialized mpv_controller.
+ * @param player Pointer to initialized player_adapter.
  * @param spu Pointer to initialized spu_compositor.
  */
-dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, mpv_controller_t *mpv, spu_compositor_t *spu);
+dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, player_adapter_t *player, spu_compositor_t *spu);
 
 /**
  * Start the background DVD navigation event pump thread.
@@ -110,16 +105,6 @@ bool dvd_vm_bridge_is_running(dvd_vm_bridge_t *bridge);
  * Register an event callback for web streaming or GUI event notification.
  */
 void dvd_vm_bridge_set_event_callback(dvd_vm_bridge_t *bridge, dvd_vm_event_callback_t cb, void *user_data);
-
-/**
- * Report current playback PTS from an external player (e.g. HTML5 video client).
- */
-void dvd_vm_bridge_report_pts(dvd_vm_bridge_t *bridge, int64_t pts_nanos);
-
-/**
- * Report that the current video stream has ended in an external player.
- */
-void dvd_vm_bridge_report_video_ended(dvd_vm_bridge_t *bridge);
 
 /**
  * Get the underlying SPU compositor.
