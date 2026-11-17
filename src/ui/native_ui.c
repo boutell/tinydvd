@@ -108,7 +108,8 @@ typedef struct {
     char text[512];
     int len;
     int cursor;
-    bool select_all;
+    int sel_anchor; /* -1 when no selection; otherwise byte offset of selection anchor */
+    double scroll_x;
 } ui_textfield_t;
 
 typedef struct {
@@ -146,6 +147,7 @@ struct native_ui {
     ui_textfield_t tf_source;
     ui_textfield_t tf_title;
     bool enrich_checked;
+    bool dragging_tf;
 
     /* Filtered catalog snapshot */
     catalog_item_t *items_snapshot;
@@ -165,6 +167,7 @@ struct native_ui {
     import_state_t last_import_state;
     char local_import_err[256];
     double log_scroll_offset;
+    uint32_t copy_log_feedback_ms;
 
     /* Hit boxes in logical window coords */
     ui_rect_t r_search;
@@ -180,6 +183,7 @@ struct native_ui {
     ui_rect_t r_modal_browse_iso;
     ui_rect_t r_modal_title;
     ui_rect_t r_modal_enrich;
+    ui_rect_t r_modal_copy_log;
     ui_rect_t r_modal_start;
     ui_rect_t r_modal_cancel;
     ui_rect_t r_modal_done;
@@ -194,87 +198,268 @@ struct native_ui {
 };
 
 /* =========================================================================
- * UTF-8 Text Field Helpers
+ * UTF-8 Text Field & Selection Helpers
  * ========================================================================= */
+
+static bool tf_has_selection(const ui_textfield_t *tf) {
+    return tf && tf->sel_anchor >= 0 && tf->sel_anchor != tf->cursor;
+}
+
+static void tf_get_selection(const ui_textfield_t *tf, int *out_start, int *out_end) {
+    if (!tf) {
+        if (out_start) *out_start = 0;
+        if (out_end) *out_end = 0;
+        return;
+    }
+    int a = tf->sel_anchor;
+    int b = tf->cursor;
+    if (a < 0) {
+        if (out_start) *out_start = b;
+        if (out_end) *out_end = b;
+        return;
+    }
+    if (a > b) {
+        int tmp = a;
+        a = b;
+        b = tmp;
+    }
+    if (a < 0) a = 0;
+    if (b > tf->len) b = tf->len;
+    if (out_start) *out_start = a;
+    if (out_end) *out_end = b;
+}
+
+static void tf_clear_selection(ui_textfield_t *tf) {
+    if (tf) tf->sel_anchor = -1;
+}
+
+static void tf_select_all(ui_textfield_t *tf) {
+    if (!tf) return;
+    tf->sel_anchor = 0;
+    tf->cursor = tf->len;
+}
+
+static int tf_prev_char_pos(const ui_textfield_t *tf, int pos) {
+    if (!tf || pos <= 0) return 0;
+    if (pos > tf->len) pos = tf->len;
+    pos--;
+    while (pos > 0 && (((unsigned char)tf->text[pos] & 0xC0) == 0x80)) {
+        pos--;
+    }
+    return pos;
+}
+
+static int tf_next_char_pos(const ui_textfield_t *tf, int pos) {
+    if (!tf || pos >= tf->len) return tf ? tf->len : 0;
+    if (pos < 0) pos = 0;
+    pos++;
+    while (pos < tf->len && (((unsigned char)tf->text[pos] & 0xC0) == 0x80)) {
+        pos++;
+    }
+    return pos;
+}
+
+static bool is_word_byte(unsigned char c) {
+    return isalnum(c) || c == '_' || c >= 0x80;
+}
+
+static int tf_prev_word_pos(const ui_textfield_t *tf, int pos) {
+    if (!tf || pos <= 0) return 0;
+    if (pos > tf->len) pos = tf->len;
+    while (pos > 0 && !is_word_byte((unsigned char)tf->text[pos - 1])) {
+        pos = tf_prev_char_pos(tf, pos);
+    }
+    while (pos > 0 && is_word_byte((unsigned char)tf->text[pos - 1])) {
+        pos = tf_prev_char_pos(tf, pos);
+    }
+    return pos;
+}
+
+static int tf_next_word_pos(const ui_textfield_t *tf, int pos) {
+    if (!tf || pos >= tf->len) return tf ? tf->len : 0;
+    if (pos < 0) pos = 0;
+    while (pos < tf->len && !is_word_byte((unsigned char)tf->text[pos])) {
+        pos = tf_next_char_pos(tf, pos);
+    }
+    while (pos < tf->len && is_word_byte((unsigned char)tf->text[pos])) {
+        pos = tf_next_char_pos(tf, pos);
+    }
+    return pos;
+}
+
+static void tf_delete_selection(ui_textfield_t *tf) {
+    if (!tf_has_selection(tf)) {
+        tf_clear_selection(tf);
+        return;
+    }
+    int s = 0, e = 0;
+    tf_get_selection(tf, &s, &e);
+    if (e > s) {
+        memmove(tf->text + s, tf->text + e, (size_t)(tf->len - e + 1));
+        tf->len -= (e - s);
+    }
+    tf->cursor = s;
+    tf->sel_anchor = -1;
+}
 
 static void tf_set(ui_textfield_t *tf, const char *s) {
     if (!tf) return;
     snprintf(tf->text, sizeof(tf->text), "%s", s ? s : "");
     tf->len = (int)strlen(tf->text);
     tf->cursor = tf->len;
-    tf->select_all = false;
+    tf->sel_anchor = -1;
+    tf->scroll_x = 0.0;
 }
 
 static void tf_insert_str(ui_textfield_t *tf, const char *ins) {
     if (!tf || !ins || !ins[0]) return;
-    if (tf->select_all) {
-        tf->text[0] = '\0';
-        tf->len = 0;
-        tf->cursor = 0;
-        tf->select_all = false;
+    if (tf_has_selection(tf)) {
+        tf_delete_selection(tf);
+    } else {
+        tf->sel_anchor = -1;
     }
-    int ilen = (int)strlen(ins);
-    if (tf->len + ilen >= (int)sizeof(tf->text)) {
-        ilen = (int)sizeof(tf->text) - 1 - tf->len;
+
+    char clean[512];
+    int clen = 0;
+    for (const char *p = ins; *p && clen < (int)sizeof(clean) - 1; p++) {
+        if (*p == '\r' || *p == '\n') continue;
+        clean[clen++] = *p;
     }
-    if (ilen <= 0) return;
-    memmove(tf->text + tf->cursor + ilen, tf->text + tf->cursor, (size_t)(tf->len - tf->cursor + 1));
-    memcpy(tf->text + tf->cursor, ins, (size_t)ilen);
-    tf->len += ilen;
-    tf->cursor += ilen;
+    clean[clen] = '\0';
+    if (clen == 0) return;
+
+    int avail = (int)sizeof(tf->text) - 1 - tf->len;
+    if (avail <= 0) return;
+    if (clen > avail) {
+        int fit = 0;
+        while (fit < avail) {
+            int next = fit + 1;
+            while (next < clen && (((unsigned char)clean[next] & 0xC0) == 0x80)) {
+                next++;
+            }
+            if (next > avail) break;
+            fit = next;
+        }
+        clen = fit;
+    }
+    if (clen <= 0) return;
+
+    memmove(tf->text + tf->cursor + clen, tf->text + tf->cursor, (size_t)(tf->len - tf->cursor + 1));
+    memcpy(tf->text + tf->cursor, clean, (size_t)clen);
+    tf->len += clen;
+    tf->cursor += clen;
 }
 
-static void tf_backspace(ui_textfield_t *tf) {
+static void tf_backspace(ui_textfield_t *tf, bool word_mod, bool line_mod) {
     if (!tf || tf->len == 0) return;
-    if (tf->select_all) {
-        tf_set(tf, "");
+    if (tf_has_selection(tf)) {
+        tf_delete_selection(tf);
         return;
     }
+    tf->sel_anchor = -1;
     if (tf->cursor <= 0) return;
-    int prev = tf->cursor - 1;
-    while (prev > 0 && (((unsigned char)tf->text[prev] & 0xC0) == 0x80)) {
-        prev--;
-    }
+    int prev = line_mod ? 0 : (word_mod ? tf_prev_word_pos(tf, tf->cursor) : tf_prev_char_pos(tf, tf->cursor));
     int del = tf->cursor - prev;
+    if (del <= 0) return;
     memmove(tf->text + prev, tf->text + tf->cursor, (size_t)(tf->len - tf->cursor + 1));
     tf->len -= del;
     tf->cursor = prev;
 }
 
-static void tf_delete_fwd(ui_textfield_t *tf) {
+static void tf_delete_fwd(ui_textfield_t *tf, bool word_mod) {
     if (!tf || tf->len == 0) return;
-    if (tf->select_all) {
-        tf_set(tf, "");
+    if (tf_has_selection(tf)) {
+        tf_delete_selection(tf);
         return;
     }
+    tf->sel_anchor = -1;
     if (tf->cursor >= tf->len) return;
-    int next = tf->cursor + 1;
-    while (next < tf->len && (((unsigned char)tf->text[next] & 0xC0) == 0x80)) {
-        next++;
-    }
+    int next = word_mod ? tf_next_word_pos(tf, tf->cursor) : tf_next_char_pos(tf, tf->cursor);
     int del = next - tf->cursor;
+    if (del <= 0) return;
     memmove(tf->text + tf->cursor, tf->text + next, (size_t)(tf->len - next + 1));
     tf->len -= del;
 }
 
-static void tf_move_left(ui_textfield_t *tf) {
+static void tf_move_cursor(ui_textfield_t *tf, int new_pos, bool extend_selection) {
     if (!tf) return;
-    tf->select_all = false;
-    if (tf->cursor <= 0) return;
-    tf->cursor--;
-    while (tf->cursor > 0 && (((unsigned char)tf->text[tf->cursor] & 0xC0) == 0x80)) {
-        tf->cursor--;
+    if (new_pos < 0) new_pos = 0;
+    if (new_pos > tf->len) new_pos = tf->len;
+    if (extend_selection) {
+        if (tf->sel_anchor < 0) {
+            tf->sel_anchor = tf->cursor;
+        }
+        tf->cursor = new_pos;
+        if (tf->cursor == tf->sel_anchor) {
+            tf->sel_anchor = -1;
+        }
+    } else {
+        tf->sel_anchor = -1;
+        tf->cursor = new_pos;
     }
 }
 
-static void tf_move_right(ui_textfield_t *tf) {
+static void tf_copy_selection(const ui_textfield_t *tf) {
     if (!tf) return;
-    tf->select_all = false;
-    if (tf->cursor >= tf->len) return;
-    tf->cursor++;
-    while (tf->cursor < tf->len && (((unsigned char)tf->text[tf->cursor] & 0xC0) == 0x80)) {
-        tf->cursor++;
+    if (tf_has_selection(tf)) {
+        int s = 0, e = 0;
+        tf_get_selection(tf, &s, &e);
+        char buf[512];
+        int n = e - s;
+        if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+        memcpy(buf, tf->text + s, (size_t)n);
+        buf[n] = '\0';
+        SDL_SetClipboardText(buf);
+    } else if (tf->len > 0) {
+        SDL_SetClipboardText(tf->text);
     }
+}
+
+static bool tf_cut_selection(ui_textfield_t *tf) {
+    if (!tf || !tf_has_selection(tf)) return false;
+    tf_copy_selection(tf);
+    tf_delete_selection(tf);
+    return true;
+}
+
+static int tf_x_to_byte_index(const ui_textfield_t *tf, double rel_x) {
+    if (!tf || tf->len == 0) return 0;
+    double target_x = rel_x + tf->scroll_x;
+    if (target_x <= 0.0) return 0;
+
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *cr = cairo_create(surf);
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *desc = pango_font_description_new();
+    pango_font_description_set_family(desc, "Sans");
+    pango_font_description_set_absolute_size(desc, 13.5 * PANGO_SCALE);
+    pango_font_description_set_weight(desc, PANGO_WEIGHT_NORMAL);
+    pango_layout_set_font_description(layout, desc);
+    pango_font_description_free(desc);
+
+    pango_layout_set_text(layout, tf->text, tf->len);
+
+    int idx = 0;
+    int trailing = 0;
+    gboolean inside = pango_layout_xy_to_index(layout, (int)(target_x * PANGO_SCALE), 0, &idx, &trailing);
+    if (!inside) {
+        int lw = 0, lh = 0;
+        pango_layout_get_pixel_size(layout, &lw, &lh);
+        if (target_x >= (double)lw) {
+            idx = tf->len;
+            trailing = 0;
+        }
+    }
+    for (int t = 0; t < trailing && idx < tf->len; t++) {
+        idx = tf_next_char_pos(tf, idx);
+    }
+    if (idx < 0) idx = 0;
+    if (idx > tf->len) idx = tf->len;
+
+    g_object_unref(layout);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surf);
+    return idx;
 }
 
 /* =========================================================================
@@ -386,7 +571,7 @@ static void draw_text_box(cairo_t *cr, const char *text, double x, double y, dou
     g_object_unref(layout);
 }
 
-static double measure_text_width(cairo_t *cr, const char *text, double font_px, bool bold, bool monospace) {
+static double font_cap_center_offset(cairo_t *cr, double font_px, bool bold, bool monospace) {
     PangoLayout *layout = pango_cairo_create_layout(cr);
     PangoFontDescription *desc = pango_font_description_new();
     pango_font_description_set_family(desc, monospace ? "Monospace" : "Sans");
@@ -395,14 +580,71 @@ static double measure_text_width(cairo_t *cr, const char *text, double font_px, 
     pango_layout_set_font_description(layout, desc);
     pango_font_description_free(desc);
 
-    pango_layout_set_text(layout, text ? text : "", -1);
+    pango_layout_set_text(layout, "H", 1);
+    PangoRectangle ink_rect, logical_rect;
+    pango_layout_get_extents(layout, &ink_rect, &logical_rect);
+    g_object_unref(layout);
+    return ((double)ink_rect.y + (double)ink_rect.height * 0.5) / (double)PANGO_SCALE;
+}
+
+static void draw_text_vcenter(cairo_t *cr, const char *text, double x, double center_y, double w,
+                              double font_px, bool bold, bool monospace,
+                              double r, double g, double b, double a,
+                              PangoAlignment align) {
+    double y = center_y - font_cap_center_offset(cr, font_px, bold, monospace);
+    draw_text_box(cr, text, x, y, w, 1, font_px, bold, monospace, r, g, b, a, align, NULL);
+}
+
+static void draw_search_icon(cairo_t *cr, double cx, double cy, double r, double g, double b, double a) {
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, r, g, b, a);
+    cairo_set_line_width(cr, 1.6);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_arc(cr, cx - 1.2, cy - 1.2, 5.0, 0.0, 2.0 * M_PI);
+    cairo_stroke(cr);
+    cairo_move_to(cr, cx + 2.4, cy + 2.4);
+    cairo_line_to(cr, cx + 6.0, cy + 6.0);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
+static void draw_x_icon(cairo_t *cr, double cx, double cy, double half_sz, double stroke_w,
+                        double r, double g, double b, double a) {
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, r, g, b, a);
+    cairo_set_line_width(cr, stroke_w);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_move_to(cr, cx - half_sz, cy - half_sz);
+    cairo_line_to(cr, cx + half_sz, cy + half_sz);
+    cairo_move_to(cr, cx + half_sz, cy - half_sz);
+    cairo_line_to(cr, cx - half_sz, cy + half_sz);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
+static double measure_text_width_n(cairo_t *cr, const char *text, int len,
+                                     double font_px, bool bold, bool monospace) {
+    if (!text || len == 0) return 0.0;
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *desc = pango_font_description_new();
+    pango_font_description_set_family(desc, monospace ? "Monospace" : "Sans");
+    pango_font_description_set_absolute_size(desc, font_px * PANGO_SCALE);
+    pango_font_description_set_weight(desc, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
+    pango_layout_set_font_description(layout, desc);
+    pango_font_description_free(desc);
+
+    pango_layout_set_text(layout, text, len);
     int lw = 0, lh = 0;
     pango_layout_get_pixel_size(layout, &lw, &lh);
     g_object_unref(layout);
     return (double)lw;
 }
 
-static void draw_textfield(cairo_t *cr, ui_rect_t r, const ui_textfield_t *tf,
+static double measure_text_width(cairo_t *cr, const char *text, double font_px, bool bold, bool monospace) {
+    return measure_text_width_n(cr, text, -1, font_px, bold, monospace);
+}
+
+static void draw_textfield(cairo_t *cr, ui_rect_t r, ui_textfield_t *tf,
                            const char *placeholder, bool focused, bool rounded_pill,
                            double left_pad, double right_pad) {
     cairo_save(cr);
@@ -420,47 +662,58 @@ static void draw_textfield(cairo_t *cr, ui_rect_t r, const ui_textfield_t *tf,
 
     double inner_x = r.x + left_pad;
     double inner_w = r.w - left_pad - right_pad;
-    double text_y = r.y + (r.h - 16.0) * 0.5;
+    double center_y = r.y + r.h * 0.5;
 
     cairo_rounded_rect(cr, inner_x, r.y + 2, inner_w > 4 ? inner_w : 4, r.h - 4, 4.0);
     cairo_clip(cr);
 
     if (tf->len == 0) {
-        draw_text_box(cr, placeholder, inner_x, text_y, inner_w, 1, 13.5, false, false,
-                      0.53, 0.57, 0.69, 0.75, PANGO_ALIGN_LEFT, NULL);
+        tf->scroll_x = 0.0;
+        draw_text_vcenter(cr, placeholder, inner_x, center_y, inner_w, 13.5, false, false,
+                          0.53, 0.57, 0.69, 0.75, PANGO_ALIGN_LEFT);
         if (focused) {
             cairo_set_source_rgba(cr, 0.40, 0.99, 0.95, 1.0);
-            cairo_rectangle(cr, inner_x + 1.0, r.y + 8.0, 1.5, r.h - 16.0);
+            cairo_rectangle(cr, inner_x + 1.0, center_y - 8.0, 1.5, 16.0);
             cairo_fill(cr);
         }
     } else {
-        /* Compute pixel X up to cursor and scroll horizontally if overflowing */
-        char prefix[512];
-        int clen = tf->cursor;
-        if (clen > (int)sizeof(prefix) - 1) clen = (int)sizeof(prefix) - 1;
-        memcpy(prefix, tf->text, (size_t)clen);
-        prefix[clen] = '\0';
+        double cur_px = measure_text_width_n(cr, tf->text, tf->cursor, 13.5, false, false);
+        double full_w = measure_text_width_n(cr, tf->text, tf->len, 13.5, false, false);
+        double vis_w = fmax(12.0, inner_w - 6.0);
 
-        double cur_px = measure_text_width(cr, prefix, 13.5, false, false);
-        double scroll_x = 0.0;
-        if (cur_px > inner_w - 6.0) {
-            scroll_x = cur_px - (inner_w - 6.0);
+        if (cur_px < tf->scroll_x) {
+            tf->scroll_x = cur_px;
+        }
+        if (cur_px > tf->scroll_x + vis_w) {
+            tf->scroll_x = cur_px - vis_w;
+        }
+        if (full_w <= vis_w) {
+            tf->scroll_x = 0.0;
+        } else if (tf->scroll_x > full_w - vis_w) {
+            tf->scroll_x = full_w - vis_w;
+        }
+        if (tf->scroll_x < 0.0) {
+            tf->scroll_x = 0.0;
         }
 
-        if (focused && tf->select_all) {
-            double full_w = measure_text_width(cr, tf->text, 13.5, false, false);
-            double sel_w = fmin(full_w, inner_w);
+        if (focused && tf_has_selection(tf)) {
+            int sel_s = 0, sel_e = 0;
+            tf_get_selection(tf, &sel_s, &sel_e);
+            double start_px = measure_text_width_n(cr, tf->text, sel_s, 13.5, false, false);
+            double end_px = measure_text_width_n(cr, tf->text, sel_e, 13.5, false, false);
+            double hx = inner_x + start_px - tf->scroll_x;
+            double hw = fmax(2.0, end_px - start_px);
             cairo_set_source_rgba(cr, 0.40, 0.99, 0.95, 0.28);
-            cairo_rectangle(cr, inner_x, r.y + 7.0, sel_w, r.h - 14.0);
+            cairo_rectangle(cr, hx, center_y - 10.0, hw, 20.0);
             cairo_fill(cr);
         }
 
-        draw_text_box(cr, tf->text, inner_x - scroll_x, text_y, 0, 0, 13.5, false, false,
-                      1.0, 1.0, 1.0, 0.98, PANGO_ALIGN_LEFT, NULL);
+        draw_text_vcenter(cr, tf->text, inner_x - tf->scroll_x, center_y, 0, 13.5, false, false,
+                          1.0, 1.0, 1.0, 0.98, PANGO_ALIGN_LEFT);
 
-        if (focused && !tf->select_all) {
+        if (focused) {
             cairo_set_source_rgba(cr, 0.40, 0.99, 0.95, 1.0);
-            cairo_rectangle(cr, inner_x + cur_px - scroll_x, r.y + 8.0, 1.5, r.h - 16.0);
+            cairo_rectangle(cr, inner_x + cur_px - tf->scroll_x, center_y - 8.0, 1.5, 16.0);
             cairo_fill(cr);
         }
     }
@@ -542,6 +795,8 @@ static void sync_catalog_snapshot(native_ui_t *ui) {
 static void open_import_modal(native_ui_t *ui) {
     if (!ui || !ui->lib) return;
     ui->import_modal_open = true;
+    ui->dragging_tf = false;
+    ui->copy_log_feedback_ms = 0;
     ui->local_import_err[0] = '\0';
 
     import_job_t *job = &ui->lib->import_job;
@@ -568,6 +823,7 @@ static void open_import_modal(native_ui_t *ui) {
 static void close_import_modal(native_ui_t *ui) {
     if (!ui) return;
     ui->import_modal_open = false;
+    ui->dragging_tf = false;
     if (ui->focus == FOCUS_MODAL_SOURCE || ui->focus == FOCUS_MODAL_TITLE) {
         ui->focus = FOCUS_NONE;
     }
@@ -591,6 +847,7 @@ static void start_import_from_modal(native_ui_t *ui) {
                  err[0] ? err : "Failed to start import.");
     } else {
         ui->focus = FOCUS_NONE;
+        ui->dragging_tf = false;
     }
     ui->dirty = true;
 }
@@ -603,6 +860,9 @@ native_ui_t *native_ui_create(SDL_Window *window, tdvd_library_t *lib) {
     ui->enrich_checked = true;
     ui->hovered_card = -1;
     ui->selected_filtered = -1;
+    ui->tf_search.sel_anchor = -1;
+    ui->tf_source.sel_anchor = -1;
+    ui->tf_title.sel_anchor = -1;
     ui->dirty = true;
     ui->last_import_state = IMPORT_IDLE;
     sync_catalog_snapshot(ui);
@@ -651,6 +911,7 @@ static void compute_layout_rects(native_ui_t *ui, int win_w, int win_h, bool in_
     memset(&ui->r_modal_browse_iso, 0, sizeof(ui->r_modal_browse_iso));
     memset(&ui->r_modal_title, 0, sizeof(ui->r_modal_title));
     memset(&ui->r_modal_enrich, 0, sizeof(ui->r_modal_enrich));
+    memset(&ui->r_modal_copy_log, 0, sizeof(ui->r_modal_copy_log));
     memset(&ui->r_modal_start, 0, sizeof(ui->r_modal_start));
     memset(&ui->r_modal_cancel, 0, sizeof(ui->r_modal_cancel));
     memset(&ui->r_modal_done, 0, sizeof(ui->r_modal_done));
@@ -665,14 +926,16 @@ static void compute_layout_rects(native_ui_t *ui, int win_w, int win_h, bool in_
         ui->r_open_import = (ui_rect_t){ (double)win_w - 24 - btn_w, 18, btn_w, 36 };
 
         double sw = fmin(380.0, fmax(160.0, (double)win_w - 520.0));
-        double sx = ((double)win_w - sw) * 0.5;
-        if (sx < 230.0) sx = 230.0;
-        if (sx + sw > ui->r_open_import.x - 130.0) {
-            sw = fmax(120.0, ui->r_open_import.x - 130.0 - sx);
+        double left_bound = 236.0;
+        double right_bound = ui->r_open_import.x - 110.0;
+        double sx = left_bound + ((right_bound - left_bound) - sw) * 0.5;
+        if (sx < left_bound) sx = left_bound;
+        if (sx + sw > right_bound) {
+            sw = fmax(120.0, right_bound - sx);
         }
         ui->r_search = (ui_rect_t){ sx, 18, sw, 36 };
         if (ui->tf_search.len > 0) {
-            ui->r_search_clear = (ui_rect_t){ sx + sw - 30, 21, 26, 30 };
+            ui->r_search_clear = (ui_rect_t){ sx + sw - 32, 18, 28, 36 };
         }
 
         if (ui->snapshot_count == 0) {
@@ -753,6 +1016,13 @@ static void compute_layout_rects(native_ui_t *ui, int win_w, int win_h, bool in_
             ui->r_modal_title = (ui_rect_t){ inner_x, cur_y, inner_w, 36.0 };
             cur_y += 48.0;
             ui->r_modal_enrich = (ui_rect_t){ inner_x, cur_y, inner_w, 26.0 };
+            cur_y += 34.0;
+        }
+        if (show_progress) {
+            double pbox_h = my + mh - 66.0 - cur_y;
+            if (pbox_h > 40.0) {
+                ui->r_modal_copy_log = (ui_rect_t){ inner_x + inner_w - 162.0, cur_y + 5.0, 82.0, 26.0 };
+            }
         }
 
         double footer_y = my + mh - 52.0;
@@ -806,8 +1076,8 @@ static void draw_button(cairo_t *cr, ui_rect_t r, const char *label,
     double tr = primary ? 0.043 : (danger ? 1.0 : 1.0);
     double tg = primary ? 0.047 : (danger ? 0.50 : 1.0);
     double tb = primary ? 0.063 : (danger ? 0.50 : 1.0);
-    draw_text_box(cr, label, r.x + 6.0, r.y + (r.h - 15.0) * 0.5, r.w - 12.0, 1, 13.5,
-                  primary || danger, false, tr, tg, tb, 1.0, PANGO_ALIGN_CENTER, NULL);
+    draw_text_vcenter(cr, label, r.x + 6.0, r.y + r.h * 0.5, r.w - 12.0, 13.5,
+                      primary || danger, false, tr, tg, tb, 1.0, PANGO_ALIGN_CENTER);
     cairo_restore(cr);
 }
 
@@ -903,8 +1173,8 @@ static void render_library_view(native_ui_t *ui, cairo_t *cr, int win_w, int win
                 cairo_set_source_rgba(cr, 0.40, 0.99, 0.95, 0.45);
                 cairo_set_line_width(cr, 1.0);
                 cairo_stroke(cr);
-                draw_text_box(cr, ystr, yr_r.x, yr_r.y + 3, yr_r.w, 1, 11.5, true, false,
-                              0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_CENTER, NULL);
+                draw_text_vcenter(cr, ystr, yr_r.x, yr_r.y + yr_r.h * 0.5, yr_r.w, 11.5, true, false,
+                                  0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_CENTER);
             }
 
             /* Info Block */
@@ -953,11 +1223,11 @@ static void render_library_view(native_ui_t *ui, cairo_t *cr, int win_w, int win
             }
 
             /* Footer row */
-            double fy = r.y + r.h - 26.0;
-            draw_text_box(cr, item->size_str, ix, fy, iw * 0.6, 1, 12.0, false, false,
-                          0.77, 0.78, 0.78, 0.85, PANGO_ALIGN_LEFT, NULL);
-            draw_text_box(cr, "Play ▶", ix, fy, iw, 1, 12.5, true, false,
-                          0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_RIGHT, NULL);
+            double footer_cy = r.y + r.h - 17.0;
+            draw_text_vcenter(cr, item->size_str, ix, footer_cy, iw * 0.6, 12.0, false, false,
+                              0.77, 0.78, 0.78, 0.85, PANGO_ALIGN_LEFT);
+            draw_text_vcenter(cr, "Play ▶", ix, footer_cy, iw, 12.5, true, false,
+                              0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_RIGHT);
 
             cairo_restore(cr);
         }
@@ -983,21 +1253,21 @@ static void render_library_view(native_ui_t *ui, cairo_t *cr, int win_w, int win
     cairo_rectangle(cr, 0, 71, win_w, 1);
     cairo_fill(cr);
 
-    draw_text_box(cr, "Tiny", 24, 21, 0, 0, 24.0, true, false, 1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT, NULL);
+    double header_cy = 36.0;
+    draw_text_vcenter(cr, "Tiny", 24, header_cy, 0, 24.0, true, false, 1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT);
     double w_tiny = measure_text_width(cr, "Tiny", 24.0, true, false);
-    draw_text_box(cr, "DVD", 24 + w_tiny, 21, 0, 0, 24.0, true, false, 0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_LEFT, NULL);
+    draw_text_vcenter(cr, "DVD", 24 + w_tiny, header_cy, 0, 24.0, true, false, 0.40, 0.99, 0.95, 1.0, PANGO_ALIGN_LEFT);
     double w_dvd = measure_text_width(cr, "DVD", 24.0, true, false);
-    draw_text_box(cr, " Cinema", 24 + w_tiny + w_dvd, 21, 0, 0, 24.0, true, false, 1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT, NULL);
+    draw_text_vcenter(cr, " Cinema", 24 + w_tiny + w_dvd, header_cy, 0, 24.0, true, false, 1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT);
 
     /* Search Input */
     draw_textfield(cr, ui->r_search, &ui->tf_search, "Search title, actor, director, genre...",
                    ui->focus == FOCUS_SEARCH, true, 32.0, ui->tf_search.len > 0 ? 32.0 : 14.0);
-    draw_text_box(cr, "⌕", ui->r_search.x + 11.0, ui->r_search.y + 8.0, 18.0, 1, 16.0, false, false,
-                  0.65, 0.70, 0.80, 0.75, PANGO_ALIGN_LEFT, NULL);
+    draw_search_icon(cr, ui->r_search.x + 18.0, header_cy, 0.65, 0.70, 0.80, 0.80);
     if (ui->tf_search.len > 0) {
         bool x_hov = pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_search_clear);
-        draw_text_box(cr, "×", ui->r_search_clear.x, ui->r_search_clear.y + 4.0, ui->r_search_clear.w, 1, 17.0,
-                      true, false, 1.0, 1.0, 1.0, x_hov ? 1.0 : 0.65, PANGO_ALIGN_CENTER, NULL);
+        draw_x_icon(cr, ui->r_search_clear.x + ui->r_search_clear.w * 0.5, header_cy,
+                    4.2, 1.6, 1.0, 1.0, 1.0, x_hov ? 1.0 : 0.65);
     }
 
     /* Movie stats + Import button */
@@ -1010,8 +1280,8 @@ static void render_library_view(native_ui_t *ui, cairo_t *cr, int win_w, int win
     } else {
         snprintf(stats, sizeof(stats), "%d Movie%s", ui->snapshot_count, ui->snapshot_count == 1 ? "" : "s");
     }
-    draw_text_box(cr, stats, ui->r_open_import.x - 125.0, 27.0, 112.0, 1, 13.5, false, false,
-                  0.77, 0.78, 0.78, 0.90, PANGO_ALIGN_RIGHT, NULL);
+    draw_text_vcenter(cr, stats, ui->r_open_import.x - 134.0, header_cy, 120.0, 13.5, false, false,
+                      0.77, 0.78, 0.78, 0.90, PANGO_ALIGN_RIGHT);
 
     import_job_t *job = &ui->lib->import_job;
     pthread_mutex_lock(&job->lock);
@@ -1035,8 +1305,8 @@ static void render_player_hud(native_ui_t *ui, cairo_t *cr, int win_w, const cha
                 !ui->import_modal_open && pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_back_lib));
 
     if (current_movie_title && current_movie_title[0]) {
-        draw_text_box(cr, current_movie_title, 138, 20, win_w - 308, 1, 15.0, true, false,
-                      1.0, 1.0, 1.0, 0.95, PANGO_ALIGN_LEFT, NULL);
+        draw_text_vcenter(cr, current_movie_title, 138, ui->r_back_lib.y + ui->r_back_lib.h * 0.5,
+                          win_w - 308, 15.0, true, false, 1.0, 1.0, 1.0, 0.95, PANGO_ALIGN_LEFT);
     }
 
     import_job_t *job = &ui->lib->import_job;
@@ -1045,6 +1315,66 @@ static void render_player_hud(native_ui_t *ui, cairo_t *cr, int win_w, const cha
     pthread_mutex_unlock(&job->lock);
     draw_button(cr, ui->r_open_import, import_active ? "Importing..." : "+ Import DVD",
                 true, false, !ui->import_modal_open && pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_open_import));
+}
+
+static void build_import_log_text(import_job_t *job,
+                                  char *out_log, size_t out_log_sz,
+                                  import_state_t *out_state, bool *out_active,
+                                  int *out_elapsed, char *out_stage, size_t stage_sz,
+                                  char *out_err, size_t err_sz) {
+    if (out_log && out_log_sz > 0) out_log[0] = '\0';
+    if (out_stage && stage_sz > 0) out_stage[0] = '\0';
+    if (out_err && err_sz > 0) out_err[0] = '\0';
+    if (!job) return;
+
+    pthread_mutex_lock(&job->lock);
+    if (out_state) *out_state = job->state;
+    if (out_active) *out_active = job->active;
+    if (out_elapsed) *out_elapsed = (job->start_time > 0) ? (int)(time(NULL) - job->start_time) : 0;
+    if (out_stage && stage_sz > 0) snprintf(out_stage, stage_sz, "%s", job->stage_msg);
+    if (out_err && err_sz > 0) snprintf(out_err, err_sz, "%s", job->error_msg);
+    if (out_log && out_log_sz > 0) {
+        size_t lpos = 0;
+        for (int i = 0; i < job->log_count; i++) {
+            size_t ll = strlen(job->log_lines[i]);
+            if (lpos + ll + 2 < out_log_sz) {
+                if (i > 0) out_log[lpos++] = '\n';
+                memcpy(out_log + lpos, job->log_lines[i], ll);
+                lpos += ll;
+                out_log[lpos] = '\0';
+            }
+        }
+    }
+    pthread_mutex_unlock(&job->lock);
+}
+
+static void copy_import_log_to_clipboard(native_ui_t *ui) {
+    if (!ui || !ui->lib) return;
+    char log_concat[IMPORT_MAX_LOGS * IMPORT_LOG_LINE_LEN];
+    char stage_msg[256];
+    char err_msg[512];
+    build_import_log_text(&ui->lib->import_job,
+                          log_concat, sizeof(log_concat),
+                          NULL, NULL, NULL,
+                          stage_msg, sizeof(stage_msg),
+                          err_msg, sizeof(err_msg));
+    const char *disp_err = ui->local_import_err[0] ? ui->local_import_err : err_msg;
+    if (log_concat[0] && disp_err[0]) {
+        char combined[IMPORT_MAX_LOGS * IMPORT_LOG_LINE_LEN + 600];
+        snprintf(combined, sizeof(combined), "%s\nError: %s", log_concat, disp_err);
+        SDL_SetClipboardText(combined);
+    } else if (log_concat[0]) {
+        SDL_SetClipboardText(log_concat);
+    } else if (disp_err[0]) {
+        SDL_SetClipboardText(disp_err);
+    } else if (stage_msg[0]) {
+        SDL_SetClipboardText(stage_msg);
+    } else {
+        return;
+    }
+    uint32_t now = SDL_GetTicks();
+    ui->copy_log_feedback_ms = (now == 0) ? 1u : now;
+    ui->dirty = true;
 }
 
 static void render_import_modal(native_ui_t *ui, cairo_t *cr, int win_w, int win_h) {
@@ -1060,33 +1390,24 @@ static void render_import_modal(native_ui_t *ui, cairo_t *cr, int win_w, int win
     cairo_set_line_width(cr, 1.2);
     cairo_stroke(cr);
 
-    draw_text_box(cr, "Import DVD to Library", b.x + 24, b.y + 20, b.w - 88, 1, 18.0, true, false,
-                  1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT, NULL);
-    draw_button(cr, ui->r_modal_close, "×", false, false, pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_modal_close));
+    double modal_title_cy = ui->r_modal_close.y + ui->r_modal_close.h * 0.5;
+    draw_text_vcenter(cr, "Import DVD to Library", b.x + 24, modal_title_cy, b.w - 88, 18.0, true, false,
+                      1.0, 1.0, 1.0, 1.0, PANGO_ALIGN_LEFT);
+    draw_button(cr, ui->r_modal_close, "", false, false, pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_modal_close));
+    draw_x_icon(cr, ui->r_modal_close.x + ui->r_modal_close.w * 0.5, modal_title_cy,
+                4.5, 1.7, 1.0, 1.0, 1.0, 0.95);
 
-    import_job_t *job = &ui->lib->import_job;
-    pthread_mutex_lock(&job->lock);
-    import_state_t st = job->state;
-    bool active = job->active;
-    int elapsed = (job->start_time > 0) ? (int)(time(NULL) - job->start_time) : 0;
+    import_state_t st = IMPORT_IDLE;
+    bool active = false;
+    int elapsed = 0;
     char stage_msg[256];
     char err_msg[512];
-    snprintf(stage_msg, sizeof(stage_msg), "%s", job->stage_msg);
-    snprintf(err_msg, sizeof(err_msg), "%s", job->error_msg);
-    int log_count = job->log_count;
     char log_concat[IMPORT_MAX_LOGS * IMPORT_LOG_LINE_LEN];
-    size_t lpos = 0;
-    log_concat[0] = '\0';
-    for (int i = 0; i < log_count; i++) {
-        size_t ll = strlen(job->log_lines[i]);
-        if (lpos + ll + 2 < sizeof(log_concat)) {
-            if (i > 0) log_concat[lpos++] = '\n';
-            memcpy(log_concat + lpos, job->log_lines[i], ll);
-            lpos += ll;
-            log_concat[lpos] = '\0';
-        }
-    }
-    pthread_mutex_unlock(&job->lock);
+    build_import_log_text(&ui->lib->import_job,
+                          log_concat, sizeof(log_concat),
+                          &st, &active, &elapsed,
+                          stage_msg, sizeof(stage_msg),
+                          err_msg, sizeof(err_msg));
 
     double ix = b.x + 24.0;
     double iw = b.w - 48.0;
@@ -1130,9 +1451,9 @@ static void render_import_modal(native_ui_t *ui, cairo_t *cr, int win_w, int win
             cairo_set_line_width(cr, 1.2);
             cairo_stroke(cr);
         }
-        draw_text_box(cr, "Fetch movie metadata (director, cast, year, genres)",
-                      cb.x + 26.0, ui->r_modal_enrich.y + 4.0, iw - 28.0, 1, 13.0, false, false,
-                      0.77, 0.78, 0.78, 0.98, PANGO_ALIGN_LEFT, NULL);
+        draw_text_vcenter(cr, "Fetch movie metadata (director, cast, year, genres)",
+                          cb.x + 26.0, cb.y + cb.h * 0.5, iw - 28.0, 13.0, false, false,
+                          0.77, 0.78, 0.78, 0.98, PANGO_ALIGN_LEFT);
         cur_y = ui->r_modal_enrich.y + 34.0;
     }
 
@@ -1149,14 +1470,21 @@ static void render_import_modal(native_ui_t *ui, cairo_t *cr, int win_w, int win
 
             bool is_err = (st == IMPORT_ERROR || ui->local_import_err[0] != '\0');
             const char *s_text = stage_msg[0] ? stage_msg : (ui->local_import_err[0] ? "Error" : "Importing...");
-            draw_text_box(cr, s_text, ix + 12, cur_y + 10, iw - 90, 1, 13.5, true, false,
-                          is_err ? 1.0 : 0.40, is_err ? 0.30 : 0.99, is_err ? 0.30 : 0.95, 1.0,
-                          PANGO_ALIGN_LEFT, NULL);
+            double prog_cy = (ui->r_modal_copy_log.h > 0)
+                             ? (ui->r_modal_copy_log.y + ui->r_modal_copy_log.h * 0.5)
+                             : (cur_y + 18.0);
+            draw_text_vcenter(cr, s_text, ix + 12, prog_cy, iw - 180, 13.5, true, false,
+                              is_err ? 1.0 : 0.40, is_err ? 0.30 : 0.99, is_err ? 0.30 : 0.95, 1.0,
+                              PANGO_ALIGN_LEFT);
+
+            const char *copy_lbl = (ui->copy_log_feedback_ms != 0) ? "Copied!" : "Copy Log";
+            draw_button(cr, ui->r_modal_copy_log, copy_lbl, false, false,
+                        pt_in_rect(ui->mouse_x, ui->mouse_y, ui->r_modal_copy_log));
 
             char tbuf[32];
             snprintf(tbuf, sizeof(tbuf), "%02d:%02d", elapsed / 60, elapsed % 60);
-            draw_text_box(cr, tbuf, ix + iw - 74, cur_y + 10, 62, 1, 13.0, false, true,
-                          0.77, 0.78, 0.78, 0.9, PANGO_ALIGN_RIGHT, NULL);
+            draw_text_vcenter(cr, tbuf, ix + iw - 74, prog_cy, 62, 13.0, false, true,
+                              0.77, 0.78, 0.78, 0.9, PANGO_ALIGN_RIGHT);
 
             double log_y = cur_y + 36.0;
             if (is_err && display_err[0]) {
@@ -1243,6 +1571,10 @@ void native_ui_render(native_ui_t *ui, int draw_w, int draw_h,
     uint32_t now = SDL_GetTicks();
     if (imp_active && (now - ui->last_tick_ms >= 250)) {
         ui->last_tick_ms = now;
+        ui->dirty = true;
+    }
+    if (ui->copy_log_feedback_ms != 0 && (now - ui->copy_log_feedback_ms >= 1500)) {
+        ui->copy_log_feedback_ms = 0;
         ui->dirty = true;
     }
 
@@ -1366,6 +1698,65 @@ static ui_textfield_t *active_textfield(native_ui_t *ui) {
     }
 }
 
+static bool textfield_geometry_for_focus(const native_ui_t *ui, ui_focus_t focus,
+                                         ui_rect_t *out_r, double *out_left_pad) {
+    if (!ui) return false;
+    switch (focus) {
+        case FOCUS_SEARCH:
+            if (out_r) *out_r = ui->r_search;
+            if (out_left_pad) *out_left_pad = 32.0;
+            return true;
+        case FOCUS_MODAL_SOURCE:
+            if (out_r) *out_r = ui->r_modal_source;
+            if (out_left_pad) *out_left_pad = 12.0;
+            return true;
+        case FOCUS_MODAL_TITLE:
+            if (out_r) *out_r = ui->r_modal_title;
+            if (out_left_pad) *out_left_pad = 12.0;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void handle_textfield_mouse_down(native_ui_t *ui, ui_focus_t target_focus,
+                                        const SDL_MouseButtonEvent *btn) {
+    ui->focus = target_focus;
+    ui_textfield_t *tf = active_textfield(ui);
+    ui_rect_t r = {0};
+    double left_pad = 12.0;
+    if (!tf || !textfield_geometry_for_focus(ui, target_focus, &r, &left_pad)) {
+        ui->dragging_tf = false;
+        ui->dirty = true;
+        return;
+    }
+
+    int idx = tf_x_to_byte_index(tf, (double)btn->x - (r.x + left_pad));
+    if (btn->clicks >= 3) {
+        tf_select_all(tf);
+        ui->dragging_tf = false;
+    } else if (btn->clicks == 2) {
+        int start_anchor = (idx < tf->len) ? tf_next_char_pos(tf, idx) : idx;
+        tf->sel_anchor = tf_prev_word_pos(tf, start_anchor);
+        tf->cursor = tf_next_word_pos(tf, idx);
+        if (tf->cursor == tf->sel_anchor) {
+            tf->sel_anchor = -1;
+        }
+        ui->dragging_tf = false;
+    } else {
+        bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+        if (shift) {
+            tf_move_cursor(tf, idx, true);
+            if (tf->sel_anchor < 0) tf->sel_anchor = tf->cursor;
+        } else {
+            tf->sel_anchor = idx;
+            tf->cursor = idx;
+        }
+        ui->dragging_tf = true;
+    }
+    ui->dirty = true;
+}
+
 bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
                             bool in_player_view,
                             char *out_play_disc_path, size_t path_len,
@@ -1387,6 +1778,19 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
     if (ev->type == SDL_MOUSEMOTION) {
         ui->mouse_x = ev->motion.x;
         ui->mouse_y = ev->motion.y;
+        if (ui->dragging_tf) {
+            if (ev->motion.state & SDL_BUTTON_LMASK) {
+                ui_textfield_t *tf = active_textfield(ui);
+                ui_rect_t r = {0};
+                double left_pad = 12.0;
+                if (tf && textfield_geometry_for_focus(ui, ui->focus, &r, &left_pad)) {
+                    tf->cursor = tf_x_to_byte_index(tf, (double)ui->mouse_x - (r.x + left_pad));
+                    ui->dirty = true;
+                    return true;
+                }
+            }
+            ui->dragging_tf = false;
+        }
         if (!in_player_view && !ui->import_modal_open) {
             int new_hov = -1;
             for (int i = 0; i < ui->card_hit_count; i++) {
@@ -1406,6 +1810,19 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
             ui->dirty = true;
         }
         return ui->import_modal_open;
+    }
+
+    if (ev->type == SDL_MOUSEBUTTONUP && ev->button.button == SDL_BUTTON_LEFT) {
+        if (ui->dragging_tf) {
+            ui->dragging_tf = false;
+            ui_textfield_t *tf = active_textfield(ui);
+            if (tf && tf->sel_anchor == tf->cursor) {
+                tf->sel_anchor = -1;
+                ui->dirty = true;
+            }
+            return true;
+        }
+        return false;
     }
 
     if (ev->type == SDL_MOUSEWHEEL) {
@@ -1428,6 +1845,7 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
     if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
         double mx = ev->button.x;
         double my = ev->button.y;
+        ui->dragging_tf = false;
 
         if (ui->import_modal_open) {
             import_job_t *job = &ui->lib->import_job;
@@ -1445,6 +1863,10 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
                 close_import_modal(ui);
                 return true;
             }
+            if (pt_in_rect(mx, my, ui->r_modal_copy_log)) {
+                copy_import_log_to_clipboard(ui);
+                return true;
+            }
             if (imp_active && pt_in_rect(mx, my, ui->r_modal_cancel)) {
                 tdvd_library_import_cancel(ui->lib);
                 ui->dirty = true;
@@ -1458,13 +1880,11 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
             }
             if (!imp_active) {
                 if (pt_in_rect(mx, my, ui->r_modal_source)) {
-                    ui->focus = FOCUS_MODAL_SOURCE;
-                    ui->dirty = true;
+                    handle_textfield_mouse_down(ui, FOCUS_MODAL_SOURCE, &ev->button);
                     return true;
                 }
                 if (pt_in_rect(mx, my, ui->r_modal_title)) {
-                    ui->focus = FOCUS_MODAL_TITLE;
-                    ui->dirty = true;
+                    handle_textfield_mouse_down(ui, FOCUS_MODAL_TITLE, &ev->button);
                     return true;
                 }
                 if (pt_in_rect(mx, my, ui->r_modal_browse)) {
@@ -1526,8 +1946,7 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
             return true;
         }
         if (pt_in_rect(mx, my, ui->r_search)) {
-            ui->focus = FOCUS_SEARCH;
-            ui->dirty = true;
+            handle_textfield_mouse_down(ui, FOCUS_SEARCH, &ev->button);
             return true;
         }
 
@@ -1547,6 +1966,9 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
     }
 
     if (ev->type == SDL_TEXTINPUT) {
+        if (SDL_GetModState() & KMOD_GUI) {
+            return true;
+        }
         ui_textfield_t *tf = active_textfield(ui);
         if (tf) {
             tf_insert_str(tf, ev->text.text);
@@ -1567,17 +1989,52 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
 
     if (ev->type == SDL_KEYDOWN) {
         SDL_Keycode sym = ev->key.keysym.sym;
+        SDL_Scancode sc = ev->key.keysym.scancode;
         Uint16 mod = ev->key.keysym.mod;
-        bool accel = (mod & KMOD_GUI) || (mod & KMOD_CTRL);
+        bool accel = ((mod & KMOD_GUI) != 0) || ((mod & KMOD_CTRL) != 0);
+        bool shift = (mod & KMOD_SHIFT) != 0;
+        bool opt = (mod & KMOD_ALT) != 0;
+        bool cmd = (mod & KMOD_GUI) != 0;
+
+        bool is_a = (sym == SDLK_a || sc == SDL_SCANCODE_A);
+        bool is_c = (sym == SDLK_c || sc == SDL_SCANCODE_C);
+        bool is_v = (sym == SDLK_v || sc == SDL_SCANCODE_V);
+        bool is_x = (sym == SDLK_x || sc == SDL_SCANCODE_X);
+        bool is_f = (sym == SDLK_f || sc == SDL_SCANCODE_F);
+        bool is_u = (sym == SDLK_u || sc == SDL_SCANCODE_U);
 
         ui_textfield_t *tf = active_textfield(ui);
+        if (accel && !tf) {
+            if (!in_player_view && !ui->import_modal_open && (is_v || is_a)) {
+                ui->focus = FOCUS_SEARCH;
+                tf = &ui->tf_search;
+            } else if (ui->import_modal_open && is_c) {
+                copy_import_log_to_clipboard(ui);
+                return true;
+            }
+        }
+
         if (tf) {
-            if (accel && sym == SDLK_a) {
-                tf->select_all = true;
+            if (accel && is_a) {
+                tf_select_all(tf);
                 ui->dirty = true;
                 return true;
             }
-            if (accel && sym == SDLK_v) {
+            if (accel && is_c) {
+                tf_copy_selection(tf);
+                return true;
+            }
+            if (accel && is_x) {
+                if (tf_cut_selection(tf)) {
+                    if (ui->focus == FOCUS_SEARCH) {
+                        ui->scroll_y = 0.0;
+                        sync_catalog_snapshot(ui);
+                    }
+                    ui->dirty = true;
+                }
+                return true;
+            }
+            if (accel && is_v) {
                 char *clip = SDL_GetClipboardText();
                 if (clip) {
                     tf_insert_str(tf, clip);
@@ -1590,18 +2047,23 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
                 }
                 return true;
             }
-            if (accel && sym == SDLK_c) {
-                SDL_SetClipboardText(tf->text);
+            if (accel && is_f && !ui->import_modal_open && !in_player_view) {
+                ui->focus = FOCUS_SEARCH;
+                tf_select_all(&ui->tf_search);
+                ui->dirty = true;
                 return true;
             }
-            if ((mod & KMOD_CTRL) && sym == SDLK_u) {
+            if ((mod & KMOD_CTRL) && is_u) {
                 tf_set(tf, "");
-                if (ui->focus == FOCUS_SEARCH) sync_catalog_snapshot(ui);
+                if (ui->focus == FOCUS_SEARCH) {
+                    ui->scroll_y = 0.0;
+                    sync_catalog_snapshot(ui);
+                }
                 ui->dirty = true;
                 return true;
             }
             if (sym == SDLK_BACKSPACE) {
-                tf_backspace(tf);
+                tf_backspace(tf, opt, cmd);
                 if (ui->focus == FOCUS_SEARCH) {
                     ui->scroll_y = 0.0;
                     sync_catalog_snapshot(ui);
@@ -1610,16 +2072,50 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
                 return true;
             }
             if (sym == SDLK_DELETE) {
-                tf_delete_fwd(tf);
-                if (ui->focus == FOCUS_SEARCH) sync_catalog_snapshot(ui);
+                tf_delete_fwd(tf, opt);
+                if (ui->focus == FOCUS_SEARCH) {
+                    ui->scroll_y = 0.0;
+                    sync_catalog_snapshot(ui);
+                }
                 ui->dirty = true;
                 return true;
             }
-            if (sym == SDLK_LEFT) { tf_move_left(tf); ui->dirty = true; return true; }
-            if (sym == SDLK_RIGHT) { tf_move_right(tf); ui->dirty = true; return true; }
-            if (sym == SDLK_HOME) { tf->select_all = false; tf->cursor = 0; ui->dirty = true; return true; }
-            if (sym == SDLK_END) { tf->select_all = false; tf->cursor = tf->len; ui->dirty = true; return true; }
+            if (sym == SDLK_LEFT) {
+                if (!shift && !cmd && !opt && tf_has_selection(tf)) {
+                    int s = 0, e = 0;
+                    tf_get_selection(tf, &s, &e);
+                    tf_move_cursor(tf, s, false);
+                } else {
+                    int next_pos = cmd ? 0 : (opt ? tf_prev_word_pos(tf, tf->cursor) : tf_prev_char_pos(tf, tf->cursor));
+                    tf_move_cursor(tf, next_pos, shift);
+                }
+                ui->dirty = true;
+                return true;
+            }
+            if (sym == SDLK_RIGHT) {
+                if (!shift && !cmd && !opt && tf_has_selection(tf)) {
+                    int s = 0, e = 0;
+                    tf_get_selection(tf, &s, &e);
+                    tf_move_cursor(tf, e, false);
+                } else {
+                    int next_pos = cmd ? tf->len : (opt ? tf_next_word_pos(tf, tf->cursor) : tf_next_char_pos(tf, tf->cursor));
+                    tf_move_cursor(tf, next_pos, shift);
+                }
+                ui->dirty = true;
+                return true;
+            }
+            if (sym == SDLK_HOME || sym == SDLK_UP) {
+                tf_move_cursor(tf, 0, shift);
+                ui->dirty = true;
+                return true;
+            }
+            if (sym == SDLK_END || sym == SDLK_DOWN) {
+                tf_move_cursor(tf, tf->len, shift);
+                ui->dirty = true;
+                return true;
+            }
             if (sym == SDLK_TAB && ui->import_modal_open) {
+                ui->dragging_tf = false;
                 ui->focus = (ui->focus == FOCUS_MODAL_SOURCE) ? FOCUS_MODAL_TITLE : FOCUS_MODAL_SOURCE;
                 ui->dirty = true;
                 return true;
@@ -1667,8 +2163,9 @@ bool native_ui_handle_event(native_ui_t *ui, const SDL_Event *ev,
         }
 
         if (!in_player_view) {
-            if (accel && sym == SDLK_f) {
+            if (accel && is_f) {
                 ui->focus = FOCUS_SEARCH;
+                tf_select_all(&ui->tf_search);
                 ui->dirty = true;
                 return true;
             }
