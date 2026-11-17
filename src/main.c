@@ -9,12 +9,15 @@
 #include <stdbool.h>
 #include <string.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "mvob_parser.h"
 #include "mpv_controller.h"
 #include "spu_compositor.h"
 #include "dvd_vm_bridge.h"
+#include "library.h"
+#include "ui/native_ui.h"
 #include "web_server.h"
 
 #define TINYDVD_VERSION "1.0.0"
@@ -63,10 +66,104 @@ static void on_mpv_update_cb(void *user_data) {
     SDL_PushEvent(&ev);
 }
 
+static void resolve_default_library_path(char *out, size_t out_len) {
+    const char *home = getenv("HOME");
+    if (!home || !home[0]) {
+        snprintf(out, out_len, ".");
+        return;
+    }
+    char movies[1024], videos[1024];
+    snprintf(movies, sizeof(movies), "%s/Movies", home);
+    snprintf(videos, sizeof(videos), "%s/Videos", home);
+    struct stat st;
+    if (stat(movies, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(out, out_len, "%s", movies);
+    } else if (stat(videos, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(out, out_len, "%s", videos);
+    } else {
+#ifdef __APPLE__
+        snprintf(out, out_len, "%s", movies);
+#else
+        snprintf(out, out_len, "%s", videos);
+#endif
+    }
+}
+
+static bool start_movie_playback(SDL_Window *window, mpv_controller_t *mpv,
+                                 spu_compositor_t **spu, dvd_vm_bridge_t **bridge,
+                                 const char *disc_path, const char *disc_title,
+                                 char *current_title, size_t title_len,
+                                 bool *in_player_view, native_ui_t *ui) {
+    if (*bridge) {
+        dvd_vm_bridge_destroy(*bridge);
+        *bridge = NULL;
+    }
+    mpv_handle *mh = mpv_controller_get_handle(mpv);
+    if (mh) mpv_command_string(mh, "stop");
+    player_adapter_reset(mpv_controller_get_adapter(mpv));
+
+    if (*spu) {
+        spu_compositor_destroy(*spu);
+    }
+    *spu = spu_compositor_create();
+    if (!*spu) return false;
+
+    dvd_vm_bridge_t *new_bridge = dvd_vm_bridge_init(disc_path, mpv_controller_get_adapter(mpv), *spu);
+    if (!new_bridge) {
+        fprintf(stderr, "Failed to initialize DVD VM bridge for '%s'\n", disc_path);
+        return false;
+    }
+    *bridge = new_bridge;
+    dvd_vm_bridge_start(*bridge);
+    *in_player_view = true;
+
+    snprintf(current_title, title_len, "%s", (disc_title && disc_title[0]) ? disc_title : disc_path);
+    if (window) {
+        char wtitle[320];
+        snprintf(wtitle, sizeof(wtitle), "TinyDVD — %s", current_title);
+        SDL_SetWindowTitle(window, wtitle);
+    }
+    if (ui) native_ui_mark_dirty(ui);
+    return true;
+}
+
+static void return_to_library(SDL_Window *window, mpv_controller_t *mpv,
+                              spu_compositor_t **spu, dvd_vm_bridge_t **bridge,
+                              tdvd_library_t *lib, const char *fallback_dir,
+                              bool *in_player_view, bool *cursor_visible,
+                              native_ui_t *ui) {
+    if (*bridge) {
+        dvd_vm_bridge_destroy(*bridge);
+        *bridge = NULL;
+    }
+    mpv_handle *mh = mpv_controller_get_handle(mpv);
+    if (mh) mpv_command_string(mh, "stop");
+    player_adapter_reset(mpv_controller_get_adapter(mpv));
+
+    if (*spu) {
+        spu_compositor_destroy(*spu);
+        *spu = spu_compositor_create();
+    }
+
+    if (!lib->is_library && fallback_dir && fallback_dir[0]) {
+        tdvd_library_set_directory(lib, fallback_dir);
+    } else {
+        tdvd_library_rescan(lib);
+    }
+
+    SDL_ShowCursor(SDL_ENABLE);
+    *cursor_visible = true;
+    *in_player_view = false;
+    if (window) {
+        SDL_SetWindowTitle(window, "TinyDVD Cinema");
+    }
+    if (ui) native_ui_mark_dirty(ui);
+}
+
 static void print_usage(const char *prog) {
     printf("tinydvd Player v%s\n", TINYDVD_VERSION);
     printf("Interactive DVD-Video Hybrid Player (.tdvd / H.264 + Meta-VOB)\n\n");
-    printf("Usage: %s [options] <movie.tdvd | tinydvd_directory>\n\n", prog);
+    printf("Usage: %s [options] [movie.tdvd | library_directory]\n\n", prog);
     printf("Options:\n");
     printf("  -s, --serve          Start embedded web streaming server\n");
     printf("  -p, --port <port>    Web server port (default: 8080)\n");
@@ -128,10 +225,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    char default_lib_buf[1024] = {0};
     if (!dvd_path) {
-        fprintf(stderr, "Error: No DVD path specified.\n\n");
-        print_usage(argv[0]);
-        return 1;
+        if (serve_mode) {
+            fprintf(stderr, "Error: No DVD path specified.\n\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+        resolve_default_library_path(default_lib_buf, sizeof(default_lib_buf));
+        dvd_path = default_lib_buf;
     }
 
     if (serve_mode) {
@@ -155,8 +257,21 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    tdvd_library_t lib;
+    tdvd_library_init(&lib, dvd_path);
+
+    char library_fallback_dir[1024] = {0};
+    if (!lib.is_library) {
+        snprintf(library_fallback_dir, sizeof(library_fallback_dir), "%s", lib.target_path);
+        char *sl = strrchr(library_fallback_dir, '/');
+        if (sl && sl > library_fallback_dir) *sl = '\0';
+        else if (sl == library_fallback_dir) library_fallback_dir[1] = '\0';
+        else snprintf(library_fallback_dir, sizeof(library_fallback_dir), ".");
+    }
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        tdvd_library_destroy(&lib);
         return 1;
     }
 
@@ -172,15 +287,20 @@ int main(int argc, char *argv[]) {
         window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
 
+    int init_w = lib.is_library ? 1280 : 853;
+    int init_h = lib.is_library ? 800 : 480;
+    const char *init_title = lib.is_library ? "TinyDVD Cinema" : "tinydvd Player";
+
     SDL_Window *window = SDL_CreateWindow(
-        "tinydvd Player",
+        init_title,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        853, 480, /* 16:9 widescreen or 720:480 display aspect */
+        init_w, init_h,
         window_flags
     );
 
     if (!window) {
         fprintf(stderr, "Failed to create SDL window: %s\n", SDL_GetError());
+        tdvd_library_destroy(&lib);
         SDL_Quit();
         return 1;
     }
@@ -189,12 +309,14 @@ int main(int argc, char *argv[]) {
     if (!gl_ctx) {
         fprintf(stderr, "Failed to create OpenGL context: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
+        tdvd_library_destroy(&lib);
         SDL_Quit();
         return 1;
     }
 
     SDL_GL_MakeCurrent(window, gl_ctx);
     SDL_GL_SetSwapInterval(1); /* vsync */
+    SDL_StartTextInput();
 
     /* Prevent screensaver / screen blanking / idle sleep during playback */
     SDL_DisableScreenSaver();
@@ -203,8 +325,10 @@ int main(int argc, char *argv[]) {
     mpv_controller_t *mpv = mpv_controller_init(get_proc_address_sdl, on_mpv_update_cb, NULL);
     if (!mpv) {
         fprintf(stderr, "Failed to initialize mpv_controller\n");
+        SDL_StopTextInput();
         SDL_GL_DeleteContext(gl_ctx);
         SDL_DestroyWindow(window);
+        tdvd_library_destroy(&lib);
         SDL_Quit();
         return 1;
     }
@@ -213,24 +337,36 @@ int main(int argc, char *argv[]) {
     if (!spu) {
         fprintf(stderr, "Failed to initialize spu_compositor\n");
         mpv_controller_destroy(mpv);
+        SDL_StopTextInput();
         SDL_GL_DeleteContext(gl_ctx);
         SDL_DestroyWindow(window);
+        tdvd_library_destroy(&lib);
         SDL_Quit();
         return 1;
     }
 
-    dvd_vm_bridge_t *bridge = dvd_vm_bridge_init(dvd_path, mpv_controller_get_adapter(mpv), spu);
-    if (!bridge) {
-        fprintf(stderr, "Failed to initialize DVD VM bridge for '%s'\n", dvd_path);
-        spu_compositor_destroy(spu);
-        mpv_controller_destroy(mpv);
-        SDL_GL_DeleteContext(gl_ctx);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
+    native_ui_t *ui = native_ui_create(window, &lib);
+    dvd_vm_bridge_t *bridge = NULL;
+    bool in_player_view = false;
+    char current_movie_title[256] = {0};
 
-    dvd_vm_bridge_start(bridge);
+    if (!lib.is_library) {
+        const char *play_target = (lib.catalog_count > 0) ? lib.catalog[0].path : lib.target_path;
+        const char *play_title = (lib.catalog_count > 0) ? lib.catalog[0].title : dvd_path;
+        if (!start_movie_playback(window, mpv, &spu, &bridge, play_target, play_title,
+                                  current_movie_title, sizeof(current_movie_title),
+                                  &in_player_view, ui)) {
+            if (ui) native_ui_destroy(ui);
+            if (spu) spu_compositor_destroy(spu);
+            mpv_controller_destroy(mpv);
+            SDL_StopTextInput();
+            SDL_GL_DeleteContext(gl_ctx);
+            SDL_DestroyWindow(window);
+            tdvd_library_destroy(&lib);
+            SDL_Quit();
+            return 1;
+        }
+    }
 
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
@@ -240,7 +376,12 @@ int main(int argc, char *argv[]) {
     bool cursor_visible = true;
     Uint32 last_mouse_activity = SDL_GetTicks();
 
-    while (running && !g_quit_requested && dvd_vm_bridge_is_running(bridge)) {
+    while (running && !g_quit_requested) {
+        if (in_player_view && bridge && !dvd_vm_bridge_is_running(bridge)) {
+            return_to_library(window, mpv, &spu, &bridge, &lib, library_fallback_dir,
+                              &in_player_view, &cursor_visible, ui);
+        }
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEMOTION || ev.type == SDL_MOUSEBUTTONDOWN ||
@@ -249,51 +390,77 @@ int main(int argc, char *argv[]) {
                 if (!cursor_visible) {
                     SDL_ShowCursor(SDL_ENABLE);
                     cursor_visible = true;
+                    if (ui) native_ui_mark_dirty(ui);
                 }
             }
-            switch (ev.type) {
-                case SDL_QUIT:
-                    running = false;
-                    break;
 
+            if (ev.type == SDL_QUIT) {
+                running = false;
+                break;
+            }
+
+            char play_path[1024] = {0};
+            char play_title[256] = {0};
+            bool back_to_lib = false;
+            if (ui && native_ui_handle_event(ui, &ev, in_player_view,
+                                             play_path, sizeof(play_path),
+                                             play_title, sizeof(play_title),
+                                             &back_to_lib)) {
+                if (play_path[0]) {
+                    start_movie_playback(window, mpv, &spu, &bridge, play_path, play_title,
+                                         current_movie_title, sizeof(current_movie_title),
+                                         &in_player_view, ui);
+                    last_mouse_activity = SDL_GetTicks();
+                } else if (back_to_lib && in_player_view) {
+                    return_to_library(window, mpv, &spu, &bridge, &lib, library_fallback_dir,
+                                      &in_player_view, &cursor_visible, ui);
+                }
+                continue;
+            }
+
+            switch (ev.type) {
                 case SDL_KEYDOWN:
                     switch (ev.key.keysym.sym) {
                         case SDLK_q:
                             running = false;
                             break;
                         case SDLK_UP:
-                            dvd_vm_bridge_up_button(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_up_button(bridge);
                             break;
                         case SDLK_DOWN:
-                            dvd_vm_bridge_down_button(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_down_button(bridge);
                             break;
                         case SDLK_LEFT:
-                            if (ev.key.keysym.mod & KMOD_SHIFT) {
-                                dvd_vm_bridge_seek_relative(bridge, -60);
-                            } else {
-                                dvd_vm_bridge_left_button(bridge);
+                            if (in_player_view && bridge) {
+                                if (ev.key.keysym.mod & KMOD_SHIFT) {
+                                    dvd_vm_bridge_seek_relative(bridge, -60);
+                                } else {
+                                    dvd_vm_bridge_left_button(bridge);
+                                }
                             }
                             break;
                         case SDLK_RIGHT:
-                            if (ev.key.keysym.mod & KMOD_SHIFT) {
-                                dvd_vm_bridge_seek_relative(bridge, +60);
-                            } else {
-                                dvd_vm_bridge_right_button(bridge);
+                            if (in_player_view && bridge) {
+                                if (ev.key.keysym.mod & KMOD_SHIFT) {
+                                    dvd_vm_bridge_seek_relative(bridge, +60);
+                                } else {
+                                    dvd_vm_bridge_right_button(bridge);
+                                }
                             }
                             break;
                         case SDLK_COMMA:
-                            dvd_vm_bridge_seek_relative(bridge, -10);
+                            if (in_player_view && bridge) dvd_vm_bridge_seek_relative(bridge, -10);
                             break;
                         case SDLK_PERIOD:
-                            dvd_vm_bridge_seek_relative(bridge, +10);
+                            if (in_player_view && bridge) dvd_vm_bridge_seek_relative(bridge, +10);
                             break;
                         case SDLK_LEFTBRACKET:
                         case SDLK_PAGEUP:
-                            dvd_vm_bridge_prev_chapter(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_prev_chapter(bridge);
                             break;
                         case SDLK_RIGHTBRACKET:
                         case SDLK_PAGEDOWN:
-                            dvd_vm_bridge_next_chapter(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_next_chapter(bridge);
                             break;
                         case SDLK_0:
                         case SDLK_1:
@@ -305,35 +472,43 @@ int main(int argc, char *argv[]) {
                         case SDLK_7:
                         case SDLK_8:
                         case SDLK_9: {
-                            int digit = (int)(ev.key.keysym.sym - SDLK_0);
-                            dvd_vm_bridge_seek_fraction(bridge, (double)digit * 0.10);
+                            if (in_player_view && bridge) {
+                                int digit = (int)(ev.key.keysym.sym - SDLK_0);
+                                dvd_vm_bridge_seek_fraction(bridge, (double)digit * 0.10);
+                            }
                             break;
                         }
                         case SDLK_c:
                         case SDLK_s:
-                            dvd_vm_bridge_cycle_subtitles(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_cycle_subtitles(bridge);
                             break;
                         case SDLK_a:
-                            dvd_vm_bridge_cycle_audio(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_cycle_audio(bridge);
                             break;
                         case SDLK_RETURN:
                         case SDLK_KP_ENTER:
-                            dvd_vm_bridge_activate_button(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_activate_button(bridge);
                             break;
                         case SDLK_SPACE:
-                            dvd_vm_bridge_toggle_pause(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_toggle_pause(bridge);
                             break;
                         case SDLK_m:
-                            dvd_vm_bridge_menu(bridge);
+                            if (in_player_view && bridge) dvd_vm_bridge_menu(bridge);
                             break;
                         case SDLK_ESCAPE:
-                            if (!dvd_vm_bridge_escape(bridge)) {
+                            if (in_player_view && bridge) {
+                                if (!dvd_vm_bridge_escape(bridge)) {
+                                    return_to_library(window, mpv, &spu, &bridge, &lib, library_fallback_dir,
+                                                      &in_player_view, &cursor_visible, ui);
+                                }
+                            } else {
                                 running = false;
                             }
                             break;
                         case SDLK_f:
                             is_fullscreen = !is_fullscreen;
                             SDL_SetWindowFullscreen(window, is_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                            if (ui) native_ui_mark_dirty(ui);
                             break;
                         default:
                             break;
@@ -341,20 +516,24 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDL_MOUSEMOTION: {
-                    int x_dvd, y_dvd;
-                    if (window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
-                                      spu_compositor_get_frame_height(spu), ev.motion.x, ev.motion.y, &x_dvd, &y_dvd)) {
-                        dvd_vm_bridge_mouse_move(bridge, x_dvd, y_dvd);
+                    if (in_player_view && bridge && spu) {
+                        int x_dvd, y_dvd;
+                        if (window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
+                                          spu_compositor_get_frame_height(spu), ev.motion.x, ev.motion.y, &x_dvd, &y_dvd)) {
+                            dvd_vm_bridge_mouse_move(bridge, x_dvd, y_dvd);
+                        }
                     }
                     break;
                 }
 
                 case SDL_MOUSEBUTTONDOWN: {
-                    int x_dvd, y_dvd;
-                    if (ev.button.button == SDL_BUTTON_LEFT &&
-                        window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
-                                      spu_compositor_get_frame_height(spu), ev.button.x, ev.button.y, &x_dvd, &y_dvd)) {
-                        dvd_vm_bridge_mouse_click(bridge, x_dvd, y_dvd);
+                    if (in_player_view && bridge && spu) {
+                        int x_dvd, y_dvd;
+                        if (ev.button.button == SDL_BUTTON_LEFT &&
+                            window_to_dvd(window, mpv_controller_get_display_aspect(mpv),
+                                          spu_compositor_get_frame_height(spu), ev.button.x, ev.button.y, &x_dvd, &y_dvd)) {
+                            dvd_vm_bridge_mouse_click(bridge, x_dvd, y_dvd);
+                        }
                     }
                     break;
                 }
@@ -364,9 +543,16 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (cursor_visible && SDL_GetTicks() - last_mouse_activity >= CURSOR_IDLE_MS) {
-            SDL_ShowCursor(SDL_DISABLE);
-            cursor_visible = false;
+        if (in_player_view && !(ui && native_ui_is_modal_open(ui))) {
+            if (cursor_visible && SDL_GetTicks() - last_mouse_activity >= CURSOR_IDLE_MS) {
+                SDL_ShowCursor(SDL_DISABLE);
+                cursor_visible = false;
+                if (ui) native_ui_mark_dirty(ui);
+            }
+        } else if (!cursor_visible) {
+            SDL_ShowCursor(SDL_ENABLE);
+            cursor_visible = true;
+            if (ui) native_ui_mark_dirty(ui);
         }
 
         mpv_controller_poll_events(mpv);
@@ -378,8 +564,16 @@ int main(int argc, char *argv[]) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        mpv_controller_render(mpv, draw_w, draw_h);
-        spu_compositor_render_gl(spu, draw_w, draw_h, mpv_controller_get_display_aspect(mpv));
+        if (in_player_view) {
+            mpv_controller_render(mpv, draw_w, draw_h);
+            spu_compositor_render_gl(spu, draw_w, draw_h, mpv_controller_get_display_aspect(mpv));
+            if (ui) {
+                bool hud_vis = cursor_visible || native_ui_is_modal_open(ui);
+                native_ui_render(ui, draw_w, draw_h, true, current_movie_title, hud_vis);
+            }
+        } else if (ui) {
+            native_ui_render(ui, draw_w, draw_h, false, NULL, false);
+        }
 
         SDL_GL_SwapWindow(window);
 
@@ -387,12 +581,15 @@ int main(int argc, char *argv[]) {
     }
 
     printf("[main] Cleaning up...\n");
+    SDL_StopTextInput();
     SDL_EnableScreenSaver();
-    dvd_vm_bridge_destroy(bridge);
-    spu_compositor_destroy(spu);
+    if (ui) native_ui_destroy(ui);
+    if (bridge) dvd_vm_bridge_destroy(bridge);
+    if (spu) spu_compositor_destroy(spu);
     mpv_controller_destroy(mpv);
     SDL_GL_DeleteContext(gl_ctx);
     SDL_DestroyWindow(window);
+    tdvd_library_destroy(&lib);
     SDL_Quit();
 
     return 0;

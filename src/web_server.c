@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "web_assets.h"
+#include "library.h"
 #include "dvd_vm_bridge.h"
 #include "spu_compositor.h"
 #include "tdvd_archive.h"
@@ -25,24 +26,12 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/wait.h>
+#include <ctype.h>
 
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 #define CHUNK_SIZE 65536
 #define SESSION_TIMEOUT_SEC 180
-
-typedef struct catalog_item {
-    char id[128];
-    char title[256];
-    char path[1024];
-    uint64_t size_bytes;
-    char size_str[32];
-    bool has_thumbnail;
-    int year;
-    char director[128];
-    char cast[512];
-    char genres[128];
-    char overview[1024];
-} catalog_item_t;
 
 typedef struct ws_client {
     int fd;
@@ -90,16 +79,8 @@ struct web_server {
     int listen_fd;
     int port;
     char bind_addr[64];
-    char target_path[1024];
-    bool is_library;
 
-    catalog_item_t *catalog;
-    int catalog_count;
-    int catalog_cap;
-
-    char default_disc_path[1024];
-    char default_disc_id[128];
-    char default_disc_title[256];
+    tdvd_library_t lib;
 
     web_session_t *sessions;
     pthread_mutex_t sessions_lock;
@@ -108,49 +89,7 @@ struct web_server {
     pthread_t accept_thread;
 };
 
-static void sanitize_id(const char *in, char *out, size_t out_len) {
-    size_t j = 0;
-    for (size_t i = 0; in[i] && j + 1 < out_len; i++) {
-        char c = in[i];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
-            out[j++] = c;
-        } else {
-            out[j++] = '_';
-        }
-    }
-    out[j] = '\0';
-}
-
 static void json_escape_copy(const char *in, char *out, size_t out_len);
-
-static void format_size(uint64_t bytes, char *buf, size_t len) {
-    if (bytes >= 1073741824ULL) {
-        snprintf(buf, len, "%.1f GB", (double)bytes / 1073741824.0);
-    } else if (bytes >= 1048576ULL) {
-        snprintf(buf, len, "%.1f MB", (double)bytes / 1048576.0);
-    } else {
-        snprintf(buf, len, "%llu KB", (unsigned long long)(bytes / 1024ULL));
-    }
-}
-
-static bool is_tdvd_file(const char *path) {
-    if (!path) return false;
-    size_t len = strlen(path);
-    if (len > 5 && strcasecmp(path + len - 5, ".tdvd") == 0) return true;
-    if (len > 8 && strcasecmp(path + len - 8, ".tinydvd") == 0) return true;
-    return false;
-}
-
-static bool is_tinydvd_dir(const char *dir_path) {
-    if (!dir_path) return false;
-    char ifo[1024];
-    struct stat st;
-    snprintf(ifo, sizeof(ifo), "%s/VIDEO_TS.IFO", dir_path);
-    if (stat(ifo, &st) == 0) return true;
-    snprintf(ifo, sizeof(ifo), "%s/video_ts.ifo", dir_path);
-    if (stat(ifo, &st) == 0) return true;
-    return false;
-}
 
 /* =========================================================================
  * WebSocket Helpers (RFC 6455)
@@ -439,7 +378,7 @@ static web_session_t *get_or_create_session(web_server_t *s, const char *session
 
     char sid[64] = {0};
     if (session_id && session_id[0]) {
-        sanitize_id(session_id, sid, sizeof(sid));
+        tdvd_library_sanitize_id(session_id, sid, sizeof(sid));
     }
     if (sid[0] == '\0') {
         snprintf(sid, sizeof(sid), "s_%08x%08x", (unsigned)rand(), (unsigned)time(NULL));
@@ -470,15 +409,25 @@ static web_session_t *get_or_create_session(web_server_t *s, const char *session
     /* Single-disc mode auto-starts its only disc. In library mode a new session
      * (e.g. a fresh tab connecting its WebSocket) stays idle on the library
      * until the user picks a disc via /api/play. */
-    const char *fallback_disc = s->is_library ? NULL : s->default_disc_path;
+    pthread_mutex_lock(&s->lib.catalog_lock);
+    bool is_lib = s->lib.is_library;
+    char default_path_copy[1024];
+    char default_title_copy[256];
+    strncpy(default_path_copy, s->lib.default_disc_path, sizeof(default_path_copy) - 1);
+    default_path_copy[sizeof(default_path_copy) - 1] = '\0';
+    strncpy(default_title_copy, s->lib.default_disc_title, sizeof(default_title_copy) - 1);
+    default_title_copy[sizeof(default_title_copy) - 1] = '\0';
+    pthread_mutex_unlock(&s->lib.catalog_lock);
+
+    const char *fallback_disc = is_lib ? NULL : default_path_copy;
     const char *target_disc = (disc_path && disc_path[0]) ? disc_path : fallback_disc;
-    const char *target_title = (disc_title && disc_title[0]) ? disc_title : s->default_disc_title;
+    const char *target_title = (disc_title && disc_title[0]) ? disc_title : default_title_copy;
 
     if (target_disc && target_disc[0]) {
         strncpy(sess->disc_path, target_disc, sizeof(sess->disc_path) - 1);
         const char *slash = strrchr(target_disc, '/');
         const char *base = slash ? slash + 1 : target_disc;
-        sanitize_id(base, sess->disc_id, sizeof(sess->disc_id));
+        tdvd_library_sanitize_id(base, sess->disc_id, sizeof(sess->disc_id));
         strncpy(sess->disc_title, (target_title && target_title[0]) ? target_title : sess->disc_id, sizeof(sess->disc_title) - 1);
 
         sess->spu = spu_compositor_create();
@@ -519,7 +468,7 @@ static bool session_load_movie(web_session_t *sess, const char *disc_path, const
     strncpy(sess->disc_path, disc_path, sizeof(sess->disc_path) - 1);
     const char *slash = strrchr(disc_path, '/');
     const char *base = slash ? slash + 1 : disc_path;
-    sanitize_id(base, sess->disc_id, sizeof(sess->disc_id));
+    tdvd_library_sanitize_id(base, sess->disc_id, sizeof(sess->disc_id));
     if (disc_title && disc_title[0]) {
         strncpy(sess->disc_title, disc_title, sizeof(sess->disc_title) - 1);
     } else {
@@ -570,8 +519,8 @@ static bool session_load_movie(web_session_t *sess, const char *disc_path, const
 static bool ensure_remuxed_mp4(web_server_t *s, const char *disc_path, const char *disc_id, const char *base_name, char *out_path, size_t out_path_len) {
     if (!s || !base_name) return false;
 
-    const char *dpath = (disc_path && disc_path[0]) ? disc_path : s->default_disc_path;
-    const char *did = (disc_id && disc_id[0]) ? disc_id : s->default_disc_id;
+    const char *dpath = (disc_path && disc_path[0]) ? disc_path : s->lib.default_disc_path;
+    const char *did = (disc_id && disc_id[0]) ? disc_id : s->lib.default_disc_id;
 
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "/tmp/tinydvd_web_cache/%s", did);
@@ -593,7 +542,7 @@ static bool ensure_remuxed_mp4(web_server_t *s, const char *disc_path, const cha
 
     fprintf(stderr, "[web_server] Remuxing %s -> %s...\n", mkv_name, out_path);
 
-    if (is_tdvd_file(dpath)) {
+    if (tdvd_library_is_tdvd_file(dpath)) {
         tdvd_archive_t *arc = tdvd_archive_open(dpath);
         if (!arc) return false;
 
@@ -1022,6 +971,54 @@ static void handle_http_range_file(int client_fd, const char *file_path, const c
     fclose(f);
 }
 
+/* =========================================================================
+ * Built-in DVD Import Pipeline & Helpers
+ * ========================================================================= */
+
+static void url_decode(const char *src, char *dst, size_t dst_len) {
+    if (!src || !dst || dst_len == 0) return;
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
+        if (src[i] == '%' &&
+            isxdigit((unsigned char)src[i + 1]) &&
+            isxdigit((unsigned char)src[i + 2])) {
+            char hex[3] = { src[i + 1], src[i + 2], '\0' };
+            dst[j++] = (char)strtol(hex, NULL, 16);
+            i += 2;
+        } else if (src[i] == '+') {
+            dst[j++] = ' ';
+        } else {
+            dst[j++] = src[i];
+        }
+    }
+    dst[j] = '\0';
+}
+
+static bool extract_query_param(const char *uri, const char *key, char *out, size_t out_len) {
+    if (!uri || !key || !out || out_len == 0) return false;
+    out[0] = '\0';
+    const char *q = strchr(uri, '?');
+    if (!q) return false;
+    const char *p = q + 1;
+    size_t klen = strlen(key);
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t plen = amp ? (size_t)(amp - p) : strlen(p);
+        if (plen > klen && strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            char encoded[1024];
+            size_t vlen = plen - (klen + 1);
+            if (vlen >= sizeof(encoded)) vlen = sizeof(encoded) - 1;
+            memcpy(encoded, p + klen + 1, vlen);
+            encoded[vlen] = '\0';
+            url_decode(encoded, out, out_len);
+            return true;
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return false;
+}
+
 static void handle_client_request(web_server_t *s, int client_fd) {
     char req[4096];
     ssize_t n = recv(client_fd, req, sizeof(req) - 1, 0);
@@ -1031,8 +1028,8 @@ static void handle_client_request(web_server_t *s, int client_fd) {
     }
     req[n] = '\0';
 
-    char method[16], uri[1024];
-    if (sscanf(req, "%15s %1023s", method, uri) != 2) {
+    char method[16], uri[2048];
+    if (sscanf(req, "%15s %2047s", method, uri) != 2) {
         send_http_error(client_fd, 400, "Bad Request");
         close(client_fd);
         return;
@@ -1095,19 +1092,22 @@ static void handle_client_request(web_server_t *s, int client_fd) {
 
     /* Route: /api/library */
     if (strncmp(uri, "/api/library", 12) == 0) {
-        char json[65536];
-        int pos = snprintf(json, sizeof(json), "{\"is_directory\":%s,\"items\":[", s->is_library ? "true" : "false");
+        tdvd_library_rescan(&s->lib);
 
-        for (int i = 0; i < s->catalog_count; i++) {
-            catalog_item_t *item = &s->catalog[i];
-            char e_title[512] = {0}, e_dir[256] = {0}, e_cast[1024] = {0}, e_gen[256] = {0}, e_ov[2048] = {0};
+        char json[65536];
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        int pos = snprintf(json, sizeof(json), "{\"is_directory\":%s,\"items\":[", s->lib.is_library ? "true" : "false");
+
+        for (int i = 0; i < s->lib.catalog_count; i++) {
+            catalog_item_t *item = &s->lib.catalog[i];
+            char e_title[512] = {0}, e_dir[256] = {0}, e_cast[2048] = {0}, e_gen[256] = {0}, e_ov[2048] = {0};
             json_escape_copy(item->title, e_title, sizeof(e_title));
             json_escape_copy(item->director, e_dir, sizeof(e_dir));
             json_escape_copy(item->cast, e_cast, sizeof(e_cast));
             json_escape_copy(item->genres, e_gen, sizeof(e_gen));
             json_escape_copy(item->overview, e_ov, sizeof(e_ov));
 
-            char elem[4096];
+            char elem[6144];
             snprintf(elem, sizeof(elem),
                      "%s{\"id\":\"%s\",\"title\":\"%s\",\"size_bytes\":%llu,\"size_str\":\"%s\",\"has_thumbnail\":%s,"
                      "\"year\":%d,\"director\":\"%s\",\"cast\":\"%s\",\"genres\":\"%s\",\"overview\":\"%s\"}",
@@ -1122,6 +1122,7 @@ static void handle_client_request(web_server_t *s, int client_fd) {
                 pos += elen;
             }
         }
+        pthread_mutex_unlock(&s->lib.catalog_lock);
         strcpy(json + pos, "]}");
 
         char header[256];
@@ -1138,6 +1139,137 @@ static void handle_client_request(web_server_t *s, int client_fd) {
         return;
     }
 
+    /* Route: /api/import/status */
+    if (strncmp(uri, "/api/import/status", 18) == 0) {
+        char default_src[512] = {0};
+        char default_title[256] = {0};
+        tdvd_library_detect_default_source(default_src, sizeof(default_src), default_title, sizeof(default_title));
+
+        import_job_t *job = &s->lib.import_job;
+        char *json = (char *)malloc(65536);
+        if (!json) {
+            send_http_error(client_fd, 500, "Out of Memory");
+            close(client_fd);
+            return;
+        }
+
+        pthread_mutex_lock(&job->lock);
+        const char *st_name = tdvd_import_state_name(job->state);
+        bool active = job->active;
+        int elapsed = (job->start_time > 0) ? (int)(time(NULL) - job->start_time) : 0;
+
+        char e_def_src[1024] = {0}, e_def_title[512] = {0};
+        char e_src[1024] = {0}, e_title[512] = {0};
+        char e_stage[512] = {0}, e_err[1024] = {0};
+        char e_res_id[256] = {0}, e_res_title[512] = {0};
+
+        json_escape_copy(default_src, e_def_src, sizeof(e_def_src));
+        json_escape_copy(default_title, e_def_title, sizeof(e_def_title));
+        json_escape_copy(job->source, e_src, sizeof(e_src));
+        json_escape_copy(job->title, e_title, sizeof(e_title));
+        json_escape_copy(job->stage_msg, e_stage, sizeof(e_stage));
+        json_escape_copy(job->error_msg, e_err, sizeof(e_err));
+        json_escape_copy(job->result_disc_id, e_res_id, sizeof(e_res_id));
+        json_escape_copy(job->result_title, e_res_title, sizeof(e_res_title));
+
+        int pos = snprintf(json, 65536,
+                           "{\"state\":\"%s\",\"active\":%s,\"elapsed_sec\":%d,"
+                           "\"default_source\":\"%s\",\"default_title\":\"%s\","
+                           "\"source\":\"%s\",\"title\":\"%s\","
+                           "\"stage_msg\":\"%s\",\"error_msg\":\"%s\","
+                           "\"result_disc_id\":\"%s\",\"result_title\":\"%s\",\"logs\":[",
+                           st_name, active ? "true" : "false", elapsed,
+                           e_def_src, e_def_title,
+                           e_src, e_title,
+                           e_stage, e_err,
+                           e_res_id, e_res_title);
+
+        for (int i = 0; i < job->log_count; i++) {
+            char e_line[IMPORT_LOG_LINE_LEN * 2] = {0};
+            json_escape_copy(job->log_lines[i], e_line, sizeof(e_line));
+            int need = (int)strlen(e_line) + 4;
+            if (pos + need + 16 < 65536) {
+                pos += snprintf(json + pos, 65536 - pos, "%s\"%s\"", (i > 0) ? "," : "", e_line);
+            }
+        }
+        pthread_mutex_unlock(&job->lock);
+        snprintf(json + pos, 65536 - pos, "]}");
+
+        char header[256];
+        size_t jlen = strlen(json);
+        snprintf(header, sizeof(header),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Cache-Control: no-store\r\n"
+                 "Connection: close\r\n\r\n",
+                 jlen);
+        send(client_fd, header, strlen(header), MSG_NOSIGNAL);
+        send(client_fd, json, jlen, MSG_NOSIGNAL);
+        free(json);
+        close(client_fd);
+        return;
+    }
+
+    /* Route: /api/import/start */
+    if (strncmp(uri, "/api/import/start", 17) == 0) {
+        char source_param[512] = {0};
+        char title_param[256] = {0};
+        char skip_param[32] = {0};
+        extract_query_param(uri, "source", source_param, sizeof(source_param));
+        extract_query_param(uri, "title", title_param, sizeof(title_param));
+        extract_query_param(uri, "skip_enrichment", skip_param, sizeof(skip_param));
+
+        bool skip_enrich = (strcmp(skip_param, "1") == 0 ||
+                            strcasecmp(skip_param, "true") == 0 ||
+                            strcasecmp(skip_param, "yes") == 0);
+
+        char err_buf[256] = {0};
+        if (tdvd_library_import_start(&s->lib, source_param, title_param, skip_enrich, err_buf, sizeof(err_buf))) {
+            const char *ok_json = "{\"status\":\"started\"}";
+            char header[256];
+            snprintf(header, sizeof(header),
+                     "HTTP/1.1 200 OK\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n",
+                     strlen(ok_json));
+            send(client_fd, header, strlen(header), MSG_NOSIGNAL);
+            send(client_fd, ok_json, strlen(ok_json), MSG_NOSIGNAL);
+        } else {
+            const char *busy_json = "{\"status\":\"error\",\"error\":\"An import job is already in progress\"}";
+            char header[256];
+            snprintf(header, sizeof(header),
+                     "HTTP/1.1 409 Conflict\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n\r\n",
+                     strlen(busy_json));
+            send(client_fd, header, strlen(header), MSG_NOSIGNAL);
+            send(client_fd, busy_json, strlen(busy_json), MSG_NOSIGNAL);
+        }
+        close(client_fd);
+        return;
+    }
+
+    /* Route: /api/import/cancel */
+    if (strncmp(uri, "/api/import/cancel", 18) == 0) {
+        tdvd_library_import_cancel(&s->lib);
+
+        const char *resp_json = "{\"status\":\"cancelling\"}";
+        char header[256];
+        snprintf(header, sizeof(header),
+                 "HTTP/1.1 200 OK\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n",
+                 strlen(resp_json));
+        send(client_fd, header, strlen(header), MSG_NOSIGNAL);
+        send(client_fd, resp_json, strlen(resp_json), MSG_NOSIGNAL);
+        close(client_fd);
+        return;
+    }
+
     /* Route: /api/thumbnail?disc=<id> or /api/thumbnail/<id> */
     if (strncmp(uri, "/api/thumbnail", 14) == 0) {
         char disc_id[128] = {0};
@@ -1150,17 +1282,20 @@ static void handle_client_request(web_server_t *s, int client_fd) {
             strncpy(disc_id, uri + 15, sizeof(disc_id) - 1);
         }
 
-        const char *disc_path = s->default_disc_path;
-        if (s->is_library && disc_id[0]) {
-            for (int i = 0; i < s->catalog_count; i++) {
-                if (strcmp(s->catalog[i].id, disc_id) == 0) {
-                    disc_path = s->catalog[i].path;
+        char disc_path[1024] = {0};
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        snprintf(disc_path, sizeof(disc_path), "%s", s->lib.default_disc_path);
+        if (s->lib.is_library && disc_id[0]) {
+            for (int i = 0; i < s->lib.catalog_count; i++) {
+                if (strcmp(s->lib.catalog[i].id, disc_id) == 0) {
+                    snprintf(disc_path, sizeof(disc_path), "%s", s->lib.catalog[i].path);
                     break;
                 }
             }
         }
+        pthread_mutex_unlock(&s->lib.catalog_lock);
 
-        if (is_tdvd_file(disc_path)) {
+        if (tdvd_library_is_tdvd_file(disc_path)) {
             tdvd_archive_t *arc = tdvd_archive_open(disc_path);
             uint64_t toff = 0, tsz = 0;
             if (arc && tdvd_archive_find(arc, "thumbnail.png", &toff, &tsz)) {
@@ -1208,17 +1343,19 @@ static void handle_client_request(web_server_t *s, int client_fd) {
             if (amp) *amp = '\0';
         }
 
-        const char *new_path = NULL;
-        const char *new_title = NULL;
-        for (int i = 0; i < s->catalog_count; i++) {
-            if (strcmp(s->catalog[i].id, disc_id) == 0) {
-                new_path = s->catalog[i].path;
-                new_title = s->catalog[i].title;
+        char new_path[1024] = {0};
+        char new_title[256] = {0};
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        for (int i = 0; i < s->lib.catalog_count; i++) {
+            if (strcmp(s->lib.catalog[i].id, disc_id) == 0) {
+                snprintf(new_path, sizeof(new_path), "%s", s->lib.catalog[i].path);
+                snprintf(new_title, sizeof(new_title), "%s", s->lib.catalog[i].title);
                 break;
             }
         }
+        pthread_mutex_unlock(&s->lib.catalog_lock);
 
-        if (new_path) {
+        if (new_path[0]) {
             web_session_t *sess = get_or_create_session(s, session_param[0] ? session_param : NULL, new_path, new_title);
             if (sess) {
                 session_load_movie(sess, new_path, new_title);
@@ -1253,17 +1390,21 @@ static void handle_client_request(web_server_t *s, int client_fd) {
             if (amp) *amp = '\0';
         }
 
-        const char *target_disc_path = s->default_disc_path;
-        const char *target_disc_id = s->default_disc_id;
+        char target_disc_path[1024] = {0};
+        char target_disc_id[128] = {0};
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        snprintf(target_disc_path, sizeof(target_disc_path), "%s", s->lib.default_disc_path);
+        snprintf(target_disc_id, sizeof(target_disc_id), "%s", s->lib.default_disc_id);
         if (disc_param[0]) {
-            for (int i = 0; i < s->catalog_count; i++) {
-                if (strcmp(s->catalog[i].id, disc_param) == 0) {
-                    target_disc_path = s->catalog[i].path;
-                    target_disc_id = s->catalog[i].id;
+            for (int i = 0; i < s->lib.catalog_count; i++) {
+                if (strcmp(s->lib.catalog[i].id, disc_param) == 0) {
+                    snprintf(target_disc_path, sizeof(target_disc_path), "%s", s->lib.catalog[i].path);
+                    snprintf(target_disc_id, sizeof(target_disc_id), "%s", s->lib.catalog[i].id);
                     break;
                 }
             }
         }
+        pthread_mutex_unlock(&s->lib.catalog_lock);
 
         char mp4_path[1024];
         if (ensure_remuxed_mp4(s, target_disc_path, target_disc_id, base, mp4_path, sizeof(mp4_path))) {
@@ -1343,159 +1484,6 @@ static void json_escape_copy(const char *in, char *out, size_t out_len) {
     out[j] = '\0';
 }
 
-static void json_get_string(const char *json, const char *key, char *out, size_t out_len) {
-    if (!json || !key || !out || out_len == 0) return;
-    out[0] = '\0';
-    char needle[128];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return;
-    p += strlen(needle);
-    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
-    if (*p == '"') {
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i + 1 < out_len) {
-            if (*p == '\\' && *(p + 1)) p++;
-            out[i++] = *p++;
-        }
-        out[i] = '\0';
-    } else if (*p == '[') {
-        p++;
-        size_t i = 0;
-        bool in_str = false;
-        while (*p && *p != ']' && i + 4 < out_len) {
-            if (*p == '"') {
-                if (in_str) {
-                    in_str = false;
-                    const char *next = p + 1;
-                    while (*next && (*next == ' ' || *next == '\t' || *next == '\r' || *next == '\n')) next++;
-                    if (*next == ',') {
-                        out[i++] = ',';
-                        out[i++] = ' ';
-                    }
-                } else {
-                    in_str = true;
-                }
-            } else if (in_str) {
-                if (*p == '\\' && *(p + 1)) p++;
-                out[i++] = *p;
-            }
-            p++;
-        }
-        out[i] = '\0';
-    }
-}
-
-static int json_get_int(const char *json, const char *key) {
-    if (!json || !key) return 0;
-    char needle[128];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return 0;
-    p += strlen(needle);
-    while (*p && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ':')) p++;
-    return atoi(p);
-}
-
-static void parse_catalog_metadata(catalog_item_t *item, const char *json) {
-    if (!item || !json) return;
-    char temp[256] = {0};
-    json_get_string(json, "title", temp, sizeof(temp));
-    if (temp[0]) strncpy(item->title, temp, sizeof(item->title) - 1);
-
-    int yr = json_get_int(json, "year");
-    if (yr > 0) item->year = yr;
-
-    json_get_string(json, "director", item->director, sizeof(item->director));
-    json_get_string(json, "cast", item->cast, sizeof(item->cast));
-    json_get_string(json, "genres", item->genres, sizeof(item->genres));
-    json_get_string(json, "overview", item->overview, sizeof(item->overview));
-}
-
-static void add_catalog_item(web_server_t *s, const char *path, const char *title) {
-    if (s->catalog_count >= s->catalog_cap) {
-        s->catalog_cap = s->catalog_cap ? (s->catalog_cap * 2) : 16;
-        s->catalog = (catalog_item_t *)realloc(s->catalog, s->catalog_cap * sizeof(catalog_item_t));
-    }
-    catalog_item_t *item = &s->catalog[s->catalog_count++];
-    memset(item, 0, sizeof(*item));
-
-    strncpy(item->path, path, sizeof(item->path) - 1);
-    const char *slash = strrchr(path, '/');
-    const char *base = slash ? slash + 1 : path;
-    sanitize_id(base, item->id, sizeof(item->id));
-
-    if (title && title[0]) {
-        strncpy(item->title, title, sizeof(item->title) - 1);
-    } else {
-        strncpy(item->title, item->id, sizeof(item->title) - 1);
-        char *tdvd_ext = strstr(item->title, "_tdvd");
-        if (tdvd_ext) *tdvd_ext = '\0';
-    }
-
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        item->size_bytes = (uint64_t)st.st_size;
-        format_size(item->size_bytes, item->size_str, sizeof(item->size_str));
-    }
-
-    if (is_tdvd_file(path)) {
-        tdvd_archive_t *arc = tdvd_archive_open(path);
-        if (arc) {
-            uint64_t toff = 0, tsz = 0;
-            item->has_thumbnail = tdvd_archive_find(arc, "thumbnail.png", &toff, &tsz);
-
-            uint64_t moff = 0, msz = 0;
-            if (tdvd_archive_find(arc, "metadata.json", &moff, &msz) && msz > 0 && msz < 65536) {
-                FILE *mf = fopen(path, "rb");
-                if (mf) {
-                    fseeko(mf, (off_t)moff, SEEK_SET);
-                    char *mjson = (char *)malloc(msz + 1);
-                    if (mjson) {
-                        size_t nr = fread(mjson, 1, msz, mf);
-                        mjson[nr] = '\0';
-                        parse_catalog_metadata(item, mjson);
-                        free(mjson);
-                    }
-                    fclose(mf);
-                }
-            }
-            tdvd_archive_close(arc);
-        }
-    }
-
-    /* Fallback: check for sidecar <path_without_ext>.json or metadata.json */
-    if (item->director[0] == '\0') {
-        char sidecar[1024];
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(sidecar, sizeof(sidecar), "%s/metadata.json", path);
-        } else {
-            snprintf(sidecar, sizeof(sidecar), "%s", path);
-            char *dot = strrchr(sidecar, '.');
-            if (dot) strcpy(dot, ".json");
-            else strncat(sidecar, ".json", sizeof(sidecar) - strlen(sidecar) - 1);
-        }
-
-        FILE *sf = fopen(sidecar, "rb");
-        if (sf) {
-            fseek(sf, 0, SEEK_END);
-            long ssz = ftell(sf);
-            if (ssz > 0 && ssz < 65536) {
-                fseek(sf, 0, SEEK_SET);
-                char *sbuf = (char *)malloc(ssz + 1);
-                if (sbuf) {
-                    size_t sn = fread(sbuf, 1, ssz, sf);
-                    sbuf[sn] = '\0';
-                    parse_catalog_metadata(item, sbuf);
-                    free(sbuf);
-                }
-            }
-            fclose(sf);
-        }
-    }
-}
-
 web_server_t *web_server_start(const web_server_config_t *config) {
     if (!config || !config->target_path) return NULL;
 
@@ -1505,69 +1493,15 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     s->port = config->port ? config->port : 8080;
     strncpy(s->bind_addr, config->bind_addr ? config->bind_addr : "0.0.0.0", sizeof(s->bind_addr) - 1);
 
-    char expanded_path[1024];
-    if (config->target_path[0] == '~' && (config->target_path[1] == '/' || config->target_path[1] == '\0')) {
-        const char *home = getenv("HOME");
-        if (home) {
-            snprintf(expanded_path, sizeof(expanded_path), "%s%s", home, config->target_path + 1);
-        } else {
-            strncpy(expanded_path, config->target_path, sizeof(expanded_path) - 1);
-        }
-    } else {
-        strncpy(expanded_path, config->target_path, sizeof(expanded_path) - 1);
-    }
-    strncpy(s->target_path, expanded_path, sizeof(s->target_path) - 1);
-
     pthread_mutex_init(&s->sessions_lock, NULL);
-
-    /* Determine mode: directory library scan vs single movie */
-    struct stat st;
-    if (stat(s->target_path, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (is_tinydvd_dir(s->target_path)) {
-            /* Single movie raw directory mode (e.g. ./tinydvds/Dune with VIDEO_TS.IFO) */
-            s->is_library = false;
-            add_catalog_item(s, s->target_path, NULL);
-        } else {
-            /* Library collection directory mode (e.g. ~/Videos or ./tinydvds) */
-            s->is_library = true;
-            DIR *dir = opendir(s->target_path);
-            if (dir) {
-                struct dirent *de;
-                while ((de = readdir(dir)) != NULL) {
-                    if (de->d_name[0] == '.') continue;
-                    char full[1024];
-                    snprintf(full, sizeof(full), "%s/%s", s->target_path, de->d_name);
-                    struct stat entry_st;
-                    if (stat(full, &entry_st) != 0) continue;
-                    if (S_ISREG(entry_st.st_mode)) {
-                        if (is_tdvd_file(de->d_name)) {
-                            add_catalog_item(s, full, NULL);
-                        }
-                    } else if (S_ISDIR(entry_st.st_mode)) {
-                        if (is_tinydvd_dir(full)) {
-                            add_catalog_item(s, full, NULL);
-                        }
-                    }
-                }
-                closedir(dir);
-            }
-        }
-    } else {
-        /* Single file mode (e.g. /path/to/Movie.tdvd) */
-        s->is_library = false;
-        add_catalog_item(s, s->target_path, NULL);
-    }
-
-    if (s->catalog_count > 0) {
-        strncpy(s->default_disc_path, s->catalog[0].path, sizeof(s->default_disc_path) - 1);
-        strncpy(s->default_disc_id, s->catalog[0].id, sizeof(s->default_disc_id) - 1);
-        strncpy(s->default_disc_title, s->catalog[0].title, sizeof(s->default_disc_title) - 1);
-    }
+    tdvd_library_init(&s->lib, config->target_path);
 
     /* Start listening socket */
     s->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (s->listen_fd < 0) {
         perror("socket");
+        tdvd_library_destroy(&s->lib);
+        pthread_mutex_destroy(&s->sessions_lock);
         free(s);
         return NULL;
     }
@@ -1584,6 +1518,8 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     if (bind(s->listen_fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
         fprintf(stderr, "[web_server] Failed to bind to %s:%d (errno: %s)\n", s->bind_addr, s->port, strerror(errno));
         close(s->listen_fd);
+        tdvd_library_destroy(&s->lib);
+        pthread_mutex_destroy(&s->sessions_lock);
         free(s);
         return NULL;
     }
@@ -1591,6 +1527,8 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     if (listen(s->listen_fd, 64) < 0) {
         perror("listen");
         close(s->listen_fd);
+        tdvd_library_destroy(&s->lib);
+        pthread_mutex_destroy(&s->sessions_lock);
         free(s);
         return NULL;
     }
@@ -1600,6 +1538,8 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     if (pthread_create(&s->accept_thread, NULL, accept_loop, s) != 0) {
         s->running = false;
         close(s->listen_fd);
+        tdvd_library_destroy(&s->lib);
+        pthread_mutex_destroy(&s->sessions_lock);
         free(s);
         return NULL;
     }
@@ -1608,8 +1548,8 @@ web_server_t *web_server_start(const web_server_config_t *config) {
     printf("  TinyDVD Web Player Running!\n");
     printf("  URL: http://localhost:%d\n", s->port);
     printf("  Mode: %s (%d movie%s available)\n",
-           s->is_library ? "Library Catalog" : "Direct Cinema Player",
-           s->catalog_count, s->catalog_count == 1 ? "" : "s");
+           s->lib.is_library ? "Library Catalog" : "Direct Cinema Player",
+           s->lib.catalog_count, s->lib.catalog_count == 1 ? "" : "s");
     printf("  Multi-Session Support: Enabled (isolated playback per tab/window)\n");
     printf("=======================================================\n\n");
 
@@ -1651,6 +1591,8 @@ void web_server_destroy(web_server_t *s) {
     if (!s) return;
     web_server_stop(s);
 
+    tdvd_library_destroy(&s->lib);
+
     pthread_mutex_lock(&s->sessions_lock);
     web_session_t *sess = s->sessions;
     while (sess) {
@@ -1661,7 +1603,6 @@ void web_server_destroy(web_server_t *s) {
     s->sessions = NULL;
     pthread_mutex_unlock(&s->sessions_lock);
 
-    if (s->catalog) free(s->catalog);
     pthread_mutex_destroy(&s->sessions_lock);
     free(s);
 }

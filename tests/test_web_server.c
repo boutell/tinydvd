@@ -359,6 +359,244 @@ static void test_library_directory_filtering(const char *tdvd_path) {
     printf("  - Directory Filtering: OK (Tolerates & ignores non-TinyDVD files/folders, only lists .tdvd)\n");
 }
 
+static size_t http_get_request(web_server_t *server, const char *path, char *resp, size_t resp_cap) {
+    pthread_t tid;
+    int fd = start_client_session(server, &tid);
+    char req[2048];
+    snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path);
+    send(fd, req, strlen(req), 0);
+
+    size_t total_recv = 0;
+    ssize_t n;
+    while (total_recv + 1 < resp_cap &&
+           (n = recv(fd, resp + total_recv, resp_cap - 1 - total_recv, 0)) > 0) {
+        total_recv += (size_t)n;
+    }
+    resp[total_recv] = '\0';
+    close(fd);
+    pthread_join(tid, NULL);
+    return total_recv;
+}
+
+static void write_dummy_file(const char *path, const uint8_t *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    if (len > 0) assert(fwrite(data, 1, len, f) == len);
+    fclose(f);
+}
+
+static void test_import_dvd_workflow(void) {
+    printf("Testing Web Server Built-in DVD Import Workflow...\n");
+
+    char lib_dir[] = "/tmp/tinydvd_test_lib_XXXXXX";
+    char src_dir[] = "/tmp/tinydvd_test_src_XXXXXX";
+    assert(mkdtemp(lib_dir) != NULL);
+    assert(mkdtemp(src_dir) != NULL);
+
+    /* Create a lightweight synthetic converted DVD directory so convert-to-tinydvd packages cleanly */
+    char f_ifo[512], f_mvob[512], f_mkv[512], f_png[512], f_meta[512];
+    snprintf(f_ifo, sizeof(f_ifo), "%s/VIDEO_TS.IFO", src_dir);
+    snprintf(f_mvob, sizeof(f_mvob), "%s/VIDEO_TS.mvob", src_dir);
+    snprintf(f_mkv, sizeof(f_mkv), "%s/VIDEO_TS_VIDEO.mkv", src_dir);
+    snprintf(f_png, sizeof(f_png), "%s/thumbnail.png", src_dir);
+    snprintf(f_meta, sizeof(f_meta), "%s/metadata.json", src_dir);
+
+    const uint8_t dummy_ifo[] = "DVDVIDEO-VMG";
+    const uint8_t dummy_mvob[] = "MVOB0001";
+    const uint8_t dummy_mkv[] = { 0x1A, 0x45, 0xDF, 0xA3 };
+    const uint8_t dummy_png[] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00 };
+    const char dummy_meta[] = "{\"title\":\"Dune Imported\",\"year\":2021,\"director\":\"Denis Villeneuve\",\"cast\":\"Timothee Chalamet, Zendaya\",\"genres\":\"Sci-Fi\"}";
+    write_dummy_file(f_ifo, dummy_ifo, sizeof(dummy_ifo));
+    write_dummy_file(f_mvob, dummy_mvob, sizeof(dummy_mvob));
+    write_dummy_file(f_mkv, dummy_mkv, sizeof(dummy_mkv));
+    write_dummy_file(f_png, dummy_png, sizeof(dummy_png));
+    write_dummy_file(f_meta, (const uint8_t *)dummy_meta, sizeof(dummy_meta) - 1);
+
+    web_server_config_t cfg = {
+        .bind_addr = "127.0.0.1",
+        .port = 8993,
+        .target_path = lib_dir
+    };
+    web_server_t *server = web_server_start(&cfg);
+    assert(server != NULL);
+
+    char resp[32768];
+
+    /* 1. Verify initial idle status */
+    http_get_request(server, "/api/import/status", resp, sizeof(resp));
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "\"state\":\"idle\"") != NULL);
+
+    /* 2. Start background import */
+    char start_uri[1024];
+    snprintf(start_uri, sizeof(start_uri),
+             "/api/import/start?source=%s&title=Dune%%20Imported&skip_enrichment=1",
+             src_dir);
+    http_get_request(server, start_uri, resp, sizeof(resp));
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "\"status\":\"started\"") != NULL);
+
+    /* 3. Poll /api/import/status until done */
+    bool done = false;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        usleep(100000);
+        http_get_request(server, "/api/import/status", resp, sizeof(resp));
+        assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+        if (strstr(resp, "\"state\":\"error\"") != NULL) {
+            fprintf(stderr, "Import failed unexpectedly: %s\n", resp);
+            assert(0);
+        }
+        if (strstr(resp, "\"state\":\"done\"") != NULL) {
+            done = true;
+            break;
+        }
+    }
+    assert(done);
+    assert(strstr(resp, "\"result_title\":\"Dune Imported\"") != NULL);
+
+    /* 4. Verify /api/library dynamically includes the newly imported archive */
+    http_get_request(server, "/api/library", resp, sizeof(resp));
+    assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(resp, "Dune Imported") != NULL);
+    assert(strstr(resp, "Denis Villeneuve") != NULL);
+    assert(strstr(resp, "Timothee Chalamet") != NULL);
+
+    web_server_destroy(server);
+
+    char out_tdvd[512];
+    snprintf(out_tdvd, sizeof(out_tdvd), "%s/Dune Imported.tdvd", lib_dir);
+    unlink(out_tdvd);
+    unlink(f_ifo);
+    unlink(f_mvob);
+    unlink(f_mkv);
+    unlink(f_png);
+    unlink(f_meta);
+    rmdir(src_dir);
+    rmdir(lib_dir);
+
+    printf("  - Built-in DVD Import Workflow: OK (status -> start -> convert -> live catalog refresh)\n");
+}
+
+static void poll_import_until_done(web_server_t *server, char *resp, size_t resp_cap) {
+    bool done = false;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        usleep(100000);
+        http_get_request(server, "/api/import/status", resp, resp_cap);
+        assert(strstr(resp, "HTTP/1.1 200 OK") != NULL);
+        if (strstr(resp, "\"state\":\"error\"") != NULL) {
+            fprintf(stderr, "Import failed unexpectedly: %s\n", resp);
+            assert(0);
+        }
+        if (strstr(resp, "\"state\":\"done\"") != NULL) {
+            done = true;
+            break;
+        }
+    }
+    assert(done);
+}
+
+static void create_dummy_converted_dir(const char *dir, const char *meta_json) {
+    char f_ifo[512], f_mvob[512], f_mkv[512], f_png[512], f_meta[512];
+    snprintf(f_ifo, sizeof(f_ifo), "%s/VIDEO_TS.IFO", dir);
+    snprintf(f_mvob, sizeof(f_mvob), "%s/VIDEO_TS.mvob", dir);
+    snprintf(f_mkv, sizeof(f_mkv), "%s/VIDEO_TS_VIDEO.mkv", dir);
+    snprintf(f_png, sizeof(f_png), "%s/thumbnail.png", dir);
+    snprintf(f_meta, sizeof(f_meta), "%s/metadata.json", dir);
+
+    const uint8_t dummy_ifo[] = "DVDVIDEO-VMG";
+    const uint8_t dummy_mvob[] = "MVOB0001";
+    const uint8_t dummy_mkv[] = { 0x1A, 0x45, 0xDF, 0xA3 };
+    const uint8_t dummy_png[] = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x00 };
+    write_dummy_file(f_ifo, dummy_ifo, sizeof(dummy_ifo));
+    write_dummy_file(f_mvob, dummy_mvob, sizeof(dummy_mvob));
+    write_dummy_file(f_mkv, dummy_mkv, sizeof(dummy_mkv));
+    write_dummy_file(f_png, dummy_png, sizeof(dummy_png));
+    write_dummy_file(f_meta, (const uint8_t *)meta_json, strlen(meta_json));
+}
+
+static void remove_dummy_converted_dir(const char *dir) {
+    char p[512];
+    const char *names[] = { "VIDEO_TS.IFO", "VIDEO_TS.mvob", "VIDEO_TS_VIDEO.mkv", "thumbnail.png", "metadata.json" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(p, sizeof(p), "%s/%s", dir, names[i]);
+        unlink(p);
+    }
+    rmdir(dir);
+}
+
+static void test_duplicate_dvd_import_disambiguation(void) {
+    printf("Testing Duplicate DVD Import Name Disambiguation (Year first, then numeric suffix)...\n");
+
+    char lib_dir[] = "/tmp/tinydvd_test_dup_lib_XXXXXX";
+    char src1_dir[] = "/tmp/tinydvd_test_dup_s1_XXXXXX";
+    char src2_dir[] = "/tmp/tinydvd_test_dup_s2_XXXXXX";
+    assert(mkdtemp(lib_dir) != NULL);
+    assert(mkdtemp(src1_dir) != NULL);
+    assert(mkdtemp(src2_dir) != NULL);
+
+    create_dummy_converted_dir(src1_dir, "{\"title\":\"Dune Test\",\"year\":1984,\"director\":\"David Lynch\"}");
+    create_dummy_converted_dir(src2_dir, "{\"title\":\"Dune Test\",\"year\":2021,\"director\":\"Denis Villeneuve\"}");
+
+    web_server_config_t cfg = {
+        .bind_addr = "127.0.0.1",
+        .port = 8994,
+        .target_path = lib_dir
+    };
+    web_server_t *server = web_server_start(&cfg);
+    assert(server != NULL);
+
+    char resp[32768];
+    char start_uri[1024];
+
+    /* 1. First import: creates Dune Test.tdvd (1984) */
+    snprintf(start_uri, sizeof(start_uri),
+             "/api/import/start?source=%s&title=Dune%%20Test&skip_enrichment=1", src1_dir);
+    http_get_request(server, start_uri, resp, sizeof(resp));
+    assert(strstr(resp, "\"status\":\"started\"") != NULL);
+    poll_import_until_done(server, resp, sizeof(resp));
+
+    /* 2. Second import (different year 2021): creates Dune Test (2021).tdvd */
+    snprintf(start_uri, sizeof(start_uri),
+             "/api/import/start?source=%s&title=Dune%%20Test&skip_enrichment=1", src2_dir);
+    http_get_request(server, start_uri, resp, sizeof(resp));
+    assert(strstr(resp, "\"status\":\"started\"") != NULL);
+    poll_import_until_done(server, resp, sizeof(resp));
+
+    /* 3. Third import (same title + same year 2021): creates Dune Test (2021) (2).tdvd */
+    snprintf(start_uri, sizeof(start_uri),
+             "/api/import/start?source=%s&title=Dune%%20Test&skip_enrichment=1", src2_dir);
+    http_get_request(server, start_uri, resp, sizeof(resp));
+    assert(strstr(resp, "\"status\":\"started\"") != NULL);
+    poll_import_until_done(server, resp, sizeof(resp));
+    assert(strstr(resp, "\"result_title\":\"Dune Test (2)\"") != NULL);
+
+    /* Verify all 3 archives exist on disk and appear in /api/library */
+    struct stat st;
+    char out1[512], out2[512], out3[512];
+    snprintf(out1, sizeof(out1), "%s/Dune Test.tdvd", lib_dir);
+    snprintf(out2, sizeof(out2), "%s/Dune Test (2021).tdvd", lib_dir);
+    snprintf(out3, sizeof(out3), "%s/Dune Test (2021) (2).tdvd", lib_dir);
+    assert(stat(out1, &st) == 0 && st.st_size > 0);
+    assert(stat(out2, &st) == 0 && st.st_size > 0);
+    assert(stat(out3, &st) == 0 && st.st_size > 0);
+
+    http_get_request(server, "/api/library", resp, sizeof(resp));
+    assert(strstr(resp, "David Lynch") != NULL);
+    assert(strstr(resp, "Denis Villeneuve") != NULL);
+    assert(strstr(resp, "Dune Test (2)") != NULL);
+
+    web_server_destroy(server);
+
+    unlink(out1);
+    unlink(out2);
+    unlink(out3);
+    remove_dummy_converted_dir(src1_dir);
+    remove_dummy_converted_dir(src2_dir);
+    rmdir(lib_dir);
+
+    printf("  - Duplicate DVD Disambiguation: OK (year suffix + (2) numeric suffix, no overwrites)\n");
+}
+
 int main(int argc, char *argv[]) {
     const char *tdvd = (argc > 1) ? argv[1] : "./tinydvds/Dune.tdvd";
     printf("=== Running TinyDVD Web Server & Protocol Tests ===\n");
@@ -366,6 +604,8 @@ int main(int argc, char *argv[]) {
     test_spu_png_encoding();
     test_http_and_websocket_endpoints(tdvd);
     test_library_directory_filtering(tdvd);
+    test_import_dvd_workflow();
+    test_duplicate_dvd_import_disambiguation();
     printf("All Web Server tests completed successfully!\n");
     return 0;
 }

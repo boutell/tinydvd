@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import contextlib
 import zipfile
+import json
 from fractions import Fraction
 
 try:
@@ -385,7 +386,7 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
                 vf += f",setsar={sar.replace(':', '/')}"
             if seg["audio_sectors"] > 0:
                 cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                     "-probesize", "50M", "-analyzeduration", "50M",
                     "-f", "mpeg", "-i", seg_vob,
                     "-vf", vf,
@@ -398,7 +399,7 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
                 ]
             else:
                 cmd = [
-                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                     "-probesize", "50M", "-analyzeduration", "50M",
                     "-f", "mpeg", "-i", seg_vob,
                     "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
@@ -424,7 +425,7 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
                 for m in seg_mkvs:
                     f.write(f"file '{m}'\n")
             cmd_concat = [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                 "-f", "concat", "-safe", "0", "-i", concat_txt,
                 "-c", "copy", output_mkv
             ]
@@ -466,7 +467,7 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
                 keyframe_args = ["-force_key_frames", ",".join(seg_times)]
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-nostdin", "-y",
         "-probesize", "50M", "-analyzeduration", "50M",
         "-i", input_spec,
         "-map", "0:v:0",
@@ -835,7 +836,7 @@ def package_tdvd_archive(staging_dir, output_archive_path):
         ext = os.path.splitext(fname)[1].lower()
         if ext in (".ifo", ".bup"):
             prio = 0
-        elif ext in (".png", ".jpg", ".jpeg"):
+        elif ext in (".json", ".png", ".jpg", ".jpeg"):
             prio = 1
         elif ext == ".mvob":
             prio = 2
@@ -883,6 +884,90 @@ def run_conversion_to_dir(raw_input, target_dir, args):
 
             for vid in sorted(vts_ids):
                 process_vts(input_path, target_dir, vid, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
+
+
+def _load_meta_dict(meta_dir=None, meta_tdvd=None):
+    if meta_dir:
+        mpath = os.path.join(meta_dir, "metadata.json")
+        if os.path.isfile(mpath):
+            try:
+                with open(mpath, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    if meta_tdvd and os.path.isfile(meta_tdvd):
+        try:
+            with zipfile.ZipFile(meta_tdvd, "r") as zf:
+                if "metadata.json" in zf.namelist():
+                    return json.loads(zf.read("metadata.json").decode("utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _write_meta_into_tdvd(tdvd_path, meta):
+    data_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
+    if tinydvd_metadata:
+        tinydvd_metadata.write_metadata_to_tdvd(tdvd_path, meta)
+        return
+    with zipfile.ZipFile(tdvd_path, "a", allowZip64=True) as zf:
+        for m in [info for info in zf.filelist if info.filename.lower() == "metadata.json"]:
+            zf.filelist.remove(m)
+            if m.filename in zf.NameToInfo:
+                del zf.NameToInfo[m.filename]
+        zinfo = zipfile.ZipInfo(filename="metadata.json")
+        zinfo.compress_type = zipfile.ZIP_STORED
+        zinfo.external_attr = 0o644 << 16
+        zf.writestr(zinfo, data_bytes)
+
+
+def resolve_unique_output_path(desired_output_path, meta_dir=None, meta_tdvd=None):
+    """
+    Never overwrite an existing .tdvd archive:
+    1) Year first: if metadata has a release year not already in the stem, try '<Stem> (<Year>).tdvd'.
+    2) Numeric suffix: try '<Stem> (2).tdvd', '<Stem> (3).tdvd', ... and append ' (N)' to metadata title.
+    """
+    desired_output_path = os.path.abspath(desired_output_path)
+    meta = _load_meta_dict(meta_dir=meta_dir, meta_tdvd=meta_tdvd)
+
+    if not os.path.exists(desired_output_path):
+        return desired_output_path, None
+
+    parent_dir = os.path.dirname(desired_output_path)
+    base = os.path.basename(desired_output_path)
+    stem, ext = os.path.splitext(base)
+
+    new_year = 0
+    try:
+        new_year = int(meta.get("year") or 0)
+    except Exception:
+        new_year = 0
+
+    if new_year > 0 and f"({new_year})" not in stem:
+        year_cand = os.path.join(parent_dir, f"{stem} ({new_year}){ext}")
+        if not os.path.exists(year_cand):
+            print(f"[duplicate] Existing archive at {desired_output_path}; saving with release year -> {year_cand}")
+            return year_cand, None
+        stem = f"{stem} ({new_year})"
+
+    n = 2
+    while True:
+        cand = os.path.join(parent_dir, f"{stem} ({n}){ext}")
+        if not os.path.exists(cand):
+            print(f"[duplicate] Existing archive found; saving unique copy -> {cand}")
+            updated_meta = None
+            if meta:
+                orig_title = str(meta.get("title") or stem).strip()
+                suffix = f" ({n})"
+                if not orig_title.endswith(suffix):
+                    meta["title"] = f"{orig_title}{suffix}"
+                updated_meta = meta
+                if meta_dir:
+                    mpath = os.path.join(meta_dir, "metadata.json")
+                    with open(mpath, "w", encoding="utf-8") as mf:
+                        json.dump(meta, mf, indent=2, ensure_ascii=False)
+            return cand, updated_meta
+        n += 1
 
 
 def main():
@@ -939,20 +1024,36 @@ def main():
             print(f"[warning] Metadata enrichment failed: {e}", file=sys.stderr)
 
     if is_single_file:
+        parent_dir = os.path.dirname(output_path) or "."
+        os.makedirs(parent_dir, exist_ok=True)
         if is_already_converted_dir(raw_input):
-            package_tdvd_archive(raw_input, output_path)
-            do_enrich(output_path, hint=output_path)
+            ext = os.path.splitext(output_path)[1] or ".tdvd"
+            tmp_fd, tmp_tdvd = tempfile.mkstemp(prefix=".tdvd_tmp_", suffix=ext, dir=parent_dir)
+            os.close(tmp_fd)
+            try:
+                package_tdvd_archive(raw_input, tmp_tdvd)
+                do_enrich(tmp_tdvd, hint=output_path)
+                output_path, updated_meta = resolve_unique_output_path(output_path, meta_tdvd=tmp_tdvd)
+                if updated_meta:
+                    _write_meta_into_tdvd(tmp_tdvd, updated_meta)
+                os.replace(tmp_tdvd, output_path)
+            finally:
+                if os.path.exists(tmp_tdvd):
+                    try:
+                        os.unlink(tmp_tdvd)
+                    except Exception:
+                        pass
         else:
-            parent_dir = os.path.dirname(output_path) or "."
-            os.makedirs(parent_dir, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
                 run_conversion_to_dir(raw_input, stage_dir, args)
                 do_enrich(stage_dir, hint=output_path)
+                output_path, _ = resolve_unique_output_path(output_path, meta_dir=stage_dir)
                 package_tdvd_archive(stage_dir, output_path)
     else:
         run_conversion_to_dir(raw_input, output_path, args)
         do_enrich(output_path, hint=output_path)
 
+    print(f"[output] Final archive: {output_path}")
     print("\nConversion completed successfully!")
 
 

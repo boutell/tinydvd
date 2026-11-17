@@ -121,8 +121,9 @@ To stream your collection to any web browser, tablet, phone, or smart TV on your
 2. **Graceful Tolerance of Non-TinyDVD Files:**
    You do not need to separate your `.tdvd` files into their own isolated folder. TinyDVD expands `~` automatically and scans `~/Videos`, **tolerating and silently ignoring** any non-TinyDVD files (such as `.mp4`, `.mkv`, `.avi`, `.srt`, or downloads) and other subdirectories. Only `.tdvd` archives (and unpacked TinyDVD folders) are added to the library catalog.
 
-3. **Enjoy in Your Browser:**
+3. **Enjoy & Import in Your Browser:**
    Open `http://localhost:8080` (or `http://<your-ip>:8080` from any other device). You can:
+   - Click **"+ Import DVD"** in the header to rip, convert, enrich, and add a new DVD (from an optical drive, mounted disc volume, folder, or `.iso`) straight into your library from the browser.
    - Search your catalog live by **actor, director, genre, title, or year**.
    - Click any card to launch the interactive DVD player in full cinema mode.
    - Enjoy multi-session isolation: multiple family members or tabs can watch different movies or menus at the same time without interfering with each other.
@@ -169,9 +170,14 @@ Run [`scripts/convert-to-tinydvd`](file:///Users/boutell/boutell/tinydvd/scripts
 
 #### Step 3: Play with `tinydvd`
 
-Launch the player pointing to your `.tdvd` file (or converted directory), or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager:
+Launch the player with no arguments to open the native **Library Browser & DVD Importer UI** (defaulting to `~/Movies` or `~/Videos`), point it at a library folder, or pass a `.tdvd` file / converted directory directly to start playback (or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager):
 
 ```bash
+# Launch the native Library Browser & DVD Importer UI:
+./build/tinydvd
+./build/tinydvd ~/Movies
+
+# Or launch playback directly on a movie:
 ./build/tinydvd ~/Videos/MY_MOVIE.tdvd
 
 # Or start directly in fullscreen:
@@ -196,6 +202,7 @@ You can stream any `.tdvd` movie or an entire folder of movies to modern web bro
 ./build/tinydvd --serve ./tinydvds/ --port 8080 --bind 0.0.0.0
 ```
 
+* **Built-in DVD Importer**: Click **"+ Import DVD"** directly in the library header to rip an optical disc (`dvdbackup`), convert & enrich it to `.tdvd`, and automatically refresh the catalog without leaving the browser.
 * **Multi-Session Isolation**: Every browser tab and device gets its own independent DVD VM and playback timeline—different family members can watch or browse different movies at the same time without interfering with each other.
 * **Instant Fast Remuxing & Caching**: Video chunks are remuxed on-demand into fast-start MP4 with HTTP 206 byte-range seeking and cached on disk.
 * **Live Catalog Search**: Search your collection instantly by **actor, director, genre, title, year**, or plot summary.

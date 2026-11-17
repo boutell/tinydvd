@@ -6,6 +6,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
 # Ensure Homebrew and standard paths are considered
 if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
@@ -24,6 +28,8 @@ find_package(ZLIB REQUIRED)
 pkg_check_modules(DVDREAD REQUIRED dvdread)
 pkg_check_modules(MPV REQUIRED mpv)
 pkg_check_modules(SDL2 REQUIRED sdl2)
+pkg_check_modules(CAIRO REQUIRED cairo)
+pkg_check_modules(PANGOCAIRO REQUIRED pangocairo)
 
 add_definitions(-DGL_SILENCE_DEPRECATION)
 
@@ -35,8 +41,47 @@ include_directories(
     ${OPENGL_INCLUDE_DIRS}
 )
 
+# Static Native UI Library (Cairo + PangoCairo + native OS file/folder picker)
+set(TINYDVD_UI_SOURCES
+    src/ui/native_ui.c
+)
+if(APPLE)
+    list(APPEND TINYDVD_UI_SOURCES src/ui/native_dialog_mac.m)
+endif()
+
+add_library(tinydvd_ui STATIC ${TINYDVD_UI_SOURCES})
+target_include_directories(tinydvd_ui
+    PUBLIC
+    src
+    src/ui
+    ${CAIRO_INCLUDE_DIRS}
+    ${PANGOCAIRO_INCLUDE_DIRS}
+    ${SDL2_INCLUDE_DIRS}
+    ${OPENGL_INCLUDE_DIRS}
+)
+target_link_directories(tinydvd_ui
+    PUBLIC
+    ${CAIRO_LIBRARY_DIRS}
+    ${PANGOCAIRO_LIBRARY_DIRS}
+    ${SDL2_LIBRARY_DIRS}
+)
+target_link_libraries(tinydvd_ui
+    PUBLIC
+    ${CAIRO_LIBRARIES}
+    ${PANGOCAIRO_LIBRARIES}
+    ${SDL2_LIBRARIES}
+    ${OPENGL_LIBRARIES}
+    Threads::Threads
+    m
+)
+if(APPLE)
+    target_link_libraries(tinydvd_ui PUBLIC "-framework Cocoa")
+endif()
+target_compile_options(tinydvd_ui PRIVATE -Wall -Wextra)
+
 set(TINYDVD_SOURCES
     src/main.c
+    src/library.c
     src/player_adapter.c
     src/mvob_parser.c
     src/tdvd_archive.c
@@ -52,6 +97,7 @@ add_executable(tinydvd ${TINYDVD_SOURCES})
 
 target_link_libraries(tinydvd
     PRIVATE
+    tinydvd_ui
     ${DVDREAD_LIBRARIES}
     ${MPV_LIBRARIES}
     ${SDL2_LIBRARIES}
@@ -92,7 +138,7 @@ target_include_directories(test_dvd_vm PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV
 target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
 target_link_directories(test_dvd_vm PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
 
-add_executable(test_web tests/test_web_server.c src/player_adapter.c src/web_server.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/sha1.c src/mpv_controller.c)
+add_executable(test_web tests/test_web_server.c src/library.c src/player_adapter.c src/web_server.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/sha1.c src/mpv_controller.c)
 target_include_directories(test_web PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
 target_link_libraries(test_web PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
 target_link_directories(test_web PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
