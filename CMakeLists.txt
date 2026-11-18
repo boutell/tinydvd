@@ -21,6 +21,7 @@ if(APPLE)
 endif()
 
 find_package(PkgConfig REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -50,6 +51,7 @@ if(APPLE)
 endif()
 
 add_library(tinydvd_ui STATIC ${TINYDVD_UI_SOURCES})
+set_target_properties(tinydvd_ui PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(tinydvd_ui
     PUBLIC
     src
@@ -79,9 +81,8 @@ if(APPLE)
 endif()
 target_compile_options(tinydvd_ui PRIVATE -Wall -Wextra)
 
-set(TINYDVD_SOURCES
-    src/main.c
-    src/library.c
+set(TINYDVD_CORE_SOURCES
+    src/core_bridge.c
     src/player_adapter.c
     src/mvob_parser.c
     src/tdvd_archive.c
@@ -89,13 +90,11 @@ set(TINYDVD_SOURCES
     src/mpv_controller.c
     src/spu_compositor.c
     src/spu_png.c
-    src/sha1.c
-    src/web_server.c
 )
 
-add_executable(tinydvd ${TINYDVD_SOURCES})
+add_library(tinydvd_core SHARED ${TINYDVD_CORE_SOURCES})
 
-target_link_libraries(tinydvd
+target_link_libraries(tinydvd_core
     PRIVATE
     tinydvd_ui
     ${DVDREAD_LIBRARIES}
@@ -106,13 +105,23 @@ target_link_libraries(tinydvd
     ZLIB::ZLIB
 )
 
-target_link_directories(tinydvd
+target_link_directories(tinydvd_core
     PRIVATE
     ${DVDREAD_LIBRARY_DIRS}
     ${MPV_LIBRARY_DIRS}
     ${SDL2_LIBRARY_DIRS}
 )
 
+target_compile_options(tinydvd_core PRIVATE -Wall -Wextra)
+
+add_executable(tinydvd src/main.c)
+add_dependencies(tinydvd tinydvd_core)
+target_compile_definitions(tinydvd PRIVATE
+    PYTHON3_EXECUTABLE="${Python3_EXECUTABLE}"
+    TINYDVD_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    TINYDVD_BINARY_DIR="${CMAKE_BINARY_DIR}"
+    TINYDVD_CORE_LIB="$<TARGET_FILE:tinydvd_core>"
+)
 target_compile_options(tinydvd PRIVATE -Wall -Wextra)
 
 # Convenience target / symlinks for tinydvd-player and convert-to-tinydvd
@@ -138,10 +147,15 @@ target_include_directories(test_dvd_vm PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV
 target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
 target_link_directories(test_dvd_vm PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
 
-add_executable(test_web tests/test_web_server.c src/library.c src/player_adapter.c src/web_server.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/sha1.c src/mpv_controller.c)
-target_include_directories(test_web PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
-target_link_libraries(test_web PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
-target_link_directories(test_web PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
+add_executable(test_web tests/test_web_server.c)
+add_dependencies(test_web tinydvd_core)
+target_compile_definitions(test_web PRIVATE
+    PYTHON3_EXECUTABLE="${Python3_EXECUTABLE}"
+    TINYDVD_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    TINYDVD_BINARY_DIR="${CMAKE_BINARY_DIR}"
+    TINYDVD_CORE_LIB="$<TARGET_FILE:tinydvd_core>"
+)
+target_compile_options(test_web PRIVATE -Wall -Wextra)
 
 # Installation rules for Linux / GNOME desktop integration
 include(GNUInstallDirs)
