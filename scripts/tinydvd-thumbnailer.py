@@ -106,9 +106,12 @@ def frame_candidates(videos, time_offset=None):
 
 def grab_frame(package, source, seconds, out_path, max_size):
     """Write one frame at `seconds` to out_path as PNG. Returns True on success."""
-    vf = []
+    # Unsqueeze anamorphic DVD frames (e.g. 720x480 SAR 32:27 -> 854x480 SAR 1:1) into square pixels
+    unsquish = "scale='round(iw*max(1,if(gt(sar,0),sar,1))/2)*2':'round(ih/min(1,if(gt(sar,0),sar,1))/2)*2',setsar=1"
     if max_size:
-        vf = ["-vf", f"scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease"]
+        vf = ["-vf", f"{unsquish},scale='min({max_size},iw)':'min({max_size},ih)':force_original_aspect_ratio=decrease,setsar=1"]
+    else:
+        vf = ["-vf", unsquish]
     out = ["-frames:v", "1", "-f", "image2", "-c:v", "png", out_path]
     if isinstance(source, str):
         cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(seconds), "-i", source] + vf + out

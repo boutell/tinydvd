@@ -115,6 +115,7 @@ typedef struct {
 typedef struct {
     char id[128];
     cairo_surface_t *surface;
+    double sar;
     bool attempted;
 } ui_thumb_entry_t;
 
@@ -482,10 +483,52 @@ static cairo_status_t png_read_from_mem(void *closure, unsigned char *data, unsi
     return CAIRO_STATUS_SUCCESS;
 }
 
-static cairo_surface_t *ui_get_thumbnail_surface(native_ui_t *ui, const catalog_item_t *item) {
+static double parse_png_sar(const uint8_t *data, size_t size) {
+    static const uint8_t png_sig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+    if (!data || size < 20 || memcmp(data, png_sig, 8) != 0) {
+        return 1.0;
+    }
+    size_t pos = 8;
+    while (pos + 12 <= size) {
+        uint32_t clen = ((uint32_t)data[pos] << 24) |
+                        ((uint32_t)data[pos + 1] << 16) |
+                        ((uint32_t)data[pos + 2] << 8) |
+                        (uint32_t)data[pos + 3];
+        const uint8_t *ctype = data + pos + 4;
+        if (memcmp(ctype, "pHYs", 4) == 0 && clen == 9 && pos + 8 + 9 <= size) {
+            uint32_t px = ((uint32_t)data[pos + 8] << 24) |
+                          ((uint32_t)data[pos + 9] << 16) |
+                          ((uint32_t)data[pos + 10] << 8) |
+                          (uint32_t)data[pos + 11];
+            uint32_t py = ((uint32_t)data[pos + 12] << 24) |
+                          ((uint32_t)data[pos + 13] << 16) |
+                          ((uint32_t)data[pos + 14] << 8) |
+                          (uint32_t)data[pos + 15];
+            (void)data[pos + 16];
+            if (px > 0 && py > 0) {
+                double sar = (double)px / (double)py;
+                if (sar >= 0.5 && sar <= 2.5) {
+                    return sar;
+                }
+            }
+        }
+        if (memcmp(ctype, "IDAT", 4) == 0 || memcmp(ctype, "IEND", 4) == 0) {
+            break;
+        }
+        if ((size_t)clen > size - pos - 12) {
+            break;
+        }
+        pos += 12 + (size_t)clen;
+    }
+    return 1.0;
+}
+
+static cairo_surface_t *ui_get_thumbnail_surface(native_ui_t *ui, const catalog_item_t *item, double *out_sar) {
+    if (out_sar) *out_sar = 1.0;
     if (!ui || !item || !item->has_thumbnail) return NULL;
     for (int i = 0; i < ui->thumb_count; i++) {
         if (strcmp(ui->thumbs[i].id, item->id) == 0) {
+            if (out_sar) *out_sar = (ui->thumbs[i].sar > 0.0) ? ui->thumbs[i].sar : 1.0;
             return ui->thumbs[i].surface;
         }
     }
@@ -495,10 +538,12 @@ static cairo_surface_t *ui_get_thumbnail_surface(native_ui_t *ui, const catalog_
     snprintf(entry->id, sizeof(entry->id), "%s", item->id);
     entry->attempted = true;
     entry->surface = NULL;
+    entry->sar = 1.0;
 
     size_t sz = 0;
     uint8_t *png = tdvd_library_read_thumbnail(item->path, &sz);
     if (png && sz > 0) {
+        entry->sar = parse_png_sar(png, sz);
         png_mem_reader_t reader = { .data = png, .size = sz, .offset = 0 };
         cairo_surface_t *s = cairo_image_surface_create_from_png_stream(png_read_from_mem, &reader);
         if (s && cairo_surface_status(s) == CAIRO_STATUS_SUCCESS) {
@@ -508,6 +553,7 @@ static cairo_surface_t *ui_get_thumbnail_surface(native_ui_t *ui, const catalog_
         }
         free(png);
     }
+    if (out_sar) *out_sar = entry->sar;
     return entry->surface;
 }
 
@@ -566,6 +612,7 @@ static void draw_text_box(cairo_t *cr, const char *text, double x, double y, dou
     cairo_set_source_rgba(cr, r, g, b, a);
     cairo_move_to(cr, x, y);
     pango_cairo_show_layout(cr, layout);
+    cairo_new_path(cr);
     cairo_restore(cr);
 
     g_object_unref(layout);
@@ -597,6 +644,7 @@ static void draw_text_vcenter(cairo_t *cr, const char *text, double x, double ce
 
 static void draw_search_icon(cairo_t *cr, double cx, double cy, double r, double g, double b, double a) {
     cairo_save(cr);
+    cairo_new_path(cr);
     cairo_set_source_rgba(cr, r, g, b, a);
     cairo_set_line_width(cr, 1.6);
     cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
@@ -611,6 +659,7 @@ static void draw_search_icon(cairo_t *cr, double cx, double cy, double r, double
 static void draw_x_icon(cairo_t *cr, double cx, double cy, double half_sz, double stroke_w,
                         double r, double g, double b, double a) {
     cairo_save(cr);
+    cairo_new_path(cr);
     cairo_set_source_rgba(cr, r, g, b, a);
     cairo_set_line_width(cr, stroke_w);
     cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
@@ -1140,20 +1189,23 @@ static void render_library_view(native_ui_t *ui, cairo_t *cr, int win_w, int win
             cairo_set_source_rgb(cr, 0.078, 0.090, 0.102);
             cairo_paint(cr);
 
-            cairo_surface_t *tsurf = ui_get_thumbnail_surface(ui, item);
+            double sar = 1.0;
+            cairo_surface_t *tsurf = ui_get_thumbnail_surface(ui, item, &sar);
             if (tsurf) {
                 int iw = cairo_image_surface_get_width(tsurf);
                 int ih = cairo_image_surface_get_height(tsurf);
                 if (iw > 0 && ih > 0) {
-                    double sx = r.w / (double)iw;
-                    double sy = thumb_h / (double)ih;
+                    double eff_w = (double)iw * sar;
+                    double eff_h = (double)ih;
+                    double sx = r.w / eff_w;
+                    double sy = thumb_h / eff_h;
                     double sc = fmax(sx, sy);
-                    double dw = iw * sc;
-                    double dh = ih * sc;
+                    double dw = eff_w * sc;
+                    double dh = eff_h * sc;
                     double ox = r.x + (r.w - dw) * 0.5;
                     double oy = r.y + (thumb_h - dh) * 0.5;
                     cairo_translate(cr, ox, oy);
-                    cairo_scale(cr, sc, sc);
+                    cairo_scale(cr, sc * sar, sc);
                     cairo_set_source_surface(cr, tsurf, 0, 0);
                     cairo_paint(cr);
                 }
