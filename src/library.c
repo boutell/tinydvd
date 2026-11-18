@@ -14,6 +14,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/event.h>
+#elif defined(__linux__)
+#include <sys/inotify.h>
+#endif
 
 void tdvd_library_sanitize_id(const char *in, char *out, size_t out_len) {
     if (!out || out_len == 0) return;
@@ -254,6 +259,63 @@ static void expand_tilde_path(const char *in, char *out, size_t out_len) {
     }
 }
 
+static uint64_t fnv1a_hash_bytes(uint64_t h, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t compute_directory_signature(const char *target_path, bool is_library) {
+    if (!target_path || !target_path[0]) return 0;
+    struct stat st;
+    if (stat(target_path, &st) != 0) {
+        return 0xdeadbeef00000001ULL;
+    }
+
+    uint64_t sig_xor = 0;
+    uint64_t sig_sum = 0;
+    uint64_t count = 0;
+
+    if (is_library && S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir(target_path);
+        if (dir) {
+            struct dirent *de;
+            while ((de = readdir(dir)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                char full[1536];
+                snprintf(full, sizeof(full), "%s/%s", target_path, de->d_name);
+                struct stat entry_st;
+                if (stat(full, &entry_st) != 0) continue;
+
+                uint64_t eh = 14695981039346656037ULL;
+                eh = fnv1a_hash_bytes(eh, de->d_name, strlen(de->d_name) + 1);
+                eh = fnv1a_hash_bytes(eh, &entry_st.st_mode, sizeof(entry_st.st_mode));
+                eh = fnv1a_hash_bytes(eh, &entry_st.st_ino, sizeof(entry_st.st_ino));
+                eh = fnv1a_hash_bytes(eh, &entry_st.st_size, sizeof(entry_st.st_size));
+                eh = fnv1a_hash_bytes(eh, &entry_st.st_mtime, sizeof(entry_st.st_mtime));
+                eh = fnv1a_hash_bytes(eh, &entry_st.st_ctime, sizeof(entry_st.st_ctime));
+
+                sig_xor ^= eh;
+                sig_sum += eh * 0x9e3779b97f4a7c15ULL;
+                count++;
+            }
+            closedir(dir);
+        }
+    }
+
+    uint64_t final_sig = 14695981039346656037ULL;
+    final_sig = fnv1a_hash_bytes(final_sig, &st.st_dev, sizeof(st.st_dev));
+    final_sig = fnv1a_hash_bytes(final_sig, &st.st_ino, sizeof(st.st_ino));
+    final_sig = fnv1a_hash_bytes(final_sig, &st.st_mode, sizeof(st.st_mode));
+    final_sig = fnv1a_hash_bytes(final_sig, &sig_xor, sizeof(sig_xor));
+    final_sig = fnv1a_hash_bytes(final_sig, &sig_sum, sizeof(sig_sum));
+    final_sig = fnv1a_hash_bytes(final_sig, &count, sizeof(count));
+    return final_sig;
+}
+
 void tdvd_library_rescan(tdvd_library_t *lib) {
     if (!lib) return;
     pthread_mutex_lock(&lib->catalog_lock);
@@ -302,15 +364,229 @@ void tdvd_library_rescan(tdvd_library_t *lib) {
         snprintf(lib->default_disc_id, sizeof(lib->default_disc_id), "%s", lib->catalog[0].id);
         snprintf(lib->default_disc_title, sizeof(lib->default_disc_title), "%s", lib->catalog[0].title);
     }
+    uint64_t new_sig = compute_directory_signature(lib->target_path, lib->is_library);
+    if (new_sig != lib->dir_signature || lib->catalog_generation == 0) {
+        lib->dir_signature = new_sig;
+        lib->catalog_generation++;
+        pthread_cond_broadcast(&lib->catalog_cond);
+    }
     pthread_mutex_unlock(&lib->catalog_lock);
+}
+
+bool tdvd_library_check_for_changes(tdvd_library_t *lib) {
+    if (!lib) return false;
+    pthread_mutex_lock(&lib->catalog_lock);
+    bool is_lib = lib->is_library;
+    char path_copy[1024];
+    snprintf(path_copy, sizeof(path_copy), "%s", lib->target_path);
+    uint64_t prev_sig = lib->dir_signature;
+    pthread_mutex_unlock(&lib->catalog_lock);
+
+    if (!is_lib) return false;
+    uint64_t cur_sig = compute_directory_signature(path_copy, true);
+    if (cur_sig != prev_sig) {
+        tdvd_library_rescan(lib);
+        return true;
+    }
+    return false;
+}
+
+uint64_t tdvd_library_get_generation(tdvd_library_t *lib) {
+    if (!lib) return 0;
+    pthread_mutex_lock(&lib->catalog_lock);
+    uint64_t gen = lib->catalog_generation;
+    pthread_mutex_unlock(&lib->catalog_lock);
+    return gen;
+}
+
+void tdvd_library_wake_watchers(tdvd_library_t *lib) {
+    if (!lib) return;
+    pthread_mutex_lock(&lib->catalog_lock);
+    pthread_cond_broadcast(&lib->catalog_cond);
+    pthread_mutex_unlock(&lib->catalog_lock);
+}
+
+static void drain_fd_nonblock(int fd) {
+    if (fd < 0) return;
+    char tmp[128];
+    while (read(fd, tmp, sizeof(tmp)) > 0) {}
+}
+
+static bool wait_coalesce_or_wake(tdvd_library_t *lib, int wake_fd, int delay_ms) {
+    if (wake_fd < 0) return true;
+    struct pollfd pfd = { .fd = wake_fd, .events = POLLIN };
+    if (poll(&pfd, 1, delay_ms) > 0) {
+        drain_fd_nonblock(wake_fd);
+    }
+    pthread_mutex_lock(&lib->catalog_lock);
+    bool stop = lib->watch_stop;
+    pthread_mutex_unlock(&lib->catalog_lock);
+    return !stop;
+}
+
+static void *directory_watch_thread(void *arg) {
+    tdvd_library_t *lib = (tdvd_library_t *)arg;
+#ifdef __APPLE__
+    int kq = kqueue();
+    if (kq < 0) return NULL;
+
+    struct kevent wake_kev;
+    EV_SET(&wake_kev, (uintptr_t)lib->watch_wake_pipe[0], EVFILT_READ,
+           EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
+    kevent(kq, &wake_kev, 1, NULL, 0, NULL);
+
+    int watched_fd = -1;
+    char watched_path[1024] = {0};
+
+    while (1) {
+        pthread_mutex_lock(&lib->catalog_lock);
+        bool stop = lib->watch_stop;
+        bool is_lib = lib->is_library;
+        char path_copy[1024];
+        snprintf(path_copy, sizeof(path_copy), "%s", lib->target_path);
+        pthread_mutex_unlock(&lib->catalog_lock);
+        if (stop) break;
+
+        if (!is_lib || watched_fd < 0 || strcmp(path_copy, watched_path) != 0) {
+            if (watched_fd >= 0) {
+                close(watched_fd);
+                watched_fd = -1;
+                watched_path[0] = '\0';
+            }
+            if (is_lib && path_copy[0]) {
+#ifndef O_EVTONLY
+#define O_EVTONLY O_RDONLY
+#endif
+                watched_fd = open(path_copy, O_EVTONLY);
+                if (watched_fd >= 0) {
+                    struct kevent vnode_kev;
+                    EV_SET(&vnode_kev, (uintptr_t)watched_fd, EVFILT_VNODE,
+                           EV_ADD | EV_ENABLE | EV_CLEAR,
+                           NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_DELETE | NOTE_RENAME | NOTE_LINK,
+                           0, NULL);
+                    if (kevent(kq, &vnode_kev, 1, NULL, 0, NULL) == 0) {
+                        snprintf(watched_path, sizeof(watched_path), "%s", path_copy);
+                    } else {
+                        close(watched_fd);
+                        watched_fd = -1;
+                    }
+                }
+            }
+        }
+
+        struct kevent ev;
+        int nev = kevent(kq, NULL, 0, &ev, 1, NULL);
+        if (nev < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if ((int)ev.ident == lib->watch_wake_pipe[0]) {
+            drain_fd_nonblock(lib->watch_wake_pipe[0]);
+            if (watched_fd >= 0) {
+                close(watched_fd);
+                watched_fd = -1;
+                watched_path[0] = '\0';
+            }
+            continue;
+        }
+        if (watched_fd >= 0 && (int)ev.ident == watched_fd) {
+            if (ev.fflags & (NOTE_DELETE | NOTE_RENAME)) {
+                close(watched_fd);
+                watched_fd = -1;
+                watched_path[0] = '\0';
+            }
+            if (!wait_coalesce_or_wake(lib, lib->watch_wake_pipe[0], 100)) break;
+            tdvd_library_check_for_changes(lib);
+        }
+    }
+
+    if (watched_fd >= 0) close(watched_fd);
+    close(kq);
+#elif defined(__linux__)
+    int in_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    int wd = -1;
+    char watched_path[1024] = {0};
+
+    while (1) {
+        pthread_mutex_lock(&lib->catalog_lock);
+        bool stop = lib->watch_stop;
+        bool is_lib = lib->is_library;
+        char path_copy[1024];
+        snprintf(path_copy, sizeof(path_copy), "%s", lib->target_path);
+        pthread_mutex_unlock(&lib->catalog_lock);
+        if (stop) break;
+
+        if (in_fd >= 0 && (!is_lib || wd < 0 || strcmp(path_copy, watched_path) != 0)) {
+            if (wd >= 0) {
+                inotify_rm_watch(in_fd, wd);
+                wd = -1;
+                watched_path[0] = '\0';
+            }
+            if (is_lib && path_copy[0]) {
+                wd = inotify_add_watch(in_fd, path_copy,
+                                       IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM |
+                                       IN_MOVED_TO | IN_CLOSE_WRITE | IN_ATTRIB |
+                                       IN_DELETE_SELF | IN_MOVE_SELF);
+                if (wd >= 0) {
+                    snprintf(watched_path, sizeof(watched_path), "%s", path_copy);
+                }
+            }
+        }
+
+        struct pollfd pfds[2];
+        pfds[0].fd = lib->watch_wake_pipe[0];
+        pfds[0].events = POLLIN;
+        pfds[1].fd = in_fd;
+        pfds[1].events = POLLIN;
+        nfds_t nfds = (in_fd >= 0 && wd >= 0) ? 2 : 1;
+
+        int pr = poll(pfds, nfds, -1);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pfds[0].revents & POLLIN) {
+            drain_fd_nonblock(lib->watch_wake_pipe[0]);
+            if (wd >= 0 && in_fd >= 0) {
+                inotify_rm_watch(in_fd, wd);
+                wd = -1;
+                watched_path[0] = '\0';
+            }
+            continue;
+        }
+        if (nfds == 2 && (pfds[1].revents & POLLIN)) {
+            drain_fd_nonblock(in_fd);
+            if (!wait_coalesce_or_wake(lib, lib->watch_wake_pipe[0], 100)) break;
+            tdvd_library_check_for_changes(lib);
+        }
+    }
+
+    if (wd >= 0 && in_fd >= 0) inotify_rm_watch(in_fd, wd);
+    if (in_fd >= 0) close(in_fd);
+#else
+    struct pollfd pfd = { .fd = lib->watch_wake_pipe[0], .events = POLLIN };
+    while (1) {
+        pthread_mutex_lock(&lib->catalog_lock);
+        bool stop = lib->watch_stop;
+        pthread_mutex_unlock(&lib->catalog_lock);
+        if (stop) break;
+        if (poll(&pfd, 1, -1) > 0) {
+            drain_fd_nonblock(lib->watch_wake_pipe[0]);
+        }
+    }
+#endif
+    return NULL;
 }
 
 void tdvd_library_init(tdvd_library_t *lib, const char *target_path) {
     if (!lib) return;
     memset(lib, 0, sizeof(*lib));
     pthread_mutex_init(&lib->catalog_lock, NULL);
+    pthread_cond_init(&lib->catalog_cond, NULL);
     pthread_mutex_init(&lib->import_job.lock, NULL);
     lib->import_job.state = IMPORT_IDLE;
+    lib->watch_wake_pipe[0] = -1;
+    lib->watch_wake_pipe[1] = -1;
 
     if (target_path) {
         expand_tilde_path(target_path, lib->target_path, sizeof(lib->target_path));
@@ -324,6 +600,19 @@ void tdvd_library_init(tdvd_library_t *lib, const char *target_path) {
     }
 
     tdvd_library_rescan(lib);
+
+    if (pipe(lib->watch_wake_pipe) == 0) {
+        fcntl(lib->watch_wake_pipe[0], F_SETFL, O_NONBLOCK);
+        fcntl(lib->watch_wake_pipe[1], F_SETFL, O_NONBLOCK);
+        if (pthread_create(&lib->watch_thread, NULL, directory_watch_thread, lib) == 0) {
+            lib->watch_thread_valid = true;
+        } else {
+            close(lib->watch_wake_pipe[0]);
+            close(lib->watch_wake_pipe[1]);
+            lib->watch_wake_pipe[0] = -1;
+            lib->watch_wake_pipe[1] = -1;
+        }
+    }
 }
 
 void tdvd_library_set_directory(tdvd_library_t *lib, const char *dir_path) {
@@ -333,10 +622,32 @@ void tdvd_library_set_directory(tdvd_library_t *lib, const char *dir_path) {
     lib->is_library = true;
     pthread_mutex_unlock(&lib->catalog_lock);
     tdvd_library_rescan(lib);
+    if (lib->watch_wake_pipe[1] >= 0) {
+        ssize_t wr = write(lib->watch_wake_pipe[1], "w", 1);
+        (void)wr;
+    }
 }
 
 void tdvd_library_destroy(tdvd_library_t *lib) {
     if (!lib) return;
+
+    pthread_mutex_lock(&lib->catalog_lock);
+    lib->watch_stop = true;
+    pthread_cond_broadcast(&lib->catalog_cond);
+    pthread_mutex_unlock(&lib->catalog_lock);
+
+    if (lib->watch_wake_pipe[1] >= 0) {
+        ssize_t wr = write(lib->watch_wake_pipe[1], "q", 1);
+        (void)wr;
+    }
+    if (lib->watch_thread_valid) {
+        pthread_join(lib->watch_thread, NULL);
+        lib->watch_thread_valid = false;
+    }
+    if (lib->watch_wake_pipe[0] >= 0) close(lib->watch_wake_pipe[0]);
+    if (lib->watch_wake_pipe[1] >= 0) close(lib->watch_wake_pipe[1]);
+    lib->watch_wake_pipe[0] = -1;
+    lib->watch_wake_pipe[1] = -1;
 
     pthread_mutex_lock(&lib->import_job.lock);
     lib->import_job.cancel_requested = true;
@@ -358,6 +669,7 @@ void tdvd_library_destroy(tdvd_library_t *lib) {
         lib->catalog = NULL;
     }
     pthread_mutex_destroy(&lib->import_job.lock);
+    pthread_cond_destroy(&lib->catalog_cond);
     pthread_mutex_destroy(&lib->catalog_lock);
 }
 

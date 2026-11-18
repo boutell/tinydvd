@@ -85,6 +85,7 @@ struct web_server {
     web_session_t *sessions;
     pthread_mutex_t sessions_lock;
 
+    int sse_client_count;
     volatile bool running;
     pthread_t accept_thread;
 };
@@ -1090,9 +1091,78 @@ static void handle_client_request(web_server_t *s, int client_fd) {
         return;
     }
 
+    /* Route: /api/library/events (Server-Sent Events backed by OS watcher) */
+    if (strncmp(uri, "/api/library/events", 19) == 0) {
+        const char *sse_hdr =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache, no-store\r\n"
+            "Connection: keep-alive\r\n\r\n"
+            ": connected\n\n";
+        if (send(client_fd, sse_hdr, strlen(sse_hdr), MSG_NOSIGNAL) <= 0) {
+            close(client_fd);
+            return;
+        }
+
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        s->sse_client_count++;
+        uint64_t last_gen = s->lib.catalog_generation;
+        pthread_mutex_unlock(&s->lib.catalog_lock);
+
+        while (1) {
+            struct pollfd pfd = { .fd = client_fd, .events = POLLIN };
+            if (poll(&pfd, 1, 0) > 0) {
+                if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
+                if (pfd.revents & POLLIN) {
+                    char tmp_c;
+                    ssize_t rn = recv(client_fd, &tmp_c, 1, MSG_PEEK | MSG_DONTWAIT);
+                    if (rn == 0 || (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                        break;
+                    }
+                }
+            }
+
+            pthread_mutex_lock(&s->lib.catalog_lock);
+            while (s->running && s->lib.catalog_generation == last_gen) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 250000000L;
+                if (ts.tv_nsec >= 1000000000L) {
+                    ts.tv_sec += 1;
+                    ts.tv_nsec -= 1000000000L;
+                }
+                int wrc = pthread_cond_timedwait(&s->lib.catalog_cond, &s->lib.catalog_lock, &ts);
+                if (wrc == ETIMEDOUT) break;
+            }
+            uint64_t cur_gen = s->lib.catalog_generation;
+            bool still_running = s->running;
+            pthread_mutex_unlock(&s->lib.catalog_lock);
+
+            if (!still_running) break;
+
+            if (cur_gen != last_gen) {
+                last_gen = cur_gen;
+                char evt[128];
+                snprintf(evt, sizeof(evt),
+                         "event: library_update\ndata: {\"generation\":%llu}\n\n",
+                         (unsigned long long)cur_gen);
+                if (send(client_fd, evt, strlen(evt), MSG_NOSIGNAL) <= 0) {
+                    break;
+                }
+            }
+        }
+
+        pthread_mutex_lock(&s->lib.catalog_lock);
+        s->sse_client_count--;
+        pthread_cond_broadcast(&s->lib.catalog_cond);
+        pthread_mutex_unlock(&s->lib.catalog_lock);
+        close(client_fd);
+        return;
+    }
+
     /* Route: /api/library */
     if (strncmp(uri, "/api/library", 12) == 0) {
-        tdvd_library_rescan(&s->lib);
+        tdvd_library_check_for_changes(&s->lib);
 
         char json[65536];
         pthread_mutex_lock(&s->lib.catalog_lock);
@@ -1131,6 +1201,7 @@ static void handle_client_request(web_server_t *s, int client_fd) {
                  "HTTP/1.1 200 OK\r\n"
                  "Content-Type: application/json\r\n"
                  "Content-Length: %zu\r\n"
+                 "Cache-Control: no-store\r\n"
                  "Connection: close\r\n\r\n",
                  jlen);
         send(client_fd, header, strlen(header), MSG_NOSIGNAL);
@@ -1581,7 +1652,19 @@ void web_server_run(web_server_t *s) {
 
 void web_server_stop(web_server_t *s) {
     if (!s || !s->running) return;
+    pthread_mutex_lock(&s->lib.catalog_lock);
     s->running = false;
+    pthread_cond_broadcast(&s->lib.catalog_cond);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 1;
+    while (s->sse_client_count > 0) {
+        if (pthread_cond_timedwait(&s->lib.catalog_cond, &s->lib.catalog_lock, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s->lib.catalog_lock);
+    tdvd_library_wake_watchers(&s->lib);
     shutdown(s->listen_fd, SHUT_RDWR);
     close(s->listen_fd);
     pthread_join(s->accept_thread, NULL);

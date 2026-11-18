@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -284,6 +285,25 @@ static void test_http_and_websocket_endpoints(const char *tdvd_path) {
     printf("Web Server tests passed!\n");
 }
 
+static size_t http_get_request(web_server_t *server, const char *path, char *resp, size_t resp_cap) {
+    pthread_t tid;
+    int fd = start_client_session(server, &tid);
+    char req[2048];
+    snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path);
+    send(fd, req, strlen(req), 0);
+
+    size_t total_recv = 0;
+    ssize_t n;
+    while (total_recv + 1 < resp_cap &&
+           (n = recv(fd, resp + total_recv, resp_cap - 1 - total_recv, 0)) > 0) {
+        total_recv += (size_t)n;
+    }
+    resp[total_recv] = '\0';
+    close(fd);
+    pthread_join(tid, NULL);
+    return total_recv;
+}
+
 static void test_library_directory_filtering(const char *tdvd_path) {
     printf("Testing Web Server Directory Scanning & Non-TinyDVD Filtering...\n");
 
@@ -346,9 +366,54 @@ static void test_library_directory_filtering(const char *tdvd_path) {
     assert(strstr(resp, "readme.txt") == NULL);
     assert(strstr(resp, "OtherFolder") == NULL);
 
+    /* Open an SSE stream and verify OS directory watcher pushes library_update on new file */
+    pthread_t sse_tid;
+    int sse_fd = start_client_session(server, &sse_tid);
+    const char sse_req[] = "GET /api/library/events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    send(sse_fd, sse_req, sizeof(sse_req) - 1, 0);
+
+    char sse_buf[4096];
+    size_t sse_len = 0;
+    struct pollfd sse_pfd = { .fd = sse_fd, .events = POLLIN };
+    assert(poll(&sse_pfd, 1, 2000) > 0);
+    ssize_t s0 = recv(sse_fd, sse_buf, sizeof(sse_buf) - 1, 0);
+    assert(s0 > 0);
+    sse_len = (size_t)s0;
+    sse_buf[sse_len] = '\0';
+    assert(strstr(sse_buf, "HTTP/1.1 200 OK") != NULL);
+    assert(strstr(sse_buf, "text/event-stream") != NULL);
+
+    char extra_tdvd[512];
+    snprintf(extra_tdvd, sizeof(extra_tdvd), "%s/Dune_SSE_Test.tdvd", test_dir);
+    assert(symlink(abs_tdvd, extra_tdvd) == 0);
+
+    bool got_update = (strstr(sse_buf, "event: library_update") != NULL);
+    for (int attempt = 0; attempt < 30 && !got_update; attempt++) {
+        int pr = poll(&sse_pfd, 1, 100);
+        if (pr > 0 && sse_len + 1 < sizeof(sse_buf)) {
+            ssize_t sn = recv(sse_fd, sse_buf + sse_len, sizeof(sse_buf) - 1 - sse_len, 0);
+            if (sn <= 0) break;
+            sse_len += (size_t)sn;
+            sse_buf[sse_len] = '\0';
+            if (strstr(sse_buf, "event: library_update") != NULL) {
+                got_update = true;
+            }
+        }
+    }
+    assert(got_update);
+
+    shutdown(sse_fd, SHUT_RDWR);
+    close(sse_fd);
+    pthread_join(sse_tid, NULL);
+
+    char lib_resp2[16384];
+    http_get_request(server, "/api/library", lib_resp2, sizeof(lib_resp2));
+    assert(strstr(lib_resp2, "\"id\":\"Dune_SSE_Test_tdvd\"") != NULL);
+
     web_server_destroy(server);
 
     /* Cleanup temporary files */
+    unlink(extra_tdvd);
     unlink(valid_tdvd);
     unlink(dummy_mp4);
     unlink(dummy_mkv);
@@ -357,25 +422,6 @@ static void test_library_directory_filtering(const char *tdvd_path) {
     rmdir(test_dir);
 
     printf("  - Directory Filtering: OK (Tolerates & ignores non-TinyDVD files/folders, only lists .tdvd)\n");
-}
-
-static size_t http_get_request(web_server_t *server, const char *path, char *resp, size_t resp_cap) {
-    pthread_t tid;
-    int fd = start_client_session(server, &tid);
-    char req[2048];
-    snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n", path);
-    send(fd, req, strlen(req), 0);
-
-    size_t total_recv = 0;
-    ssize_t n;
-    while (total_recv + 1 < resp_cap &&
-           (n = recv(fd, resp + total_recv, resp_cap - 1 - total_recv, 0)) > 0) {
-        total_recv += (size_t)n;
-    }
-    resp[total_recv] = '\0';
-    close(fd);
-    pthread_join(tid, NULL);
-    return total_recv;
 }
 
 static void write_dummy_file(const char *path, const uint8_t *data, size_t len) {

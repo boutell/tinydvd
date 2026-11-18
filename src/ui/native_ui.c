@@ -142,6 +142,7 @@ struct native_ui {
     bool last_player_view;
     bool last_hud_visible;
     uint32_t last_tick_ms;
+    uint64_t last_catalog_gen;
 
     ui_focus_t focus;
     ui_textfield_t tf_search;
@@ -915,16 +916,24 @@ native_ui_t *native_ui_create(SDL_Window *window, tdvd_library_t *lib) {
     ui->dirty = true;
     ui->last_import_state = IMPORT_IDLE;
     sync_catalog_snapshot(ui);
+    ui->last_catalog_gen = tdvd_library_get_generation(lib);
     return ui;
 }
 
-void native_ui_destroy(native_ui_t *ui) {
+static void clear_thumbnail_cache(native_ui_t *ui) {
     if (!ui) return;
     for (int i = 0; i < ui->thumb_count; i++) {
         if (ui->thumbs[i].surface) {
             cairo_surface_destroy(ui->thumbs[i].surface);
+            ui->thumbs[i].surface = NULL;
         }
     }
+    ui->thumb_count = 0;
+}
+
+void native_ui_destroy(native_ui_t *ui) {
+    if (!ui) return;
+    clear_thumbnail_cache(ui);
     if (ui->gl_initialized && ui->gl_tex) {
         glDeleteTextures(1, &ui->gl_tex);
     }
@@ -1621,6 +1630,13 @@ void native_ui_render(native_ui_t *ui, int draw_w, int draw_h,
     ui->last_import_state = imp_state;
 
     uint32_t now = SDL_GetTicks();
+    uint64_t cur_gen = tdvd_library_get_generation(ui->lib);
+    if (cur_gen != ui->last_catalog_gen) {
+        ui->last_catalog_gen = cur_gen;
+        clear_thumbnail_cache(ui);
+        sync_catalog_snapshot(ui);
+        ui->dirty = true;
+    }
     if (imp_active && (now - ui->last_tick_ms >= 250)) {
         ui->last_tick_ms = now;
         ui->dirty = true;

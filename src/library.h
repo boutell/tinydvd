@@ -61,11 +61,19 @@ typedef struct catalog_item {
 typedef struct tdvd_library {
     char target_path[1024];
     bool is_library;
+    uint64_t dir_signature;
+    uint64_t catalog_generation;
 
     catalog_item_t *catalog;
     int catalog_count;
     int catalog_cap;
     pthread_mutex_t catalog_lock;
+    pthread_cond_t catalog_cond;
+
+    pthread_t watch_thread;
+    bool watch_thread_valid;
+    bool watch_stop;
+    int watch_wake_pipe[2];
 
     char default_disc_path[1024];
     char default_disc_id[128];
@@ -77,6 +85,9 @@ typedef struct tdvd_library {
 void tdvd_library_init(tdvd_library_t *lib, const char *target_path);
 void tdvd_library_destroy(tdvd_library_t *lib);
 void tdvd_library_rescan(tdvd_library_t *lib);
+bool tdvd_library_check_for_changes(tdvd_library_t *lib);
+uint64_t tdvd_library_get_generation(tdvd_library_t *lib);
+void tdvd_library_wake_watchers(tdvd_library_t *lib);
 void tdvd_library_set_directory(tdvd_library_t *lib, const char *dir_path);
 
 bool tdvd_library_is_tdvd_file(const char *path);
