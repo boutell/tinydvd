@@ -39,7 +39,6 @@ find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
-pkg_check_modules(DVDREAD REQUIRED dvdread)
 pkg_check_modules(MPV REQUIRED mpv)
 pkg_check_modules(SDL2 REQUIRED sdl2)
 pkg_check_modules(CAIRO REQUIRED cairo)
@@ -49,7 +48,6 @@ add_definitions(-DGL_SILENCE_DEPRECATION)
 
 include_directories(
     src
-    ${DVDREAD_INCLUDE_DIRS}
     ${MPV_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
     ${OPENGL_INCLUDE_DIRS}
@@ -62,6 +60,7 @@ set(TINYDVD_CORE_SOURCES
     src/player_adapter.c
     src/mvob_parser.c
     src/tdvd_archive.c
+    src/dvd_ifo.c
     src/dvd_vm_bridge.c
     src/mpv_controller.c
     src/spu_compositor.c
@@ -74,7 +73,6 @@ endif()
 add_library(tinydvd_core SHARED ${TINYDVD_CORE_SOURCES})
 
 set(TINYDVD_CORE_LINK_LIBS
-    ${DVDREAD_LIBRARIES}
     ${MPV_LIBRARIES}
     ${SDL2_LIBRARIES}
     ${OPENGL_LIBRARIES}
@@ -90,7 +88,6 @@ endif()
 list(REMOVE_DUPLICATES TINYDVD_CORE_LINK_LIBS)
 
 set(TINYDVD_CORE_LINK_DIRS
-    ${DVDREAD_LIBRARY_DIRS}
     ${MPV_LIBRARY_DIRS}
     ${SDL2_LIBRARY_DIRS}
     ${CAIRO_LIBRARY_DIRS}
@@ -133,10 +130,10 @@ add_executable(test_spu tests/test_spu_rle.c src/spu_compositor.c)
 target_include_directories(test_spu PRIVATE src ${OPENGL_INCLUDE_DIRS})
 target_link_libraries(test_spu PRIVATE ${OPENGL_LIBRARIES})
 
-add_executable(test_dvd_vm tests/test_dvd_vm.c src/player_adapter.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/mpv_controller.c)
-target_include_directories(test_dvd_vm PRIVATE src ${DVDREAD_INCLUDE_DIRS} ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
-target_link_libraries(test_dvd_vm PRIVATE ${DVDREAD_LIBRARIES} ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
-target_link_directories(test_dvd_vm PRIVATE ${DVDREAD_LIBRARY_DIRS} ${MPV_LIBRARY_DIRS})
+add_executable(test_dvd_vm tests/test_dvd_vm.c src/player_adapter.c src/dvd_ifo.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/mpv_controller.c)
+target_include_directories(test_dvd_vm PRIVATE src ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
+target_link_libraries(test_dvd_vm PRIVATE ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
+target_link_directories(test_dvd_vm PRIVATE ${MPV_LIBRARY_DIRS})
 
 add_executable(test_web tests/test_web_server.c)
 add_dependencies(test_web tinydvd_core)

@@ -773,6 +773,11 @@ def resolve_dvd_source(input_path):
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if res.returncode == 0:
                         mountpoint = tmp_extract
+                else:
+                    raise ValueError(
+                        f"Cannot read ISO image '{input_path}' directly on Linux because '7z' is not installed. "
+                        "Mount the ISO first and import the mounted folder, or install p7zip/7zip."
+                    )
 
             if mountpoint and os.path.isdir(mountpoint):
                 print(f"[source] Successfully mounted ISO at: {mountpoint}")

@@ -4,7 +4,7 @@ Pure-Python desktop UI layer for TinyDVD Cinema.
 
 Owns all desktop UI state, UTF-8 text editing/selection/clipboard, search
 filtering, card grid layout & scrolling, mouse hit-testing, player HUD, and
-Import DVD modal logic, driving low-level Cairo/Pango/OpenGL/SDL2/mpv/libdvdread
+Import DVD modal logic, driving low-level Cairo/Pango/OpenGL/SDL2/mpv/DVD-VM
 primitives exposed by libtinydvd_core.
 """
 

@@ -1,21 +1,15 @@
 #include "dvd_vm_bridge.h"
+#include "dvd_ifo.h"
 #include "mvob_parser.h"
 #include "tdvd_archive.h"
 #include "spu_png.h"
 #include <stdio.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
-
-#include <dvdread/dvd_reader.h>
-#include <dvdread/ifo_read.h>
-#include <dvdread/ifo_types.h>
-#include <dvdread/nav_read.h>
-#include <dvdread/nav_types.h>
 
 typedef enum {
     DVD_DOMAIN_FP = 0,
@@ -77,10 +71,9 @@ struct dvd_vm_bridge {
     player_adapter_t *player;
     spu_compositor_t *spu;
 
-    /* IFO reader handles (libdvdread) */
-    dvd_reader_t *reader;
-    ifo_handle_t *vmgi;
-    ifo_handle_t *vtsi[100];
+    /* Clean-room parsed IFO handles */
+    dvd_ifo_t *vmgi;
+    dvd_ifo_t *vtsi[100];
 
     /* DVD Virtual Machine Registers */
     uint16_t gprm[16];
@@ -102,7 +95,7 @@ struct dvd_vm_bridge {
     dvd_domain_t domain;
     int          vts_nr;      /* 1..99 for VTSM/VTSTT, 0 for FP/VMGM */
     int          pgc_nr;      /* 1-based index into current PGC table */
-    pgc_t       *current_pgc;
+    dvd_pgc_t       *current_pgc;
     int          cell_nr;     /* 1-based index into current_pgc->cell_playback */
     int          enter_depth; /* Guard against recursive Pre-command loops */
 
@@ -127,7 +120,7 @@ struct dvd_vm_bridge {
 
     /* Active NV_PCK highlight state */
     bool         has_active_hli;
-    hli_t        active_hli;
+    dvd_hli_t    active_hli;
 
     /* Web streaming & event callback */
     dvd_vm_event_callback_t event_cb;
@@ -185,42 +178,42 @@ static uint16_t read_be16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
-static ifo_handle_t *get_vtsi(dvd_vm_bridge_t *b, int vts_nr) {
+static dvd_ifo_t *get_vtsi(dvd_vm_bridge_t *b, int vts_nr) {
     if (vts_nr < 1 || vts_nr >= 100) return NULL;
     if (!b->vtsi[vts_nr]) {
-        b->vtsi[vts_nr] = ifoOpen(b->reader, vts_nr);
+        b->vtsi[vts_nr] = dvd_ifo_open(b->archive, b->dvd_path, vts_nr);
     }
     return b->vtsi[vts_nr];
 }
 
-static pgcit_t *get_menu_pgcit(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr) {
-    pgci_ut_t *ut = NULL;
+static dvd_pgcit_t *get_menu_pgcit(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr) {
+    dvd_pgci_ut_t *ut = NULL;
     if (dom == DVD_DOMAIN_VMGM) {
         ut = b->vmgi ? b->vmgi->pgci_ut : NULL;
     } else if (dom == DVD_DOMAIN_VTSM) {
-        ifo_handle_t *vtsi = get_vtsi(b, vts_nr);
+        dvd_ifo_t *vtsi = get_vtsi(b, vts_nr);
         ut = vtsi ? vtsi->pgci_ut : NULL;
     }
     if (!ut || ut->nr_of_lus == 0 || !ut->lu) return NULL;
     return ut->lu[0].pgcit;
 }
 
-static pgcit_t *get_title_pgcit(dvd_vm_bridge_t *b, int vts_nr) {
-    ifo_handle_t *vtsi = get_vtsi(b, vts_nr);
+static dvd_pgcit_t *get_title_pgcit(dvd_vm_bridge_t *b, int vts_nr) {
+    dvd_ifo_t *vtsi = get_vtsi(b, vts_nr);
     return vtsi ? vtsi->vts_pgcit : NULL;
 }
 
-static pgc_t *lookup_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr) {
+static dvd_pgc_t *lookup_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr) {
     if (dom == DVD_DOMAIN_FP) {
         return b->vmgi ? b->vmgi->first_play_pgc : NULL;
     }
-    pgcit_t *pgcit = (dom == DVD_DOMAIN_VTSTT) ? get_title_pgcit(b, vts_nr) : get_menu_pgcit(b, dom, vts_nr);
+    dvd_pgcit_t *pgcit = (dom == DVD_DOMAIN_VTSTT) ? get_title_pgcit(b, vts_nr) : get_menu_pgcit(b, dom, vts_nr);
     if (!pgcit || pgc_nr < 1 || pgc_nr > pgcit->nr_of_pgci_srp) return NULL;
     return pgcit->pgci_srp[pgc_nr - 1].pgc;
 }
 
 static int find_menu_pgc_by_entry_id(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int menu_id) {
-    pgcit_t *pgcit = get_menu_pgcit(b, dom, vts_nr);
+    dvd_pgcit_t *pgcit = get_menu_pgcit(b, dom, vts_nr);
     if (!pgcit) return 1;
     for (int i = 0; i < pgcit->nr_of_pgci_srp; i++) {
         if ((pgcit->pgci_srp[i].entry_id & 0x0F) == (menu_id & 0x0F)) {
@@ -233,9 +226,9 @@ static int find_menu_pgc_by_entry_id(dvd_vm_bridge_t *b, dvd_domain_t dom, int v
 /* Frame height of the current domain's video, from its IFO video attributes:
  * 576 for PAL, 480 for NTSC */
 static int domain_frame_height(dvd_vm_bridge_t *b) {
-    video_attr_t *attr = NULL;
+    dvd_video_attr_t *attr = NULL;
     if (b->domain == DVD_DOMAIN_VTSM || b->domain == DVD_DOMAIN_VTSTT) {
-        ifo_handle_t *vtsi = get_vtsi(b, b->vts_nr);
+        dvd_ifo_t *vtsi = get_vtsi(b, b->vts_nr);
         if (vtsi && vtsi->vtsi_mat) {
             attr = (b->domain == DVD_DOMAIN_VTSM) ? &vtsi->vtsi_mat->vtsm_video_attr
                                                   : &vtsi->vtsi_mat->vts_video_attr;
@@ -246,7 +239,7 @@ static int domain_frame_height(dvd_vm_bridge_t *b) {
     return (attr && attr->video_format == 1) ? SPU_PAL_HEIGHT : SPU_HEIGHT;
 }
 
-static void apply_pgc_clut_and_streams(dvd_vm_bridge_t *b, pgc_t *pgc) {
+static void apply_pgc_clut_and_streams(dvd_vm_bridge_t *b, dvd_pgc_t *pgc) {
     if (!b || !pgc) return;
     if (b->spu) {
         spu_compositor_set_frame_height(b->spu, domain_frame_height(b));
@@ -411,16 +404,16 @@ static void vm_exec_system_set(dvd_vm_bridge_t *b, uint8_t sys_op, bool imm, con
 static bool vm_enter_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr, int start_cell);
 
 static bool vm_jump_vts_ptt(dvd_vm_bridge_t *b, int vts_nr, int vts_ttn, int pttn) {
-    ifo_handle_t *vtsi = get_vtsi(b, vts_nr);
+    dvd_ifo_t *vtsi = get_vtsi(b, vts_nr);
     if (!vtsi || !vtsi->vts_ptt_srpt || vts_ttn < 1 || vts_ttn > vtsi->vts_ptt_srpt->nr_of_srpts) {
         return vm_enter_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, 1, 1);
     }
-    ttu_t *ttu = &vtsi->vts_ptt_srpt->title[vts_ttn - 1];
+    dvd_ttu_t *ttu = &vtsi->vts_ptt_srpt->title[vts_ttn - 1];
     if (pttn < 1 || pttn > ttu->nr_of_ptts) pttn = 1;
     int pgcn = ttu->ptt[pttn - 1].pgcn;
     int pgn  = ttu->ptt[pttn - 1].pgn;
 
-    pgc_t *pgc = lookup_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, pgcn);
+    dvd_pgc_t *pgc = lookup_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, pgcn);
     int cell_nr = 1;
     if (pgc && pgc->program_map && pgn >= 1 && pgn <= pgc->nr_of_programs) {
         cell_nr = pgc->program_map[pgn - 1];
@@ -435,7 +428,7 @@ static bool vm_jump_global_tt(dvd_vm_bridge_t *b, int ttn) {
     if (!b->vmgi || !b->vmgi->tt_srpt || ttn < 1 || ttn > b->vmgi->tt_srpt->nr_of_srpts) {
         return false;
     }
-    title_info_t *ti = &b->vmgi->tt_srpt->title[ttn - 1];
+    dvd_title_info_t *ti = &b->vmgi->tt_srpt->title[ttn - 1];
     b->sprm[4] = (uint16_t)ttn;
     return vm_jump_vts_ptt(b, ti->title_set_nr, ti->vts_ttn, 1);
 }
@@ -578,7 +571,7 @@ static vm_link_result_t vm_exec_jump_sub(dvd_vm_bridge_t *b, uint8_t jump_sub, c
     }
 }
 
-static vm_link_result_t vm_eval_cmd(dvd_vm_bridge_t *b, const vm_cmd_t *cmd, int *inout_pc, bool *out_break) {
+static vm_link_result_t vm_eval_cmd(dvd_vm_bridge_t *b, const dvd_vm_cmd_t *cmd, int *inout_pc, bool *out_break) {
     const uint8_t *bytes = cmd->bytes;
     uint8_t group = (bytes[0] >> 5) & 0x07;
     if (out_break) *out_break = false;
@@ -717,7 +710,7 @@ static vm_link_result_t vm_eval_cmd(dvd_vm_bridge_t *b, const vm_cmd_t *cmd, int
     return VM_LINK_NONE;
 }
 
-static vm_link_result_t vm_run_cmd_list(dvd_vm_bridge_t *b, const vm_cmd_t *cmds, int num_cmds) {
+static vm_link_result_t vm_run_cmd_list(dvd_vm_bridge_t *b, const dvd_vm_cmd_t *cmds, int num_cmds) {
     if (!cmds || num_cmds <= 0) return VM_LINK_NONE;
     int pc = 0;
     int safety = 0;
@@ -938,7 +931,7 @@ static bool vm_enter_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int p
     if (!b || !b->running || b->enter_depth >= 16) {
         return false;
     }
-    pgc_t *pgc = lookup_pgc(b, dom, vts_nr, pgc_nr);
+    dvd_pgc_t *pgc = lookup_pgc(b, dom, vts_nr, pgc_nr);
     if (!pgc) {
         fprintf(stderr, "[dvd_vm] Warning: PGC not found (dom=%d, vts=%d, pgc=%d)\n", dom, vts_nr, pgc_nr);
         b->domain = DVD_DOMAIN_EXIT;
@@ -1112,7 +1105,7 @@ static void refresh_button_highlight_on_spu(dvd_vm_bridge_t *b, bool action_pale
         return;
     }
 
-    const btni_t *bt = &b->active_hli.btnit[btn_idx - 1];
+    const dvd_btni_t *bt = &b->active_hli.btnit[btn_idx - 1];
     uint32_t palette = 0xF000F000U;
     if (bt->btn_coln >= 1 && bt->btn_coln <= 3) {
         palette = b->active_hli.btn_colit.btn_coli[bt->btn_coln - 1][action_palette ? 1 : 0];
@@ -1133,7 +1126,7 @@ static void refresh_button_highlight_on_spu(dvd_vm_bridge_t *b, bool action_pale
  * Timeline Seeking, Chapter Stepping, and Closed Caption / Track Cycling
  * ========================================================================= */
 
-static bool cell_contains_vobu(const cell_playback_t *cell, const cell_position_t *pos, const mvob_vobu_entry_t *e) {
+static bool cell_contains_vobu(const dvd_cell_playback_t *cell, const dvd_cell_position_t *pos, const mvob_vobu_entry_t *e) {
     if (cell->last_sector > 0) {
         return (e->orig_lbn >= cell->first_sector && e->orig_lbn <= cell->last_sector);
     }
@@ -1151,13 +1144,13 @@ static void format_hhmmss(uint64_t total_sec, char *buf, size_t len) {
     }
 }
 
-static void get_pgc_pts_bounds(dvd_vm_bridge_t *b, pgc_t *pgc, uint64_t *out_min, uint64_t *out_max) {
+static void get_pgc_pts_bounds(dvd_vm_bridge_t *b, dvd_pgc_t *pgc, uint64_t *out_min, uint64_t *out_max) {
     uint64_t min_pts = UINT64_MAX;
     uint64_t max_pts = 0;
     if (b && pgc) {
         for (int c = 1; c <= pgc->nr_of_cells; c++) {
-            const cell_playback_t *cell = &pgc->cell_playback[c - 1];
-            const cell_position_t *pos  = &pgc->cell_position[c - 1];
+            const dvd_cell_playback_t *cell = &pgc->cell_playback[c - 1];
+            const dvd_cell_position_t *pos  = &pgc->cell_position[c - 1];
             for (size_t i = 0; i < b->vobu_count; i++) {
                 const mvob_vobu_entry_t *e = &b->vobu_index[i];
                 if (!cell_contains_vobu(cell, pos, e)) continue;
@@ -1173,7 +1166,7 @@ static void get_pgc_pts_bounds(dvd_vm_bridge_t *b, pgc_t *pgc, uint64_t *out_min
     if (out_max) *out_max = max_pts;
 }
 
-static int get_chapter_for_cell(pgc_t *pgc, int cell_nr, int *out_total_chapters) {
+static int get_chapter_for_cell(dvd_pgc_t *pgc, int cell_nr, int *out_total_chapters) {
     if (!pgc) {
         if (out_total_chapters) *out_total_chapters = 1;
         return 1;
@@ -1210,7 +1203,7 @@ static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_sec
         return false;
     }
 
-    pgc_t *pgc = b->current_pgc;
+    dvd_pgc_t *pgc = b->current_pgc;
     uint64_t min_pts = 0, max_pts = 0;
     get_pgc_pts_bounds(b, pgc, &min_pts, &max_pts);
 
@@ -1237,8 +1230,8 @@ static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_sec
     uint64_t best_diff = UINT64_MAX;
 
     for (int c = 1; c <= pgc->nr_of_cells; c++) {
-        const cell_playback_t *cell = &pgc->cell_playback[c - 1];
-        const cell_position_t *pos  = &pgc->cell_position[c - 1];
+        const dvd_cell_playback_t *cell = &pgc->cell_playback[c - 1];
+        const dvd_cell_position_t *pos  = &pgc->cell_position[c - 1];
         for (size_t i = 0; i < b->vobu_count; i++) {
             const mvob_vobu_entry_t *e = &b->vobu_index[i];
             if (!cell_contains_vobu(cell, pos, e)) continue;
@@ -1273,7 +1266,7 @@ static bool vm_step_chapter(dvd_vm_bridge_t *b, int delta_chap) {
         return false;
     }
 
-    pgc_t *pgc = b->current_pgc;
+    dvd_pgc_t *pgc = b->current_pgc;
     int total_chaps = 1;
     int cur_chap = get_chapter_for_cell(pgc, b->cell_nr, &total_chaps);
     int next_chap = cur_chap + delta_chap;
@@ -1300,8 +1293,8 @@ static bool vm_step_chapter(dvd_vm_bridge_t *b, int delta_chap) {
     uint64_t min_pts = 0, max_pts = 0;
     get_pgc_pts_bounds(b, pgc, &min_pts, &max_pts);
     uint64_t cell_pts = min_pts;
-    const cell_playback_t *cell = &pgc->cell_playback[target_cell - 1];
-    const cell_position_t *pos  = &pgc->cell_position[target_cell - 1];
+    const dvd_cell_playback_t *cell = &pgc->cell_playback[target_cell - 1];
+    const dvd_cell_position_t *pos  = &pgc->cell_position[target_cell - 1];
     for (size_t i = 0; i < b->vobu_count; i++) {
         if (cell_contains_vobu(cell, pos, &b->vobu_index[i])) {
             cell_pts = b->vobu_index[i].pts_nanos;
@@ -1337,7 +1330,7 @@ static const char *iso639_name(uint16_t lang_code, char *code_out) {
 
 static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
     if (!b) return;
-    ifo_handle_t *vtsi = (b->vts_nr >= 1) ? get_vtsi(b, b->vts_nr) : NULL;
+    dvd_ifo_t *vtsi = (b->vts_nr >= 1) ? get_vtsi(b, b->vts_nr) : NULL;
     int nr_subp = (vtsi && vtsi->vtsi_mat) ? vtsi->vtsi_mat->nr_of_vts_subp_streams : 0;
 
     if (nr_subp <= 0) {
@@ -1375,7 +1368,7 @@ static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
         fprintf(stderr, "[dvd_vm] Closed Captions / Subtitles: Off\n");
     } else {
         int t = b->sprm[2] & 0x1F;
-        subp_attr_t attr = vtsi->vtsi_mat->vts_subp_attr[t];
+        dvd_subp_attr_t attr = vtsi->vtsi_mat->vts_subp_attr[t];
         char code[4];
         const char *lang_name = iso639_name(attr.lang_code, code);
         const char *ext = "";
@@ -1395,7 +1388,7 @@ static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
 
 static void vm_cycle_audio(dvd_vm_bridge_t *b) {
     if (!b) return;
-    ifo_handle_t *vtsi = (b->vts_nr >= 1) ? get_vtsi(b, b->vts_nr) : NULL;
+    dvd_ifo_t *vtsi = (b->vts_nr >= 1) ? get_vtsi(b, b->vts_nr) : NULL;
     int nr_aud = (vtsi && vtsi->vtsi_mat) ? vtsi->vtsi_mat->nr_of_vts_audio_streams : 1;
     if (nr_aud < 1) nr_aud = 1;
 
@@ -1407,7 +1400,7 @@ static void vm_cycle_audio(dvd_vm_bridge_t *b) {
     }
     char osd[128];
     if (vtsi && vtsi->vtsi_mat && next_aud < vtsi->vtsi_mat->nr_of_vts_audio_streams) {
-        audio_attr_t attr = vtsi->vtsi_mat->vts_audio_attr[next_aud];
+        dvd_audio_attr_t attr = vtsi->vtsi_mat->vts_audio_attr[next_aud];
         char code[4];
         const char *lang_name = iso639_name(attr.lang_code, code);
         snprintf(osd, sizeof(osd), "Audio: Track %d/%d - %s (%s)", next_aud + 1, nr_aud, lang_name, code);
@@ -1418,7 +1411,7 @@ static void vm_cycle_audio(dvd_vm_bridge_t *b) {
     fprintf(stderr, "[dvd_vm] %s\n", osd);
 }
 
-static bool is_dummy_rsm_menu(const pgc_t *pgc) {
+static bool is_dummy_rsm_menu(const dvd_pgc_t *pgc) {
     if (!pgc) return true;
     if (pgc->nr_of_cells > 0) return false;
     /* PGC has 0 cells. Check its pre-commands */
@@ -1439,10 +1432,10 @@ static bool jump_from_vtstt_to_root_menu(dvd_vm_bridge_t *b) {
         vm_save_resume_state(b, b->cell_nr);
     }
     int pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3); /* Root Menu = 3 */
-    pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
+    dvd_pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
     if (target_vts != 1 && is_dummy_rsm_menu(menu_pgc)) {
         int vts1_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, 1, 3);
-        pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
+        dvd_pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
         if (vts1_menu && !is_dummy_rsm_menu(vts1_menu)) {
             target_vts = 1;
             pgcn = vts1_pgcn;
@@ -1556,7 +1549,7 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
     }
 
     int cur_btn = get_selected_button_1based(b);
-    const btni_t *bt = &b->active_hli.btnit[cur_btn - 1];
+    const dvd_btni_t *bt = &b->active_hli.btnit[cur_btn - 1];
     int next_btn = cur_btn;
     bool trigger_activate = false;
 
@@ -1584,7 +1577,7 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
         case ACT_MOUSE_MOVE:
         case ACT_MOUSE_CLICK: {
             for (int i = 0; i < b->active_hli.hl_gi.btn_ns && i < 36; i++) {
-                const btni_t *cand = &b->active_hli.btnit[i];
+                const dvd_btni_t *cand = &b->active_hli.btnit[i];
                 if (ax >= (int)cand->x_start && ax <= (int)cand->x_end &&
                     ay >= (int)cand->y_start && ay <= (int)cand->y_end) {
                     next_btn = i + 1;
@@ -1647,24 +1640,25 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
         if (fread(sector, 1, DVD_SECTOR_SIZE, f) != DVD_SECTOR_SIZE) break;
 
         if (s == 0) {
-            /* First sector of VOBU is NV_PCK: parse PCI & DSI via libdvdread */
-            pci_t pci;
-            navRead_PCI(&pci, sector + 45);
-            if (pci.hli.hl_gi.hli_ss == 1) {
-                b->active_hli = pci.hli;
-                b->has_active_hli = (pci.hli.hl_gi.btn_ns > 0);
-                if (pci.hli.hl_gi.fosl_btnn > 0) {
-                    b->sprm[8] = (uint16_t)(pci.hli.hl_gi.fosl_btnn << 10);
-                }
-            } else if (pci.hli.hl_gi.hli_ss == 2) {
-                if (!b->has_active_hli && pci.hli.hl_gi.btn_ns > 0) {
+            /* First sector of VOBU is NV_PCK: parse clean-room PCI/HLI highlight info */
+            dvd_pci_t pci;
+            if (dvd_nav_read_pci(&pci, sector + 45, DVD_SECTOR_SIZE - 45)) {
+                if (pci.hli.hl_gi.hli_ss == 1) {
                     b->active_hli = pci.hli;
-                    b->has_active_hli = true;
+                    b->has_active_hli = (pci.hli.hl_gi.btn_ns > 0);
+                    if (pci.hli.hl_gi.fosl_btnn > 0) {
+                        b->sprm[8] = (uint16_t)(pci.hli.hl_gi.fosl_btnn << 10);
+                    }
+                } else if (pci.hli.hl_gi.hli_ss == 2) {
+                    if (!b->has_active_hli && pci.hli.hl_gi.btn_ns > 0) {
+                        b->active_hli = pci.hli;
+                        b->has_active_hli = true;
+                    }
+                } else if (pci.hli.hl_gi.hli_ss == 0) {
+                    b->has_active_hli = false;
+                    if (b->spu) spu_compositor_clear_highlight(b->spu);
+                    emit_highlight_event(b);
                 }
-            } else if (pci.hli.hl_gi.hli_ss == 0) {
-                b->has_active_hli = false;
-                if (b->spu) spu_compositor_clear_highlight(b->spu);
-                emit_highlight_event(b);
             }
         } else {
             /* Feed SPU sectors to compositor */
@@ -1850,7 +1844,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
 }
 
 static void vm_finish_pgc(dvd_vm_bridge_t *b) {
-    pgc_t *pgc = b->current_pgc;
+    dvd_pgc_t *pgc = b->current_pgc;
     if (!pgc) {
         b->domain = DVD_DOMAIN_EXIT;
         return;
@@ -1888,15 +1882,15 @@ static void *vm_thread_func(void *arg) {
     vm_enter_pgc(b, DVD_DOMAIN_FP, 0, 1, 1);
 
     while (b->running && b->domain != DVD_DOMAIN_EXIT) {
-        pgc_t *pgc = b->current_pgc;
+        dvd_pgc_t *pgc = b->current_pgc;
         if (!pgc || pgc->nr_of_cells == 0 || b->cell_nr > pgc->nr_of_cells) {
             vm_finish_pgc(b);
             continue;
         }
 
         int cur_cell_nr = b->cell_nr;
-        cell_playback_t *cell = &pgc->cell_playback[cur_cell_nr - 1];
-        cell_position_t *pos  = &pgc->cell_position[cur_cell_nr - 1];
+        dvd_cell_playback_t *cell = &pgc->cell_playback[cur_cell_nr - 1];
+        dvd_cell_position_t *pos  = &pgc->cell_position[cur_cell_nr - 1];
 
         /* Update SPRM[7] (PTT / Chapter number) if in VTSTT */
         if (b->domain == DVD_DOMAIN_VTSTT && pgc->program_map) {
@@ -2000,7 +1994,7 @@ static void *vm_thread_func(void *arg) {
         /* Execute Cell Command if present */
         if (cell->cell_cmd_nr > 0 && pgc->command_tbl &&
             cell->cell_cmd_nr <= pgc->command_tbl->nr_of_cell) {
-            const vm_cmd_t *ccmd = &pgc->command_tbl->cell_cmds[cell->cell_cmd_nr - 1];
+            const dvd_vm_cmd_t *ccmd = &pgc->command_tbl->cell_cmds[cell->cell_cmd_nr - 1];
             vm_link_result_t res = vm_eval_cmd(b, ccmd, NULL, NULL);
             if (res == VM_LINK_PGC_CHANGED || res == VM_LINK_EXIT) {
                 continue;
@@ -2026,13 +2020,6 @@ static void *vm_thread_func(void *arg) {
 /* =========================================================================
  * Public Lifecycle & User Input API
  * ========================================================================= */
-
-static void dvdread_silent_logger(void *priv, dvd_logger_level_t level, const char *fmt, va_list list) {
-    (void)priv;
-    (void)level;
-    (void)fmt;
-    (void)list;
-}
 
 dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, player_adapter_t *player, spu_compositor_t *spu) {
     if (!dvd_path) return NULL;
@@ -2063,35 +2050,20 @@ dvd_vm_bridge_t *dvd_vm_bridge_init(const char *dvd_path, player_adapter_t *play
     b->sprm[18] = 0x656e; /* Initial subpicture language 'en' */
     b->sprm[20] = 0x01;   /* Player region code 1 */
 
-    const char *ifo_open_path = dvd_path;
     if (tdvd_is_archive_path(dvd_path)) {
         b->archive = tdvd_archive_open(dvd_path);
-        if (!b->archive || !tdvd_archive_ifo_dir(b->archive)) {
+        if (!b->archive) {
             fprintf(stderr, "[dvd_vm] Failed to open .tdvd archive at %s\n", dvd_path);
-            if (b->archive) tdvd_archive_close(b->archive);
             pthread_mutex_destroy(&b->lock);
             free(b->dvd_path);
             free(b);
             return NULL;
         }
-        ifo_open_path = tdvd_archive_ifo_dir(b->archive);
     }
 
-    dvd_logger_cb logcb = { .pf_log = dvdread_silent_logger };
-    b->reader = DVDOpen2(NULL, &logcb, ifo_open_path);
-    if (!b->reader) {
-        fprintf(stderr, "[dvd_vm] Failed to open DVD at %s\n", dvd_path);
-        if (b->archive) tdvd_archive_close(b->archive);
-        pthread_mutex_destroy(&b->lock);
-        free(b->dvd_path);
-        free(b);
-        return NULL;
-    }
-
-    b->vmgi = ifoOpen(b->reader, 0);
+    b->vmgi = dvd_ifo_open(b->archive, b->dvd_path, 0);
     if (!b->vmgi) {
         fprintf(stderr, "[dvd_vm] Failed to open VIDEO_TS.IFO in %s\n", dvd_path);
-        DVDClose(b->reader);
         if (b->archive) tdvd_archive_close(b->archive);
         pthread_mutex_destroy(&b->lock);
         free(b->dvd_path);
@@ -2128,10 +2100,9 @@ void dvd_vm_bridge_destroy(dvd_vm_bridge_t *b) {
     close_domain_files(b);
     if (b->vobu_index) free(b->vobu_index);
     for (int i = 1; i < 100; i++) {
-        if (b->vtsi[i]) ifoClose(b->vtsi[i]);
+        if (b->vtsi[i]) dvd_ifo_close(b->vtsi[i]);
     }
-    if (b->vmgi) ifoClose(b->vmgi);
-    if (b->reader) DVDClose(b->reader);
+    if (b->vmgi) dvd_ifo_close(b->vmgi);
     if (b->archive) tdvd_archive_close(b->archive);
     pthread_mutex_destroy(&b->lock);
     if (b->dvd_path) free(b->dvd_path);
@@ -2172,15 +2143,15 @@ bool dvd_vm_bridge_escape(dvd_vm_bridge_t *b) {
         int pgcn = (b->effective_root_pgc_nr > 0 && b->effective_root_vts == target_vts)
                    ? b->effective_root_pgc_nr
                    : find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
-        pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
+        dvd_pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
         if (target_vts != 1 && is_dummy_rsm_menu(menu_pgc)) {
             int vts1_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, 1, 3);
-            pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
+            dvd_pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
             if (vts1_menu && !is_dummy_rsm_menu(vts1_menu)) {
                 menu_pgc = vts1_menu;
             }
         }
-        pgc_t *vmgm_menu = lookup_pgc(b, DVD_DOMAIN_VMGM, 0, 1);
+        dvd_pgc_t *vmgm_menu = lookup_pgc(b, DVD_DOMAIN_VMGM, 0, 1);
         bool has_menu = (!is_dummy_rsm_menu(menu_pgc) || vmgm_menu != NULL);
         if (!has_menu) {
             pthread_mutex_unlock(&b->lock);

@@ -14,7 +14,6 @@ typedef struct {
 
 struct tdvd_archive {
     char         *archive_path;
-    char          ifo_dir[512];
     tdvd_entry_t *entries;
     size_t        entry_count;
     size_t        entry_capacity;
@@ -53,30 +52,6 @@ bool tdvd_is_archive_path(const char *path) {
 static const char *basename_ptr(const char *path) {
     const char *slash = strrchr(path, '/');
     return slash ? (slash + 1) : path;
-}
-
-static bool has_ifo_or_bup_ext(const char *name) {
-    const char *dot = strrchr(name, '.');
-    if (!dot) return false;
-    return (strcasecmp(dot, ".IFO") == 0 || strcasecmp(dot, ".BUP") == 0);
-}
-
-static void remove_ifo_dir(const char *dir_path) {
-    if (!dir_path || !dir_path[0]) return;
-    char cmd[1024];
-    /* Remove only .IFO/.BUP files and the temp directory itself */
-    for (int vts = 0; vts < 100; vts++) {
-        char p[600];
-        if (vts == 0) {
-            snprintf(p, sizeof(p), "%s/VIDEO_TS.IFO", dir_path); unlink(p);
-            snprintf(p, sizeof(p), "%s/VIDEO_TS.BUP", dir_path); unlink(p);
-        } else {
-            snprintf(p, sizeof(p), "%s/VTS_%02d_0.IFO", dir_path, vts); unlink(p);
-            snprintf(p, sizeof(p), "%s/VTS_%02d_0.BUP", dir_path, vts); unlink(p);
-        }
-    }
-    (void)cmd;
-    rmdir(dir_path);
 }
 
 tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
@@ -166,10 +141,6 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
 
     tdvd_archive_t *ar = (tdvd_archive_t *)calloc(1, sizeof(tdvd_archive_t));
     ar->archive_path = strdup(archive_path);
-    snprintf(ar->ifo_dir, sizeof(ar->ifo_dir), "/tmp/tinydvd_ifo_XXXXXX");
-    if (!mkdtemp(ar->ifo_dir)) {
-        ar->ifo_dir[0] = '\0';
-    }
 
     size_t pos = 0;
     for (uint64_t idx = 0; idx < cd_num_entries && pos + 46 <= (size_t)cd_size; idx++) {
@@ -247,24 +218,6 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
         dst->name[sizeof(dst->name) - 1] = '\0';
         dst->data_offset = data_offset;
         dst->size = uncomp_size;
-
-        /* Stage small .IFO / .BUP files into ar->ifo_dir for libdvdread */
-        if (ar->ifo_dir[0] && has_ifo_or_bup_ext(bname) && uncomp_size < 16 * 1024 * 1024) {
-            char out_ifo_path[1024];
-            snprintf(out_ifo_path, sizeof(out_ifo_path), "%s/%s", ar->ifo_dir, bname);
-            FILE *out_f = fopen(out_ifo_path, "wb");
-            if (out_f) {
-                uint8_t *ifo_buf = (uint8_t *)malloc((size_t)uncomp_size);
-                if (ifo_buf) {
-                    fseeko(f, (off_t)data_offset, SEEK_SET);
-                    if (fread(ifo_buf, 1, (size_t)uncomp_size, f) == (size_t)uncomp_size) {
-                        fwrite(ifo_buf, 1, (size_t)uncomp_size, out_f);
-                    }
-                    free(ifo_buf);
-                }
-                fclose(out_f);
-            }
-        }
     }
 
     free(cd_buf);
@@ -274,9 +227,6 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
 
 void tdvd_archive_close(tdvd_archive_t *ar) {
     if (!ar) return;
-    if (ar->ifo_dir[0]) {
-        remove_ifo_dir(ar->ifo_dir);
-    }
     if (ar->entries) free(ar->entries);
     if (ar->archive_path) free(ar->archive_path);
     free(ar);
@@ -295,8 +245,39 @@ bool tdvd_archive_find(const tdvd_archive_t *ar, const char *filename, uint64_t 
     return false;
 }
 
-const char *tdvd_archive_ifo_dir(const tdvd_archive_t *ar) {
-    return (ar && ar->ifo_dir[0]) ? ar->ifo_dir : NULL;
+uint8_t *tdvd_archive_read_entry(const tdvd_archive_t *ar, const char *filename, size_t *out_size) {
+    if (out_size) *out_size = 0;
+    if (!ar || !ar->archive_path || !filename) return NULL;
+
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    if (!tdvd_archive_find(ar, filename, &offset, &size)) {
+        return NULL;
+    }
+    if (size == 0 || size > 16ULL * 1024ULL * 1024ULL) {
+        return NULL;
+    }
+
+    FILE *f = fopen(ar->archive_path, "rb");
+    if (!f) return NULL;
+    if (fseeko(f, (off_t)offset, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)size);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    if (fread(buf, 1, (size_t)size, f) != (size_t)size) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    if (out_size) *out_size = (size_t)size;
+    return buf;
 }
 
 const char *tdvd_archive_path(const tdvd_archive_t *ar) {

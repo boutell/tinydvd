@@ -179,7 +179,7 @@ collect_missing_build_deps() {
     fi
 
     local mod
-    for mod in dvdread mpv sdl2 cairo pangocairo; do
+    for mod in mpv sdl2 cairo pangocairo; do
         if ! pkg-config --exists "$mod" >/dev/null 2>&1; then
             MISSING_DEPS+=("$mod")
         fi

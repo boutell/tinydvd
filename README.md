@@ -26,7 +26,7 @@ Run the automatic dependency installer for macOS or Linux:
 
 #### macOS (Homebrew)
 ```bash
-brew install cmake pkg-config libdvdnav libdvdread libdvdcss dvdbackup mpv sdl2 cairo pango zlib ffmpeg python@3.12
+brew install cmake pkg-config mpv sdl2 cairo pango zlib ffmpeg python@3.12
 ```
 
 #### Linux (Debian / Ubuntu)
@@ -34,7 +34,7 @@ brew install cmake pkg-config libdvdnav libdvdread libdvdcss dvdbackup mpv sdl2 
 sudo apt-get update
 sudo apt-get install -y \
     build-essential cmake pkg-config \
-    libdvdnav-dev libdvdread-dev dvdbackup \
+    dvdbackup \
     libmpv-dev libsdl2-dev libgl1-mesa-dev \
     libcairo2-dev libpango1.0-dev zlib1g-dev \
     ffmpeg python3 python3-venv
@@ -44,7 +44,7 @@ sudo apt-get install -y \
 ```bash
 sudo dnf install -y \
     gcc gcc-c++ cmake pkgconf-pkg-config \
-    libdvdnav-devel libdvdread-devel dvdbackup \
+    dvdbackup \
     mpv-libs-devel SDL2-devel mesa-libGL-devel \
     cairo-devel pango-devel zlib-devel \
     ffmpeg python3
@@ -52,8 +52,29 @@ sudo dnf install -y \
 
 #### Linux (Arch Linux)
 ```bash
-sudo pacman -S --needed cmake base-devel pkgconf libdvdnav libdvdread dvdbackup mpv sdl2 cairo pango zlib ffmpeg python
+sudo pacman -S --needed cmake base-devel pkgconf dvdbackup mpv sdl2 cairo pango zlib ffmpeg python
 ```
+
+#### Optional: Optical Disc Ripping (`dvdbackup`) & CSS (`libdvdcss`)
+`tinydvd` does **not** require `libdvdread`, `libdvdnav`, `dvdbackup`, or `libdvdcss` to build, play `.tdvd` archives, or import previously ripped `VIDEO_TS` folders, unencrypted `.iso` images (automatically mounted via `hdiutil` on macOS; mounted first or extracted via `7z` on Linux), or unencrypted discs mounted under `/Volumes/<DISC>` on macOS.
+
+- **Linux (`dvdbackup` without `libdvdcss`):** `dvdbackup` is included in the Linux commands above and rips unencrypted optical discs without `libdvdcss`. If you also want optional CSS decryption for commercial discs (where permitted by local law), install `libdvdcss` separately:
+  - **Debian / Ubuntu** *(requires `contrib` on Debian or `multiverse` on Ubuntu)*:
+    ```bash
+    sudo apt-get install -y libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg
+    ```
+  - **Fedora / RHEL** *(via RPM Fusion Tainted)*:
+    ```bash
+    sudo dnf install -y rpmfusion-free-release-tainted && sudo dnf install -y libdvdcss
+    ```
+  - **Arch Linux**:
+    ```bash
+    sudo pacman -S --needed libdvdcss
+    ```
+- **macOS (Homebrew: `dvdbackup` pulls `libdvdread` + `libdvdcss`):** If you opt out of `dvdbackup`, you can still play `.tdvd` files and import previously ripped `VIDEO_TS` folders, unencrypted `.iso` images, and unencrypted discs mounted under `/Volumes/<DISC>`. Because Homebrew's `dvdbackup` formula requires `libdvdread`, which in turn pulls in `libdvdcss`, `dvdbackup` is omitted from the default macOS install. Install it only if you explicitly opt in to direct optical-drive ripping and CSS support:
+  ```bash
+  brew install dvdbackup
+  ```
 </details>
 
 ### Compile `tinydvd`
@@ -321,13 +342,13 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Keeps film at its exact timing, including soft-telecined NTSC film's 3:2 cadence, and deinterlaces only the frames the disc marks as interlaced (one frame per field, 59.94 or 50 per second), so mixed film and video titles play like they do on a DVD player.
 
 3. **Custom DVD Virtual Machine & Smooth Playback Engine ([`src/dvd_vm_bridge.c`](file:///Users/boutell/boutell/tinydvd/src/dvd_vm_bridge.c)):**
-   - Replaces `libdvdnav`'s rigid optical sector reader with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots) and compact `.mvob` indexer built on `libdvdread` (`ifoOpen`, `navRead_PCI`, `navRead_DSI`).
+   - Replaces `libdvdnav` and `libdvdread` with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots), a compact `.mvob` indexer, and a clean-room, bounds-checked `.IFO`/`.BUP` & PCI/HLI parser ([`src/dvd_ifo.c`](file:///Users/boutell/boutell/tinydvd/src/dvd_ifo.c)).
    - Tracks expected presentation timestamps across VOBUs: when consecutive VOBUs have contiguous timestamps, `libmpv` ([`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c)) continues playing smoothly without issuing redundant seeks.
    - Composites 2-bit RLE DVD subpictures and menu button highlights over the `libmpv` OpenGL video frame via [`src/spu_compositor.c`](file:///Users/boutell/boutell/tinydvd/src/spu_compositor.c), including timed DCSQ `STP_DSP` expiration for movie Closed Captions and subtitles.
 
 4. **Single-File `.tdvd` / `.tinydvd` Container ([`src/tdvd_archive.c`](file:///Users/boutell/boutell/tinydvd/src/tdvd_archive.c)):**
    - Uses a standard uncompressed ZIP (`ZIP_STORED`, with automatic `ZIP64` support for files > 4 GB) so the Central Directory at the end of the file provides $O(1)$ lookup of every constituent `.IFO`, `.mvob`, and `.mkv` file's contiguous `[offset, size)` byte range.
-   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows both `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c) using `pread`) to be streamed and seeked **directly in-place from the `.tdvd` file without unpacking video to `/tmp`**.
+   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows `.IFO`/`.BUP` tables to be loaded directly into memory while `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c) using `pread`) are streamed and seeked **directly in-place from the `.tdvd` file without unpacking to `/tmp`**.
    - Any `.tdvd` file can also be inspected with standard tools (`unzip -l MY_MOVIE.tdvd`).
 
 ### Binary Descriptor (`mvob_video_ref_t`)
@@ -367,8 +388,8 @@ tinydvds/MY_MOVIE/
 
 ### How `dvdbackup` Uses `libdvdcss`
 
-- **macOS (Homebrew):** `libdvdread` links directly to `libdvdcss.2.dylib`. `dvdbackup` loads `libdvdcss` automatically with no extra environment variables.
-- **Linux (Debian / Ubuntu):** `libdvd-pkg` compiles and installs `libdvdcss.so.2` into `/usr/lib/`, which `libdvdread` loads via `dlopen("libdvdcss.so.2")`.
+- **macOS (Homebrew):** Optional `dvdbackup` links via Homebrew's `libdvdread` to `libdvdcss.2.dylib` automatically with no extra environment variables.
+- **Linux (Debian / Ubuntu):** `dvdbackup` uses the system `libdvdread`, which works without `libdvdcss` on unencrypted discs and loads optional `libdvdcss.so.2` via `dlopen("libdvdcss.so.2")` when `libdvd-pkg` / `libdvdcss` is installed.
 - **Debugging CSS Decryption:** Run `DVDCSS_VERBOSE=2 dvdbackup -M -i /dev/rdisk4 -o ./rips` to inspect CSS drive authentication and title key descrambling logs.
 
 ### Running Tests
@@ -382,3 +403,22 @@ tinydvds/MY_MOVIE/
 # Python transcoder & packager integration test
 python3 tests/test_transcode.py
 ```
+
+---
+
+## License & Third-Party Dependencies
+
+TinyDVD's own source code is licensed under the **MIT License** (see [`LICENSE.md`](LICENSE.md)).
+
+When built and linked into binaries (`libtinydvd_core` / `tinydvd`), TinyDVD relies on system-provided third-party libraries (and does **not** link against `libdvdread`, `libdvdnav`, or `libdvdcss`):
+
+- **`libmpv`**: **LGPL-2.1-or-later** core (commonly built as **GPL-2.0-or-later** / **GPL-3.0** by OS distributions and Homebrew when GPL features/FFmpeg are enabled)
+- **`cairo`**: **LGPL-2.1** or **MPL-1.1**
+- **`pango` / `pangocairo`**: **LGPL-2.0-or-later** / **LGPL-2.1-or-later**
+- **`SDL2`** & **`zlib`**: **zlib License**
+- **Python 3**: **PSF-2.0 License**
+
+When compiled against a typical distribution or Homebrew GPL-enabled build of `libmpv`, **any distributed compiled binary packages are combined works subject to the GPL** (requiring corresponding source availability and GPL license notices if you redistribute binaries). If built against an LGPL-only `libmpv` (e.g., `-Dgpl=false`), no GPL-licensed library is linked into `libtinydvd_core`.
+
+External tools invoked only as separate CLI subprocesses (`ffmpeg`, optional `dvdbackup`, and optional `zenity`/`kdialog`) as well as user-installed optional `libdvdcss` (GPL-2.0-or-later) and `libdvdread` used by `dvdbackup` are governed by their respective licenses and are not bundled with TinyDVD.
+

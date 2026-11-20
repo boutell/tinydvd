@@ -2,7 +2,7 @@
 """
 ctypes bindings to the C media & canvas primitive engine (libtinydvd_core).
 
-Keeps libdvdread IFO/NV_PCK VM execution, SPU RLE compositing, libmpv rendering,
+Keeps clean-room IFO/NV_PCK VM execution, SPU RLE compositing, libmpv rendering,
 and low-level SDL2/OpenGL/Cairo/Pango drawing & event primitives in C while
 running all application logic, desktop UI layout/widgets, library management,
 .tdvd archive parsing, OS directory watching, and HTTP/SSE/WS serving in Python.

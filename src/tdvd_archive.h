@@ -17,13 +17,12 @@ extern "C" {
 bool tdvd_is_archive_path(const char *path);
 
 /**
- * Open a .tdvd / .tinydvd uncompressed ZIP archive, parse its Central Directory in O(1),
- * and stage its small .IFO/.BUP navigation files into a temporary directory for libdvdread.
+ * Open a .tdvd / .tinydvd uncompressed ZIP archive and parse its Central Directory in O(1).
  */
 tdvd_archive_t *tdvd_archive_open(const char *archive_path);
 
 /**
- * Close the archive and remove its temporary .IFO staging directory.
+ * Close the archive and release its index.
  */
 void tdvd_archive_close(tdvd_archive_t *ar);
 
@@ -34,9 +33,10 @@ void tdvd_archive_close(tdvd_archive_t *ar);
 bool tdvd_archive_find(const tdvd_archive_t *ar, const char *filename, uint64_t *out_offset, uint64_t *out_size);
 
 /**
- * Return the path to the temporary directory containing extracted .IFO/.BUP files for libdvdread.
+ * Read a small entry (up to 16 MB, e.g. an .IFO/.BUP file) from the archive into memory.
+ * Caller owns the returned buffer and must call free(). Returns NULL if not found or too large.
  */
-const char *tdvd_archive_ifo_dir(const tdvd_archive_t *ar);
+uint8_t *tdvd_archive_read_entry(const tdvd_archive_t *ar, const char *filename, size_t *out_size);
 
 /**
  * Return the path to the underlying .tdvd archive file.

@@ -861,7 +861,12 @@ class TinyDVDLibrary:
             if is_dev:
                 dvdbackup_bin = shutil.which("dvdbackup")
                 if not dvdbackup_bin:
-                    raise RuntimeError("dvdbackup is required to rip optical drive devices.")
+                    raise RuntimeError(
+                        "dvdbackup is required to rip directly from optical drive devices "
+                        "(you can still import previously ripped VIDEO_TS folders, unencrypted .iso images, "
+                        "or mounted unencrypted disc folders without it; to enable direct drive ripping, "
+                        "install dvdbackup or run ./scripts/install-deps.sh --with-libdvdcss)."
+                    )
                 rip_tmp_dir = tempfile.mkdtemp(prefix="tdvd_rip_")
                 with self.import_lock:
                     self.imp_state = IMPORT_RIPPING
