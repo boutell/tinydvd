@@ -16,6 +16,8 @@ tinydvd-set-thumbnail uses this script (with --frame-only) to choose the
 frame it embeds, so both always agree.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re

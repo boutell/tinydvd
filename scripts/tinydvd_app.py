@@ -2,31 +2,23 @@
 """
 Unified Python CLI entrypoint for TinyDVD Player & Library Server.
 
-Orchestrates TinyDVDLibrary, TinyDVDWebServer, and libtinydvd_core's SDL2/OpenGL
-desktop UI + mpv/libdvdread DVD VM playback engine.
+Orchestrates TinyDVDDesktopUI, TinyDVDWebServer, and libtinydvd_core's media &
+canvas primitives.
 """
 
-import ctypes
+from __future__ import annotations
+
 import os
 import signal
 import sys
-import threading
 
 # Ensure sibling modules in scripts/ are importable regardless of cwd
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-from tinydvd_core import (
-    PY_DETECT_SOURCE_CB,
-    PY_IMPORT_CANCEL_CB,
-    PY_IMPORT_START_CB,
-    PY_READ_THUMB_CB,
-    PY_SET_DIR_CB,
-    TinyDVDCore,
-    write_c_char_buf,
-)
-from tinydvd_library import TinyDVDLibrary, detect_default_source
+from tinydvd_core import TinyDVDCore
+from tinydvd_desktop_ui import run_desktop_app
 from tinydvd_web_server import TinyDVDWebServer
 
 
@@ -74,118 +66,6 @@ def print_usage(prog: str) -> None:
     print("  Escape               Go up a menu level (or return to library / exit)")
     print("  F                    Toggle fullscreen")
     print("  Q                    Quit")
-
-
-def run_desktop(core: TinyDVDCore, dvd_path: str, start_fullscreen: bool) -> int:
-    sync_lock = threading.Lock()
-    thumb_state = {"buf": None}
-
-    def sync_catalog() -> None:
-        is_dir, items, raw_target = lib.get_snapshot()
-        gen = lib.get_generation()
-        with sync_lock:
-            core.lib.tdvd_desktop_set_library_mode(
-                raw_target.encode("utf-8"), 1 if is_dir else 0
-            )
-            core.lib.tdvd_desktop_sync_catalog_begin()
-            for it in items:
-                core.lib.tdvd_desktop_sync_catalog_add(
-                    it.id.encode("utf-8"),
-                    it.title.encode("utf-8"),
-                    it.path.encode("utf-8"),
-                    it.size_bytes,
-                    it.size_str.encode("utf-8"),
-                    1 if it.has_thumbnail else 0,
-                    it.year,
-                    it.director.encode("utf-8"),
-                    it.cast.encode("utf-8"),
-                    it.genres.encode("utf-8"),
-                    it.overview.encode("utf-8"),
-                )
-            core.lib.tdvd_desktop_sync_catalog_end(gen)
-
-    def sync_import() -> None:
-        st = lib.get_import_status()
-        logs_joined = "\n".join(st["logs"]).encode("utf-8")
-        core.lib.tdvd_desktop_sync_import_status(
-            st["state_code"],
-            1 if st["active"] else 0,
-            st["start_time"],
-            st["stage_msg"].encode("utf-8"),
-            st["error_msg"].encode("utf-8"),
-            st["result_disc_id"].encode("utf-8"),
-            st["result_disc_path"].encode("utf-8"),
-            st["result_title"].encode("utf-8"),
-            logs_joined,
-        )
-
-    lib = TinyDVDLibrary(dvd_path, on_catalog_change=sync_catalog, on_import_change=sync_import)
-
-    def cb_read_thumb(disc_path_cstr: bytes, out_ptr, out_sz) -> int:
-        dpath = disc_path_cstr.decode("utf-8", errors="replace") if disc_path_cstr else ""
-        data = lib.read_thumbnail(dpath)
-        if not data:
-            return 0
-        cbuf = ctypes.create_string_buffer(data, len(data))
-        thumb_state["buf"] = cbuf
-        out_ptr[0] = ctypes.cast(cbuf, ctypes.c_void_p).value
-        out_sz[0] = len(data)
-        return 1
-
-    def cb_detect_source(out_src: int, src_len: int, out_label: int, label_len: int) -> None:
-        src, label = detect_default_source()
-        write_c_char_buf(out_src, src_len, src)
-        write_c_char_buf(out_label, label_len, label)
-
-    def cb_import_start(
-        source_cstr: bytes, title_cstr: bytes, skip_enrich: int, err_buf: int, err_len: int
-    ) -> int:
-        src = source_cstr.decode("utf-8", errors="replace") if source_cstr else ""
-        title = title_cstr.decode("utf-8", errors="replace") if title_cstr else ""
-        ok, err = lib.start_import(src, title=title, skip_enrichment=bool(skip_enrich))
-        if not ok:
-            write_c_char_buf(err_buf, err_len, err)
-            return 0
-        return 1
-
-    def cb_import_cancel() -> None:
-        lib.cancel_import()
-
-    def cb_set_dir(dir_cstr: bytes) -> None:
-        dpath = dir_cstr.decode("utf-8", errors="replace") if dir_cstr else ""
-        if not dpath:
-            return
-        with lib.catalog_lock:
-            same_lib = lib.is_library and (lib.target_path == lib._expand_path(dpath))
-        if same_lib:
-            lib.rescan()
-        else:
-            lib.set_directory(dpath)
-        sync_catalog()
-
-    # Keep strong references to ctypes callbacks for the entire C run lifetime
-    cb_refs = (
-        PY_READ_THUMB_CB(cb_read_thumb),
-        PY_DETECT_SOURCE_CB(cb_detect_source),
-        PY_IMPORT_START_CB(cb_import_start),
-        PY_IMPORT_CANCEL_CB(cb_import_cancel),
-        PY_SET_DIR_CB(cb_set_dir),
-    )
-    core.lib.tdvd_library_bind_python_callbacks(*cb_refs)
-
-    sync_catalog()
-    sync_import()
-
-    try:
-        return int(
-            core.lib.tdvd_desktop_run(
-                dvd_path.encode("utf-8"), 1 if start_fullscreen else 0
-            )
-        )
-    finally:
-        lib.destroy()
-        thumb_state["buf"] = None
-        del cb_refs
 
 
 def main(argv: list[str]) -> int:
@@ -251,7 +131,7 @@ def main(argv: list[str]) -> int:
         server.stop()
         return 0
 
-    return run_desktop(core, dvd_path, start_fullscreen)
+    return run_desktop_app(core, dvd_path, start_fullscreen)
 
 
 if __name__ == "__main__":

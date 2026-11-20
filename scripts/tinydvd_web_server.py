@@ -4,6 +4,8 @@ Pure-Python HTTP / Range Streaming / Server-Sent Events (SSE) / RFC 6455 WebSock
 web server backed by TinyDVDLibrary and libtinydvd_core's DVD VM sessions.
 """
 
+from __future__ import annotations
+
 import base64
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,8 +35,17 @@ VALID_MEDIA_BASE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 def load_web_index_html() -> bytes:
     """Parse TINYDVD_INDEX_HTML from src/web_assets.h so there is one source of truth."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    hpath = os.path.join(repo_root, "src", "web_assets.h")
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hpath = None
+    for cand in (
+        os.path.join(base_dir, "src", "web_assets.h"),
+        os.path.join(base_dir, "web_assets.h"),
+    ):
+        if os.path.isfile(cand):
+            hpath = cand
+            break
+    if not hpath:
+        raise RuntimeError(f"Failed to locate web_assets.h under {base_dir}")
     with open(hpath, "r", encoding="utf-8") as f:
         lines = f.readlines()
 

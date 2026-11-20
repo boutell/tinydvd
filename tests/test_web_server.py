@@ -5,6 +5,8 @@ Integration and unit tests for TinyDVD's Python Web Server, OS directory watcher
 security validation, and built-in DVD import + duplicate name disambiguation.
 """
 
+from __future__ import annotations
+
 import ctypes
 import json
 import os
@@ -22,7 +24,30 @@ SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
-from tinydvd_core import TinyDVDCore
+from tinydvd_core import DesktopUIEvent, TinyDVDCore
+from tinydvd_desktop_ui import (
+    EVT_KEYDOWN,
+    EVT_MOUSE_DOWN,
+    EVT_MOUSE_WHEEL,
+    EVT_TEXTINPUT,
+    FOCUS_NONE,
+    FOCUS_SEARCH,
+    KMOD_GUI,
+    SDLK_BACKSPACE,
+    SDLK_DOWN,
+    SDLK_ESCAPE,
+    SDLK_UP,
+    SDLK_a,
+    SDLK_f,
+    SDLK_v,
+    SDLK_x,
+    SDL_BUTTON_LEFT,
+    Rect,
+    TextField,
+    TinyDVDDesktopUI,
+    parse_png_sar,
+)
+from tinydvd_library import TinyDVDLibrary
 from tinydvd_web_server import TinyDVDWebServer, compute_ws_accept_key
 
 
@@ -393,12 +418,153 @@ def test_duplicate_dvd_import_disambiguation(core: TinyDVDCore) -> None:
         shutil.rmtree(src2_dir, ignore_errors=True)
 
 
+def test_desktop_ui_helpers(core: TinyDVDCore) -> None:
+    print("Testing Python Desktop UI helpers (TextField, PNG pHYs SAR, Pango hit-test)...")
+
+    # TextField editing, UTF-8 selection, word navigation, and deletion
+    tf = TextField("Café Dune 2021")
+    assert tf.text == "Café Dune 2021"
+    assert tf.cursor == len(tf.text)
+    assert not tf.has_selection()
+
+    # Word navigation
+    assert tf.prev_word_pos(tf.cursor) == 10  # before "2021"
+    assert tf.prev_word_pos(10) == 5          # before "Dune"
+    assert tf.prev_word_pos(5) == 0           # before "Café"
+    assert tf.next_word_pos(0) == 4           # after "Café"
+    assert tf.next_word_pos(4) == 9           # after "Dune"
+
+    # Shift-selection and replace-on-insert
+    tf.move_cursor(5, False)
+    tf.move_cursor(9, True)
+    assert tf.has_selection()
+    assert tf.get_selection() == (5, 9)
+    tf.insert_str("Part\n")
+    assert tf.text == "Café Part 2021"
+    assert not tf.has_selection()
+
+    # Select all & backspace/delete
+    tf.select_all()
+    assert tf.get_selection() == (0, len(tf.text))
+    tf.clear_selection()
+    assert not tf.has_selection()
+
+    tf.move_cursor(len(tf.text), False)
+    tf.backspace(word_mod=True)
+    assert tf.text == "Café Part "
+    tf.move_cursor(0, False)
+    tf.delete_fwd(word_mod=True)
+    assert tf.text == " Part "
+    tf.move_cursor(len(tf.text), False)
+    tf.backspace(line_mod=True)
+    assert tf.text == ""
+
+    # Pango x_to_char_index via libtinydvd_core (headless 1x1 surface)
+    tf.set_text("Dune Cinema")
+    assert tf.x_to_char_index(core, None, -5.0) == 0
+    end_idx = tf.x_to_char_index(core, None, 10000.0)
+    assert end_idx == len(tf.text), f"Expected {len(tf.text)}, got {end_idx}"
+    mid_idx = tf.x_to_char_index(core, None, 30.0)
+    assert 0 < mid_idx < len(tf.text), f"Expected interior index, got {mid_idx}"
+
+    # parse_png_sar with pHYs chunks
+    png_sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">I", 13) + b"IHDR" + b"\x00" * 13 + b"\x00" * 4
+    phys_32_27 = struct.pack(">I", 9) + b"pHYs" + struct.pack(">IIB", 32, 27, 0) + b"\x00" * 4
+    iend = struct.pack(">I", 0) + b"IEND" + b"\x00" * 4
+    sar = parse_png_sar(png_sig + ihdr + phys_32_27 + iend)
+    assert abs(sar - (32.0 / 27.0)) < 1e-6, f"Expected ~1.185, got {sar}"
+
+    # No pHYs defaults to 1.0
+    assert parse_png_sar(png_sig + ihdr + iend) == 1.0
+    assert parse_png_sar(b"not a png") == 1.0
+
+    # Rect hit testing
+    r = Rect(10.0, 20.0, 100.0, 40.0)
+    assert r.contains(10.0, 20.0)
+    assert r.contains(110.0, 60.0)
+    assert not r.contains(9.9, 20.0)
+    assert not Rect().contains(0.0, 0.0)
+
+    # TinyDVDDesktopUI.handle_event coverage (shortcuts, typing, mouse, scroll)
+    tmp_lib_dir = tempfile.mkdtemp(prefix="tinydvd_test_ui_")
+    try:
+        lib = TinyDVDLibrary(tmp_lib_dir)
+        try:
+            ui = TinyDVDDesktopUI(core, None, lib)
+            ui.compute_layout_rects(1280, 800, False)
+
+            # Cmd+F focuses search bar
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_f, keymod=KMOD_GUI)
+            consumed, _, _, _ = ui.handle_event(ev, 1280, 800, False)
+            assert consumed and ui.focus == FOCUS_SEARCH
+
+            # Typing via EVT_TEXTINPUT inserts into focused search field
+            ev = DesktopUIEvent(type=EVT_TEXTINPUT, text=b"Dune")
+            consumed, _, _, _ = ui.handle_event(ev, 1280, 800, False)
+            assert consumed and ui.tf_search.text == "Dune"
+
+            # Backspace & Cmd+A & Cmd+X/Cmd+V without NameError/crash
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_BACKSPACE)
+            ui.handle_event(ev, 1280, 800, False)
+            assert ui.tf_search.text == "Dun"
+
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_a, keymod=KMOD_GUI)
+            consumed, _, _, _ = ui.handle_event(ev, 1280, 800, False)
+            assert consumed and ui.tf_search.get_selection() == (0, 3)
+
+            # Cmd+V when focus is unfocused (the exact repro path)
+            ui.focus = FOCUS_NONE
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_v, keymod=KMOD_GUI)
+            consumed, _, _, _ = ui.handle_event(ev, 1280, 800, False)
+            assert consumed and ui.focus == FOCUS_SEARCH
+
+            # Cmd+X shortcut check
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_x, keymod=KMOD_GUI)
+            ui.handle_event(ev, 1280, 800, False)
+
+            # Escape clears search text first, then unfocuses
+            ui.tf_search.set_text("Dune")
+            ui.focus = FOCUS_SEARCH
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_ESCAPE)
+            ui.handle_event(ev, 1280, 800, False)
+            assert ui.tf_search.text == ""
+            ui.handle_event(ev, 1280, 800, False)
+            assert ui.focus == FOCUS_NONE
+
+            # Arrow scroll & mouse wheel & mouse down
+            ui.max_scroll_y = 200.0
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_DOWN)
+            assert ui.handle_event(ev, 1280, 800, False)[0] and ui.scroll_y > 0.0
+            ev = DesktopUIEvent(type=EVT_KEYDOWN, keysym=SDLK_UP)
+            ui.handle_event(ev, 1280, 800, False)
+            assert ui.scroll_y == 0.0
+
+            ev = DesktopUIEvent(type=EVT_MOUSE_WHEEL, wheel_y=-1)
+            ui.handle_event(ev, 1280, 800, False)
+            assert ui.scroll_y > 0.0
+
+            # Click + Import DVD button opens modal
+            imp_cx = int(ui.r_open_import.x + ui.r_open_import.w * 0.5)
+            imp_cy = int(ui.r_open_import.y + ui.r_open_import.h * 0.5)
+            ev = DesktopUIEvent(type=EVT_MOUSE_DOWN, x=imp_cx, y=imp_cy, button=SDL_BUTTON_LEFT, clicks=1)
+            consumed, _, _, _ = ui.handle_event(ev, 1280, 800, False)
+            assert consumed and ui.import_modal_open
+        finally:
+            lib.destroy()
+    finally:
+        shutil.rmtree(tmp_lib_dir, ignore_errors=True)
+
+    print("  - Python Desktop UI helpers: OK")
+
+
 def main() -> int:
     tdvd = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO_ROOT, "tinydvds", "Dune.tdvd")
     print("=== Running TinyDVD Web Server & Protocol Tests ===")
     core = TinyDVDCore()
     test_sha1_and_websocket_key()
     test_spu_png_encoding(core)
+    test_desktop_ui_helpers(core)
     test_http_and_websocket_endpoints(core, tdvd)
     test_library_directory_filtering_and_sse(core, tdvd)
     test_import_dvd_workflow(core)

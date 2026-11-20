@@ -5,6 +5,8 @@ Fetches movie details (director, cast, genres, overview, year, ratings, TMDb ID)
 and embeds them as metadata.json into .tdvd archives or writes sidecar .json files.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import re

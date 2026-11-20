@@ -1,51 +1,273 @@
 #!/usr/bin/env bash
-# install: build tinydvd and install it, with its GNOME / freedesktop
-# integration (launcher, .tdvd file type, icons and Nautilus thumbnailer),
-# under /usr/local.
+# install: build tinydvd, create a dedicated Python virtualenv, and install the
+# self-contained runtime into PREFIX (default: /usr/local) with GNOME/freedesktop
+# desktop integration on Linux.
 #
-# Everything goes under /usr/local on purpose: GNOME runs thumbnailers in a
-# sandbox that can only see system paths such as /usr, so a thumbnailer in a
-# home folder (~/.local/bin) can't run and .tdvd files get no thumbnails.
+# Everything goes under /usr/local by default so macOS/Linux tools run from a
+# single system location and GNOME's thumbnailer sandbox can access it.
 #
-#   ./install              Build, then install (asks for your password via sudo)
-#   ./install --uninstall  Remove everything this script installed
+#   ./install                      Build and install to /usr/local
+#   ./install --prefix <dir>       Build and install to a custom prefix
+#   ./install --python <path>      Use a specific compatible Python (>= 3.8)
+#   ./install --no-deps            Do not auto-run scripts/install-deps.sh
+#   ./install --uninstall          Remove everything this script installed
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
+CUSTOM_PYTHON="${TINYDVD_PYTHON:-}"
+INSTALL_DEPS=1
+UNINSTALL=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --uninstall)
+            UNINSTALL=1
+            shift
+            ;;
+        --no-deps)
+            INSTALL_DEPS=0
+            shift
+            ;;
+        --prefix)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --prefix requires a directory argument" >&2
+                exit 1
+            fi
+            PREFIX="$2"
+            shift 2
+            ;;
+        --prefix=*)
+            PREFIX="${1#*=}"
+            shift
+            ;;
+        --python)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --python requires an interpreter path" >&2
+                exit 1
+            fi
+            CUSTOM_PYTHON="$2"
+            shift 2
+            ;;
+        --python=*)
+            CUSTOM_PYTHON="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1 (try --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+PREFIX="${PREFIX%/}"
+[[ -n "$PREFIX" ]] || PREFIX="/"
+
 BIN_DIR="${PREFIX}/bin"
+LIB_DIR="${PREFIX}/lib/tinydvd"
 SHARE_DIR="${PREFIX}/share"
 APP_DIR="${SHARE_DIR}/applications"
 MIME_DIR="${SHARE_DIR}/mime/packages"
 THUMB_DIR="${SHARE_DIR}/thumbnailers"
 ICON_DIR="${SHARE_DIR}/icons/hicolor"
 MIME_TYPES=(video/x-tinydvd application/x-tdvd application/x-tinydvd)
+OS="$(uname -s)"
 
-UNINSTALL=0
-for arg in "$@"; do
-    case "$arg" in
-        --uninstall) UNINSTALL=1 ;;
-        -h|--help)
-            sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $arg (try --help)" >&2
-            exit 1
-            ;;
-    esac
-done
-
-# Build as the invoking user, so build/ never ends up owned by root, then
-# rerun this script with sudo for the installation itself.
-if [[ "$(id -u)" -ne 0 ]]; then
-    if [[ "$UNINSTALL" -eq 0 ]]; then
-        echo "=== Building tinydvd ==="
-        cmake -B "${ROOT_DIR}/build" -S "${ROOT_DIR}" -DCMAKE_BUILD_TYPE=Release
-        cmake --build "${ROOT_DIR}/build" --target tinydvd
+validate_python() {
+    local py="$1"
+    [[ -n "$py" && -x "$py" ]] || return 1
+    if [[ "$OS" == "Darwin" && "$py" == "/usr/bin/python3" ]]; then
+        xcode-select -p >/dev/null 2>&1 || return 1
     fi
-    exec sudo "${BASH_SOURCE[0]}" "$@"
+    local host_arch
+    host_arch="$(uname -m)"
+    "$py" - "$host_arch" >/dev/null 2>&1 <<'PYEOF'
+import ctypes, http.server, platform, select, sys, urllib.request, zipfile, zlib
+
+host_arch = sys.argv[1]
+if sys.version_info < (3, 8):
+    raise SystemExit(1)
+py_arch = platform.machine()
+if host_arch and py_arch and py_arch != host_arch:
+    raise SystemExit(1)
+PYEOF
+}
+
+find_compatible_python() {
+    if [[ -n "$CUSTOM_PYTHON" ]]; then
+        if validate_python "$CUSTOM_PYTHON"; then
+            printf '%s\n' "$CUSTOM_PYTHON"
+            return 0
+        fi
+        echo "Error: specified Python '${CUSTOM_PYTHON}' is missing, < 3.8, missing stdlib modules, or wrong architecture for $(uname -m)." >&2
+        return 1
+    fi
+
+    local candidates=()
+    if [[ "$OS" == "Darwin" ]]; then
+        if command -v brew >/dev/null 2>&1; then
+            local p312
+            p312="$(brew --prefix python@3.12 2>/dev/null || true)"
+            if [[ -n "$p312" ]]; then
+                candidates+=("${p312}/bin/python3.12")
+            fi
+        fi
+        candidates+=(
+            "/opt/homebrew/opt/python@3.12/bin/python3.12"
+            "/usr/local/opt/python@3.12/bin/python3.12"
+            "/opt/homebrew/bin/python3.12"
+            "/usr/local/bin/python3.12"
+            "/opt/homebrew/bin/python3.13"
+            "/usr/local/bin/python3.13"
+            "/opt/homebrew/bin/python3"
+            "/usr/local/bin/python3"
+        )
+        local cmd_py
+        cmd_py="$(command -v python3 2>/dev/null || true)"
+        if [[ -n "$cmd_py" && "$cmd_py" != "/usr/bin/python3" ]]; then
+            candidates+=("$cmd_py")
+        fi
+        candidates+=("/usr/bin/python3")
+    else
+        candidates+=(
+            "/usr/bin/python3"
+            "/usr/local/bin/python3"
+        )
+        local cmd_py
+        cmd_py="$(command -v python3 2>/dev/null || true)"
+        if [[ -n "$cmd_py" ]]; then
+            candidates+=("$cmd_py")
+        fi
+    fi
+
+    local cand
+    for cand in "${candidates[@]}"; do
+        if validate_python "$cand"; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+
+    echo "Error: No compatible Python >= 3.8 interpreter found for $(uname -m)." >&2
+    if [[ "$OS" == "Darwin" ]]; then
+        echo "Run ./scripts/install-deps.sh or 'brew install python@3.12' first." >&2
+    else
+        echo "Install python3 (>= 3.8) and python3-venv via your distribution package manager." >&2
+    fi
+    return 1
+}
+
+MISSING_DEPS=()
+collect_missing_build_deps() {
+    MISSING_DEPS=()
+    if ! command -v cmake >/dev/null 2>&1; then
+        MISSING_DEPS+=("cmake")
+    fi
+    if ! command -v pkg-config >/dev/null 2>&1; then
+        MISSING_DEPS+=("pkg-config")
+        return 0
+    fi
+
+    local old_pkg_path="${PKG_CONFIG_PATH:-}"
+    if [[ "$OS" == "Darwin" ]]; then
+        export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig${old_pkg_path:+:${old_pkg_path}}"
+    fi
+
+    local mod
+    for mod in dvdread mpv sdl2 cairo pangocairo; do
+        if ! pkg-config --exists "$mod" >/dev/null 2>&1; then
+            MISSING_DEPS+=("$mod")
+        fi
+    done
+
+    if [[ "$OS" == "Darwin" ]]; then
+        if [[ -n "$old_pkg_path" ]]; then
+            export PKG_CONFIG_PATH="$old_pkg_path"
+        else
+            unset PKG_CONFIG_PATH || true
+        fi
+    fi
+}
+
+nearest_existing_dir() {
+    local p="$1"
+    while [[ ! -e "$p" && "$p" != "/" ]]; do
+        p="$(dirname "$p")"
+    done
+    printf '%s\n' "$p"
+}
+
+needs_sudo() {
+    [[ "$(id -u)" -ne 0 ]] || return 1
+    local probe
+    probe="$(nearest_existing_dir "$PREFIX")"
+    [[ -w "$probe" ]] || return 0
+    if [[ -d "$BIN_DIR" && ! -w "$BIN_DIR" ]]; then return 0; fi
+    if [[ -d "$LIB_DIR" && ! -w "$LIB_DIR" ]]; then return 0; fi
+    return 1
+}
+
+# Preserve original CLI args for optional sudo re-exec
+ORIG_ARGS=("$@")
+
+BASE_PYTHON="${TINYDVD_BASE_PYTHON:-}"
+if [[ "$UNINSTALL" -eq 0 ]]; then
+    if [[ "${TINYDVD_ALREADY_BUILT:-0}" != "1" ]]; then
+        if [[ -n "$CUSTOM_PYTHON" && -z "$BASE_PYTHON" ]]; then
+            BASE_PYTHON="$(find_compatible_python)"
+        fi
+        collect_missing_build_deps
+        if [[ -z "$BASE_PYTHON" ]]; then
+            BASE_PYTHON="$(find_compatible_python 2>/dev/null || true)"
+        fi
+
+        if [[ ${#MISSING_DEPS[@]} -gt 0 || -z "$BASE_PYTHON" ]]; then
+            missing_desc="${MISSING_DEPS[*]:-}"
+            if [[ -z "$BASE_PYTHON" ]]; then
+                missing_desc="${missing_desc:+${missing_desc} }python3(>=3.8)"
+            fi
+            if [[ "$INSTALL_DEPS" -eq 0 ]]; then
+                echo "Error: missing build dependencies: ${missing_desc}" >&2
+                echo "Run ./scripts/install-deps.sh first (or re-run without --no-deps)." >&2
+                exit 1
+            fi
+            echo "=== Installing missing dependencies (${missing_desc}) ==="
+            "${ROOT_DIR}/scripts/install-deps.sh"
+
+            collect_missing_build_deps
+            if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+                echo "Error: still missing build dependencies after running install-deps.sh: ${MISSING_DEPS[*]}" >&2
+                exit 1
+            fi
+        fi
+
+        if [[ -z "$BASE_PYTHON" ]]; then
+            BASE_PYTHON="$(find_compatible_python)"
+        fi
+
+        echo "=== Building tinydvd (Python: ${BASE_PYTHON}) ==="
+        cmake -B "${ROOT_DIR}/build" -S "${ROOT_DIR}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="${BASE_PYTHON}" \
+            -DTINYDVD_INSTALL_LIBDIR="${LIB_DIR}"
+        cmake --build "${ROOT_DIR}/build" --target tinydvd
+    elif [[ -z "$BASE_PYTHON" ]]; then
+        BASE_PYTHON="$(find_compatible_python)"
+    fi
+fi
+
+# Escalate with sudo only if target prefix is not writable by current user
+if needs_sudo; then
+    if [[ "$UNINSTALL" -eq 0 ]]; then
+        exec sudo TINYDVD_BASE_PYTHON="${BASE_PYTHON}" TINYDVD_ALREADY_BUILT=1 "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    else
+        exec sudo "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+    fi
 fi
 
 refresh_caches() {
@@ -61,10 +283,11 @@ refresh_caches() {
 }
 
 # Make tinydvd the default application for .tdvd files ("add"), or undo that
-# ("remove"), in /usr/local/share/applications/mimeapps.list. That is the
-# system-wide default; nobody's own ~/.config/mimeapps.list is touched.
+# ("remove"), in <prefix>/share/applications/mimeapps.list.
 set_default_handler() {
-    python3 - "${APP_DIR}/mimeapps.list" "$1" "${MIME_TYPES[@]}" <<'PYEOF'
+    local py_bin="$1"
+    local action="$2"
+    "$py_bin" - "${APP_DIR}/mimeapps.list" "$action" "${MIME_TYPES[@]}" <<'PYEOF'
 import configparser, os, sys
 
 path, action, mimes = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -97,62 +320,138 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
     rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" \
           "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer" \
           "${BIN_DIR}/tinydvd-set-thumbnail" "${BIN_DIR}/tinydvd-add-thumbnail"
-    rm -f "${APP_DIR}/tinydvd.desktop" "${MIME_DIR}/tinydvd.xml" \
-          "${THUMB_DIR}/tinydvd.thumbnailer" \
-          "${ICON_DIR}/scalable/apps/tinydvd.svg" \
-          "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
-    if [[ -f "${APP_DIR}/mimeapps.list" ]]; then
-        set_default_handler remove
+    if [[ "$OS" == "Linux" ]]; then
+        UNINSTALL_PY="${LIB_DIR}/venv/bin/python3"
+        if [[ ! -x "$UNINSTALL_PY" ]]; then
+            UNINSTALL_PY="$(command -v python3 2>/dev/null || true)"
+        fi
+        rm -f "${APP_DIR}/tinydvd.desktop" "${MIME_DIR}/tinydvd.xml" \
+              "${THUMB_DIR}/tinydvd.thumbnailer" \
+              "${ICON_DIR}/scalable/apps/tinydvd.svg" \
+              "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+        if [[ -f "${APP_DIR}/mimeapps.list" && -n "$UNINSTALL_PY" && -x "$UNINSTALL_PY" ]]; then
+            set_default_handler "$UNINSTALL_PY" remove
+        fi
+        refresh_caches
     fi
-    refresh_caches
-    echo "tinydvd uninstalled."
+    rm -rf "${LIB_DIR}"
+    echo "tinydvd uninstalled from ${PREFIX}."
     exit 0
 fi
 
 TINYDVD_BIN="${ROOT_DIR}/build/tinydvd"
-if [[ ! -x "$TINYDVD_BIN" ]]; then
-    echo "Error: ${TINYDVD_BIN} not found. Run ./install without sudo so it can build first." >&2
+if [[ "$OS" == "Darwin" ]]; then
+    CORE_LIB_NAME="libtinydvd_core.dylib"
+else
+    CORE_LIB_NAME="libtinydvd_core.so"
+fi
+CORE_LIB_SRC="${ROOT_DIR}/build/${CORE_LIB_NAME}"
+
+if [[ ! -x "$TINYDVD_BIN" || ! -f "$CORE_LIB_SRC" ]]; then
+    echo "Error: ${TINYDVD_BIN} or ${CORE_LIB_SRC} not found. Build failed or incomplete." >&2
     exit 1
 fi
 
+if [[ -z "$BASE_PYTHON" ]]; then
+    BASE_PYTHON="$(find_compatible_python)"
+fi
+
 echo "=== Installing tinydvd to ${PREFIX} ==="
-install -d "${BIN_DIR}" "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}" \
-           "${ICON_DIR}/scalable/apps" "${ICON_DIR}/scalable/mimetypes"
+install -d "${BIN_DIR}" "${LIB_DIR}" "${LIB_DIR}/scripts"
+
+VENV_DIR="${LIB_DIR}/venv"
+echo "Python venv -> ${VENV_DIR} (base: ${BASE_PYTHON})"
+if "${BASE_PYTHON}" -m venv --clear --without-pip "${VENV_DIR}" 2>/dev/null; then
+    if [[ ! -x "${VENV_DIR}/bin/python3" && -x "${VENV_DIR}/bin/python" ]]; then
+        ln -sf python "${VENV_DIR}/bin/python3"
+    fi
+else
+    echo "Note: python -m venv unavailable; pinning direct symlink in ${VENV_DIR}/bin/python3"
+    rm -rf "${VENV_DIR}"
+    install -d "${VENV_DIR}/bin"
+    ln -sf "${BASE_PYTHON}" "${VENV_DIR}/bin/python3"
+fi
+VENV_PYTHON="${VENV_DIR}/bin/python3"
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    echo "Error: Failed to provision ${VENV_PYTHON}" >&2
+    exit 1
+fi
+
+echo "Runtime -> ${LIB_DIR}"
+install -m 755 "${CORE_LIB_SRC}" "${LIB_DIR}/${CORE_LIB_NAME}"
+install -m 644 "${ROOT_DIR}/src/web_assets.h" "${LIB_DIR}/web_assets.h"
+
+RUNTIME_SCRIPTS=(
+    tinydvd_app.py
+    tinydvd_core.py
+    tinydvd_desktop_ui.py
+    tinydvd_library.py
+    tinydvd_metadata.py
+    tinydvd_web_server.py
+    convert-to-tinydvd.py
+    tinydvd-thumbnailer.py
+    tinydvd-set-thumbnail.py
+)
+for s in "${RUNTIME_SCRIPTS[@]}"; do
+    install -m 755 "${ROOT_DIR}/scripts/${s}" "${LIB_DIR}/scripts/${s}"
+done
+"${VENV_PYTHON}" -m py_compile "${LIB_DIR}"/scripts/*.py
+
+write_wrapper() {
+    local name="$1"
+    local script_file="$2"
+    local target="${BIN_DIR}/${name}"
+    cat > "${target}" <<EOF
+#!/bin/sh
+exec "${VENV_PYTHON}" "${LIB_DIR}/scripts/${script_file}" "\$@"
+EOF
+    chmod 755 "${target}"
+}
 
 echo "Programs -> ${BIN_DIR}"
 install -m 755 "${TINYDVD_BIN}" "${BIN_DIR}/tinydvd"
 ln -sf tinydvd "${BIN_DIR}/tinydvd-player"
-install -m 755 "${ROOT_DIR}/scripts/convert-to-tinydvd.py" "${BIN_DIR}/convert-to-tinydvd"
-install -m 755 "${ROOT_DIR}/scripts/tinydvd-thumbnailer.py" "${BIN_DIR}/tinydvd-thumbnailer"
-install -m 755 "${ROOT_DIR}/scripts/tinydvd-set-thumbnail.py" "${BIN_DIR}/tinydvd-set-thumbnail"
+write_wrapper "convert-to-tinydvd" "convert-to-tinydvd.py"
+write_wrapper "tinydvd-thumbnailer" "tinydvd-thumbnailer.py"
+write_wrapper "tinydvd-set-thumbnail" "tinydvd-set-thumbnail.py"
 ln -sf tinydvd-set-thumbnail "${BIN_DIR}/tinydvd-add-thumbnail"
 
-# Absolute paths in Exec / TryExec, so neither the launcher nor the
-# thumbnailer sandbox depends on PATH
-echo "Launcher -> ${APP_DIR}/tinydvd.desktop"
-{
-    grep -v '^TryExec=' "${ROOT_DIR}/data/tinydvd.desktop" |
-        sed -e "s|^Exec=.*|TryExec=${BIN_DIR}/tinydvd\\
+if [[ "$OS" == "Linux" ]]; then
+    install -d "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}" \
+               "${ICON_DIR}/scalable/apps" "${ICON_DIR}/scalable/mimetypes"
+
+    # Absolute paths in Exec / TryExec, so neither the launcher nor the
+    # thumbnailer sandbox depends on PATH
+    echo "Launcher -> ${APP_DIR}/tinydvd.desktop"
+    {
+        grep -v '^TryExec=' "${ROOT_DIR}/data/tinydvd.desktop" |
+            sed -e "s|^Exec=.*|TryExec=${BIN_DIR}/tinydvd\\
 Exec=${BIN_DIR}/tinydvd -f %f|"
-} > "${APP_DIR}/tinydvd.desktop"
-chmod 644 "${APP_DIR}/tinydvd.desktop"
+    } > "${APP_DIR}/tinydvd.desktop"
+    chmod 644 "${APP_DIR}/tinydvd.desktop"
 
-echo "File type -> ${MIME_DIR}/tinydvd.xml"
-install -m 644 "${ROOT_DIR}/data/tinydvd.xml" "${MIME_DIR}/tinydvd.xml"
+    echo "File type -> ${MIME_DIR}/tinydvd.xml"
+    install -m 644 "${ROOT_DIR}/data/tinydvd.xml" "${MIME_DIR}/tinydvd.xml"
 
-echo "Thumbnailer -> ${THUMB_DIR}/tinydvd.thumbnailer"
-sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd-thumbnailer -s %s %i %o|" \
-    -e "s|^TryExec=.*|TryExec=${BIN_DIR}/tinydvd-thumbnailer|" \
-    "${ROOT_DIR}/data/tinydvd.thumbnailer" > "${THUMB_DIR}/tinydvd.thumbnailer"
-chmod 644 "${THUMB_DIR}/tinydvd.thumbnailer"
+    echo "Thumbnailer -> ${THUMB_DIR}/tinydvd.thumbnailer"
+    sed -e "s|^Exec=.*|Exec=${BIN_DIR}/tinydvd-thumbnailer -s %s %i %o|" \
+        -e "s|^TryExec=.*|TryExec=${BIN_DIR}/tinydvd-thumbnailer|" \
+        "${ROOT_DIR}/data/tinydvd.thumbnailer" > "${THUMB_DIR}/tinydvd.thumbnailer"
+    chmod 644 "${THUMB_DIR}/tinydvd.thumbnailer"
 
-echo "Icons -> ${ICON_DIR}"
-install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/apps/tinydvd.svg"
-install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+    echo "Icons -> ${ICON_DIR}"
+    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/apps/tinydvd.svg"
+    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
 
-set_default_handler add
-refresh_caches
+    set_default_handler "${VENV_PYTHON}" add
+    refresh_caches
 
-echo ""
-echo "Installed. Double-click any .tdvd file in GNOME Files to play it."
-echo "If Nautilus was already open, restart it (nautilus -q) to pick up thumbnails."
+    echo ""
+    echo "Installed cleanly with isolated Python runtime (${VENV_PYTHON})."
+    echo "Double-click any .tdvd file in GNOME Files to play it."
+    echo "If Nautilus was already open, restart it (nautilus -q) to pick up thumbnails."
+else
+    echo ""
+    echo "Installed cleanly to ${PREFIX} with isolated Python runtime (${VENV_PYTHON})."
+    echo "Try: ${BIN_DIR}/tinydvd ~/Movies   or   ${BIN_DIR}/tinydvd --serve ~/Movies"
+fi

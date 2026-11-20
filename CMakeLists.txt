@@ -21,7 +21,20 @@ if(APPLE)
 endif()
 
 find_package(PkgConfig REQUIRED)
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+if(APPLE AND NOT DEFINED Python3_EXECUTABLE)
+    foreach(_py_cand
+        "/opt/homebrew/opt/python@3.12/bin/python3.12"
+        "/usr/local/opt/python@3.12/bin/python3.12"
+        "/opt/homebrew/bin/python3.12"
+        "/usr/local/bin/python3.12"
+    )
+        if(EXISTS "${_py_cand}")
+            set(Python3_EXECUTABLE "${_py_cand}")
+            break()
+        endif()
+    endforeach()
+endif()
+find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -40,46 +53,9 @@ include_directories(
     ${MPV_INCLUDE_DIRS}
     ${SDL2_INCLUDE_DIRS}
     ${OPENGL_INCLUDE_DIRS}
-)
-
-# Static Native UI Library (Cairo + PangoCairo + native OS file/folder picker)
-set(TINYDVD_UI_SOURCES
-    src/ui/native_ui.c
-)
-if(APPLE)
-    list(APPEND TINYDVD_UI_SOURCES src/ui/native_dialog_mac.m)
-endif()
-
-add_library(tinydvd_ui STATIC ${TINYDVD_UI_SOURCES})
-set_target_properties(tinydvd_ui PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(tinydvd_ui
-    PUBLIC
-    src
-    src/ui
     ${CAIRO_INCLUDE_DIRS}
     ${PANGOCAIRO_INCLUDE_DIRS}
-    ${SDL2_INCLUDE_DIRS}
-    ${OPENGL_INCLUDE_DIRS}
 )
-target_link_directories(tinydvd_ui
-    PUBLIC
-    ${CAIRO_LIBRARY_DIRS}
-    ${PANGOCAIRO_LIBRARY_DIRS}
-    ${SDL2_LIBRARY_DIRS}
-)
-target_link_libraries(tinydvd_ui
-    PUBLIC
-    ${CAIRO_LIBRARIES}
-    ${PANGOCAIRO_LIBRARIES}
-    ${SDL2_LIBRARIES}
-    ${OPENGL_LIBRARIES}
-    Threads::Threads
-    m
-)
-if(APPLE)
-    target_link_libraries(tinydvd_ui PUBLIC "-framework Cocoa")
-endif()
-target_compile_options(tinydvd_ui PRIVATE -Wall -Wextra)
 
 set(TINYDVD_CORE_SOURCES
     src/core_bridge.c
@@ -91,28 +67,42 @@ set(TINYDVD_CORE_SOURCES
     src/spu_compositor.c
     src/spu_png.c
 )
+if(APPLE)
+    list(APPEND TINYDVD_CORE_SOURCES src/ui/native_dialog_mac.m)
+endif()
 
 add_library(tinydvd_core SHARED ${TINYDVD_CORE_SOURCES})
 
-target_link_libraries(tinydvd_core
-    PRIVATE
-    tinydvd_ui
+set(TINYDVD_CORE_LINK_LIBS
     ${DVDREAD_LIBRARIES}
     ${MPV_LIBRARIES}
     ${SDL2_LIBRARIES}
     ${OPENGL_LIBRARIES}
+    ${CAIRO_LIBRARIES}
+    ${PANGOCAIRO_LIBRARIES}
     Threads::Threads
     ZLIB::ZLIB
+    m
 )
+if(APPLE)
+    list(APPEND TINYDVD_CORE_LINK_LIBS "-framework Cocoa")
+endif()
+list(REMOVE_DUPLICATES TINYDVD_CORE_LINK_LIBS)
 
-target_link_directories(tinydvd_core
-    PRIVATE
+set(TINYDVD_CORE_LINK_DIRS
     ${DVDREAD_LIBRARY_DIRS}
     ${MPV_LIBRARY_DIRS}
     ${SDL2_LIBRARY_DIRS}
+    ${CAIRO_LIBRARY_DIRS}
+    ${PANGOCAIRO_LIBRARY_DIRS}
 )
+list(REMOVE_DUPLICATES TINYDVD_CORE_LINK_DIRS)
 
+target_link_libraries(tinydvd_core PRIVATE ${TINYDVD_CORE_LINK_LIBS})
+target_link_directories(tinydvd_core PRIVATE ${TINYDVD_CORE_LINK_DIRS})
 target_compile_options(tinydvd_core PRIVATE -Wall -Wextra)
+
+set(TINYDVD_INSTALL_LIBDIR "/usr/local/lib/tinydvd" CACHE PATH "Installed TinyDVD runtime directory")
 
 add_executable(tinydvd src/main.c)
 add_dependencies(tinydvd tinydvd_core)
@@ -121,6 +111,7 @@ target_compile_definitions(tinydvd PRIVATE
     TINYDVD_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     TINYDVD_BINARY_DIR="${CMAKE_BINARY_DIR}"
     TINYDVD_CORE_LIB="$<TARGET_FILE:tinydvd_core>"
+    TINYDVD_INSTALL_LIBDIR="${TINYDVD_INSTALL_LIBDIR}"
 )
 target_compile_options(tinydvd PRIVATE -Wall -Wextra)
 
@@ -162,6 +153,28 @@ include(GNUInstallDirs)
 
 install(TARGETS tinydvd
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(TARGETS tinydvd_core
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
+    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
+)
+
+install(FILES
+    scripts/tinydvd_app.py
+    scripts/tinydvd_core.py
+    scripts/tinydvd_desktop_ui.py
+    scripts/tinydvd_library.py
+    scripts/tinydvd_metadata.py
+    scripts/tinydvd_web_server.py
+    scripts/convert-to-tinydvd.py
+    scripts/tinydvd-thumbnailer.py
+    scripts/tinydvd-set-thumbnail.py
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd/scripts
+)
+
+install(FILES src/web_assets.h
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
 )
 
 install(PROGRAMS scripts/convert-to-tinydvd.py

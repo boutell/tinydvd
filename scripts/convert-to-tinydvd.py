@@ -6,6 +6,8 @@ containers (1 video reference sector per VOBU + NV_PCK + SPU) and
 companion H.264 + AAC Matroska (.mkv) streams.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import glob

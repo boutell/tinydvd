@@ -4,6 +4,8 @@ Pure-Python library catalog, .tdvd archive reader, OS-native directory watcher
 (kqueue on macOS, inotify on Linux), optical drive detector, and DVD import job manager.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 import ctypes
 import ctypes.util

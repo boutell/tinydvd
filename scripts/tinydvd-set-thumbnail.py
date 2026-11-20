@@ -4,6 +4,8 @@ tinydvd-set-thumbnail: Embed or update thumbnail images in .tdvd archives or dir
 Eliminates on-the-fly thumbnail generation in file managers like Nautilus.
 """
 
+from __future__ import annotations
+
 import sys
 import os
 import argparse

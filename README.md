@@ -26,7 +26,7 @@ Run the automatic dependency installer for macOS or Linux:
 
 #### macOS (Homebrew)
 ```bash
-brew install cmake pkg-config libdvdnav libdvdread libdvdcss dvdbackup mpv sdl2 ffmpeg python3
+brew install cmake pkg-config libdvdnav libdvdread libdvdcss dvdbackup mpv sdl2 cairo pango zlib ffmpeg python@3.12
 ```
 
 #### Linux (Debian / Ubuntu)
@@ -36,7 +36,8 @@ sudo apt-get install -y \
     build-essential cmake pkg-config \
     libdvdnav-dev libdvdread-dev dvdbackup \
     libmpv-dev libsdl2-dev libgl1-mesa-dev \
-    ffmpeg python3 python3-pip
+    libcairo2-dev libpango1.0-dev zlib1g-dev \
+    ffmpeg python3 python3-venv
 ```
 
 #### Linux (Fedora / RHEL)
@@ -45,12 +46,13 @@ sudo dnf install -y \
     gcc gcc-c++ cmake pkgconf-pkg-config \
     libdvdnav-devel libdvdread-devel dvdbackup \
     mpv-libs-devel SDL2-devel mesa-libGL-devel \
+    cairo-devel pango-devel zlib-devel \
     ffmpeg python3
 ```
 
 #### Linux (Arch Linux)
 ```bash
-sudo pacman -S --needed cmake base-devel pkgconf libdvdnav libdvdread dvdbackup mpv sdl2 ffmpeg python
+sudo pacman -S --needed cmake base-devel pkgconf libdvdnav libdvdread dvdbackup mpv sdl2 cairo pango zlib ffmpeg python
 ```
 </details>
 
