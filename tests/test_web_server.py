@@ -47,19 +47,51 @@ from tinydvd_desktop_ui import (
     TinyDVDDesktopUI,
     parse_png_sar,
 )
-from tinydvd_library import TinyDVDLibrary
+from tinydvd_library import TinyDVDLibrary, disc_id_for_path
 from tinydvd_web_server import TinyDVDWebServer, compute_ws_accept_key
 
+TEST_PASSWORD = "correct horse battery staple"
+_TEST_CACHE_DIR = tempfile.mkdtemp(prefix="tinydvd_test_cache_")
+_login_cookies: dict[int, str] = {}
 
-def http_get(server: TinyDVDWebServer, path: str, method: str = "GET", headers: dict | None = None):
+
+def make_server(core: TinyDVDCore, target: str, **kwargs) -> TinyDVDWebServer:
+    return TinyDVDWebServer(core, target, TEST_PASSWORD, bind_addr="127.0.0.1", listen=False,
+                            announce=False, cache_dir=_TEST_CACHE_DIR, **kwargs)
+
+
+def login_cookie(server: TinyDVDWebServer) -> str:
+    """Log in once per server and return the Cookie header value."""
+    if id(server) not in _login_cookies:
+        st, hdrs, _ = http_get(server, "/login", method="POST", auth=False,
+                               body=f"password={quote(TEST_PASSWORD)}".encode("ascii"),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert st == 303, st
+        _login_cookies[id(server)] = hdrs["set-cookie"].split(";", 1)[0]
+    return _login_cookies[id(server)]
+
+
+def http_post_json(server: TinyDVDWebServer, path: str, obj: dict, headers: dict | None = None):
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(headers or {})
+    return http_get(server, path, method="POST", body=json.dumps(obj).encode("utf-8"), headers=hdrs)
+
+
+def http_get(server: TinyDVDWebServer, path: str, method: str = "GET", headers: dict | None = None,
+             body: bytes = b"", auth: bool = True):
+    hdrs = dict(headers or {})
+    if auth:
+        hdrs["Cookie"] = login_cookie(server)
+    if body:
+        hdrs["Content-Length"] = str(len(body))
     c_sock, s_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     c_sock.settimeout(10.0)
     t = server.handle_client_socket(s_sock)
     try:
         hdr_lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1"]
-        for k, v in (headers or {}).items():
+        for k, v in hdrs.items():
             hdr_lines.append(f"{k}: {v}")
-        raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("ascii")
+        raw_req = ("\r\n".join(hdr_lines) + "\r\n\r\n").encode("ascii") + body
         c_sock.sendall(raw_req)
 
         chunks: list[bytes] = []
@@ -88,12 +120,14 @@ def http_get(server: TinyDVDWebServer, path: str, method: str = "GET", headers: 
 
 
 def ws_connect(server: TinyDVDWebServer, path: str, key: str = "dGhlIHNhbXBsZSBub25jZQ=="):
+    cookie = login_cookie(server)
     c_sock, s_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     c_sock.settimeout(5.0)
     t = server.handle_client_socket(s_sock)
     req = (
         f"GET {path} HTTP/1.1\r\n"
         "Host: 127.0.0.1\r\n"
+        f"Cookie: {cookie}\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Key: {key}\r\n"
@@ -155,7 +189,7 @@ def test_spu_png_encoding(core: TinyDVDCore) -> None:
 
 def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None:
     print("Testing Web Server HTTP endpoints, Range streaming & WebSocket...")
-    server = TinyDVDWebServer(core, tdvd_path, bind_addr="127.0.0.1", port=8991, listen=False)
+    server = make_server(core, tdvd_path)
     try:
         # 1. GET /
         st, hdrs, body = http_get(server, "/")
@@ -185,8 +219,8 @@ def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None
 
         # 4. WebSocket /ws
         sock, tid = ws_connect(server, "/ws")
-        ws_send_masked_text(sock, '{"type":"key","key":"Up"}')
-        ws_send_masked_text(sock, '{"type":"key","key":"Activate"}')
+        ws_send_masked_text(sock, '{"type":"key","key":"up"}')
+        ws_send_masked_text(sock, '{"type":"key","key":"activate"}')
         time.sleep(0.05)
         sock.close()
         tid.join(timeout=5.0)
@@ -216,8 +250,8 @@ def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None
         # 7. Multi-Session isolation
         s1, t1 = ws_connect(server, "/ws?session=user_alice")
         s2, t2 = ws_connect(server, "/ws?session=user_bob")
-        ws_send_masked_text(s1, '{"type":"key","key":"Menu"}')
-        ws_send_masked_text(s2, '{"type":"key","key":"Down"}')
+        ws_send_masked_text(s1, '{"type":"key","key":"menu"}')
+        ws_send_masked_text(s2, '{"type":"key","key":"down"}')
         time.sleep(0.05)
         s1.close()
         s2.close()
@@ -240,7 +274,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
                 f.write(txt)
         os.mkdir(os.path.join(test_dir, "OtherFolder"))
 
-        server = TinyDVDWebServer(core, test_dir, bind_addr="127.0.0.1", port=8992, listen=False)
+        server = make_server(core, test_dir)
         try:
             st, _, body = http_get(server, "/api/library")
             assert st == 200
@@ -255,7 +289,8 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
             sse_sock.settimeout(5.0)
             sse_tid = server.handle_client_socket(s_sock)
             try:
-                sse_sock.sendall(b"GET /api/library/events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                sse_sock.sendall(b"GET /api/library/events HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: "
+                                 + login_cookie(server).encode("ascii") + b"\r\n\r\n")
                 sse_buf = b""
                 deadline = time.time() + 2.0
                 while b": connected" not in sse_buf and time.time() < deadline:
@@ -295,7 +330,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
             assert st == 200
             data = json.loads(body.decode("utf-8"))
             ids = [it["id"] for it in data["items"]]
-            assert "Dune_SSE_Test_tdvd" in ids
+            assert disc_id_for_path("Dune_SSE_Test.tdvd") in ids
             print("  - OS Watcher + SSE Push: OK (kqueue/inotify detected new .tdvd and pushed library_update)")
         finally:
             server.stop()
@@ -344,14 +379,14 @@ def test_import_dvd_workflow(core: TinyDVDCore) -> None:
                 "genres": "Sci-Fi",
             },
         )
-        server = TinyDVDWebServer(core, lib_dir, bind_addr="127.0.0.1", port=8993, listen=False)
+        server = make_server(core, lib_dir, allow_import=True)
         try:
             st, _, body = http_get(server, "/api/import/status")
             assert st == 200
             assert json.loads(body)["state"] == "idle"
 
-            start_uri = f"/api/import/start?source={quote(src_dir)}&title=Dune%20Imported&skip_enrichment=1"
-            st, _, body = http_get(server, start_uri, method="POST")
+            st, _, body = http_post_json(server, "/api/import/start",
+                                         {"source": src_dir, "title": "Dune Imported", "skip_enrichment": True})
             assert st == 200
             assert json.loads(body)["status"] == "started"
 
@@ -381,20 +416,23 @@ def test_duplicate_dvd_import_disambiguation(core: TinyDVDCore) -> None:
         create_dummy_converted_dir(src1_dir, {"title": "Dune Test", "year": 1984, "director": "David Lynch"})
         create_dummy_converted_dir(src2_dir, {"title": "Dune Test", "year": 2021, "director": "Denis Villeneuve"})
 
-        server = TinyDVDWebServer(core, lib_dir, bind_addr="127.0.0.1", port=8994, listen=False)
+        server = make_server(core, lib_dir, allow_import=True)
         try:
             # 1. Dune Test.tdvd (1984)
-            st, _, _ = http_get(server, f"/api/import/start?source={quote(src1_dir)}&title=Dune%20Test&skip_enrichment=1")
+            st, _, _ = http_post_json(server, "/api/import/start",
+                                      {"source": src1_dir, "title": "Dune Test", "skip_enrichment": True})
             assert st == 200
             poll_import_until_done(server)
 
             # 2. Dune Test (2021).tdvd
-            st, _, _ = http_get(server, f"/api/import/start?source={quote(src2_dir)}&title=Dune%20Test&skip_enrichment=1")
+            st, _, _ = http_post_json(server, "/api/import/start",
+                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True})
             assert st == 200
             poll_import_until_done(server)
 
             # 3. Dune Test (2021) (2).tdvd
-            st, _, _ = http_get(server, f"/api/import/start?source={quote(src2_dir)}&title=Dune%20Test&skip_enrichment=1")
+            st, _, _ = http_post_json(server, "/api/import/start",
+                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True})
             assert st == 200
             res3 = poll_import_until_done(server)
             assert res3["result_title"] == "Dune Test (2)"
@@ -558,6 +596,49 @@ def test_desktop_ui_helpers(core: TinyDVDCore) -> None:
     print("  - Python Desktop UI helpers: OK")
 
 
+def test_auth_and_request_rules(core: TinyDVDCore, tdvd_path: str) -> None:
+    print("Testing web login, cross-site protection and the import switch...")
+    lib_dir = tempfile.mkdtemp(prefix="tinydvd_test_auth_")
+    server = make_server(core, lib_dir)
+    try:
+        st, _, _ = http_get(server, "/api/library", auth=False)
+        assert st == 401
+        st, hdrs, _ = http_get(server, "/", auth=False)
+        assert st == 303 and hdrs.get("location") == "/login"
+        st, _, body = http_get(server, "/login", auth=False)
+        assert st == 200 and b'type="password"' in body
+        st, _, _ = http_get(server, "/api/library", auth=False, headers={"Cookie": "tinydvd_auth=1.2.3"})
+        assert st == 401
+        st, _, _ = http_get(server, "/login", method="POST", auth=False, body=b"password=wrong",
+                            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        assert st == 401
+        print("  - Login required: OK (401 for API, redirect for pages, forged and wrong logins refused)")
+
+        st, _, _ = http_post_json(server, "/api/play", {"disc": "x"}, headers={"Origin": "http://evil.example"})
+        assert st == 403
+        st, _, _ = http_get(server, "/api/play")
+        assert st == 404  # state changes are POST-only
+        print("  - Cross-site POST refused, GET can't change state: OK")
+
+        st, _, body = http_get(server, "/api/library")
+        assert json.loads(body)["import_enabled"] is False
+        st, _, _ = http_post_json(server, "/api/import/start", {"source": "/"})
+        assert st == 403
+        st, _, body = http_get(server, "/api/import/status")
+        assert json.loads(body) ["enabled"] is False
+        print("  - Web import off by default: OK")
+
+        st, hdrs, _ = http_get(server, "/logout", method="POST", body=b"{}",
+                               headers={"Content-Type": "application/json"})
+        assert st == 200 and "Max-Age=0" in hdrs.get("set-cookie", "")
+        st, _, _ = http_get(server, "/api/library")
+        assert st == 401
+        print("  - Logout revokes the login: OK")
+    finally:
+        server.stop()
+        shutil.rmtree(lib_dir, ignore_errors=True)
+
+
 def main() -> int:
     tdvd = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO_ROOT, "tinydvds", "Dune.tdvd")
     print("=== Running TinyDVD Web Server & Protocol Tests ===")
@@ -565,10 +646,15 @@ def main() -> int:
     test_sha1_and_websocket_key()
     test_spu_png_encoding(core)
     test_desktop_ui_helpers(core)
-    test_http_and_websocket_endpoints(core, tdvd)
-    test_library_directory_filtering_and_sse(core, tdvd)
+    test_auth_and_request_rules(core, tdvd)
+    if os.path.isfile(tdvd):
+        test_http_and_websocket_endpoints(core, tdvd)
+        test_library_directory_filtering_and_sse(core, tdvd)
+    else:
+        print(f"Skipping playback and streaming tests ({tdvd} not found)")
     test_import_dvd_workflow(core)
     test_duplicate_dvd_import_disambiguation(core)
+    shutil.rmtree(_TEST_CACHE_DIR, ignore_errors=True)
     print("All Web Server tests completed successfully!")
     return 0
 

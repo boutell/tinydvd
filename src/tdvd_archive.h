@@ -17,7 +17,7 @@ extern "C" {
 bool tdvd_is_archive_path(const char *path);
 
 /**
- * Open a .tdvd / .tinydvd uncompressed ZIP archive and parse its Central Directory in O(1).
+ * Open a .tdvd / .tinydvd uncompressed ZIP archive and read its central directory (the index of members).
  */
 tdvd_archive_t *tdvd_archive_open(const char *archive_path);
 

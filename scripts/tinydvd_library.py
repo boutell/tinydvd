@@ -6,11 +6,10 @@ Pure-Python library catalog, .tdvd archive reader, OS-native directory watcher
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import ctypes
 import ctypes.util
 import hashlib
-import json
 import os
 import re
 import select
@@ -23,7 +22,9 @@ import sys
 import tempfile
 import threading
 import time
-import zipfile
+import traceback
+
+import tinydvd_archive
 
 
 IMPORT_IDLE = 0
@@ -33,6 +34,7 @@ IMPORT_DONE = 3
 IMPORT_ERROR = 4
 
 IMPORT_MAX_LOGS = 64
+SOURCE_DETECT_TTL_SEC = 5.0
 
 IMPORT_STATE_NAMES = {
     IMPORT_IDLE: "idle",
@@ -44,16 +46,23 @@ IMPORT_STATE_NAMES = {
 
 
 def sanitize_id(name: str) -> str:
+    """Keep only characters that are safe in URLs and file names."""
     if not name:
         return ""
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)[:127]
 
 
-def is_tdvd_file(path: str) -> bool:
-    if not path:
-        return False
-    low = path.lower()
-    return low.endswith(".tdvd") or low.endswith(".tinydvd")
+def disc_id_for_path(path: str) -> str:
+    """
+    A stable, URL-safe ID for a disc. The readable part comes from the file
+    name; the hash of the full name keeps "Alien: X" and "Alien_ X" apart.
+    """
+    base = os.path.basename(path.rstrip("/")) or path
+    digest = hashlib.blake2b(base.encode("utf-8", errors="surrogateescape"), digest_size=4).hexdigest()
+    return f"{sanitize_id(tinydvd_archive.strip_tdvd_extension(base))[:100]}-{digest}"
+
+
+is_tdvd_file = tinydvd_archive.is_tdvd_path
 
 
 def is_dvd_dir(dir_path: str) -> bool:
@@ -81,14 +90,6 @@ def _flatten_meta_field(val) -> str:
     if val is None:
         return ""
     return str(val).strip()
-
-
-def _find_zip_member(zf: zipfile.ZipFile, target_basename: str):
-    target_low = target_basename.lower()
-    for info in zf.infolist():
-        if os.path.basename(info.filename).lower() == target_low:
-            return info
-    return None
 
 
 @dataclass
@@ -217,99 +218,38 @@ def _compute_dir_signature(target_path: str, is_library: bool) -> int:
     return int.from_bytes(h.digest(), "little")
 
 
-def _load_item(path: str, title_override: str | None = None) -> CatalogItem:
+def _load_item(path: str) -> CatalogItem:
     base = os.path.basename(path.rstrip("/")) or path
-    item_id = sanitize_id(base)
-
-    if title_override and title_override.strip():
-        title = title_override.strip()[:255]
-    else:
-        title = base
-        for ext in (".tdvd", ".tinydvd"):
-            if title.lower().endswith(ext):
-                title = title[: -len(ext)]
-                break
+    title = tinydvd_archive.strip_tdvd_extension(base)
 
     size_bytes = 0
     try:
         size_bytes = os.path.getsize(path)
     except OSError:
         pass
-    size_str = format_size(size_bytes)
 
-    has_thumbnail = False
+    thumb = tinydvd_archive.locate_member(path, tinydvd_archive.THUMBNAIL_NAME)
+    meta = tinydvd_archive.read_metadata(path)
+
     year = 0
-    director = ""
-    cast = ""
-    genres = ""
-    overview = ""
-
-    def apply_meta(m: dict) -> None:
-        nonlocal title, year, director, cast, genres, overview
-        if not isinstance(m, dict):
-            return
-        t = str(m.get("title") or "").strip()
-        if t:
-            title = t[:255]
-        try:
-            y = int(m.get("year") or 0)
-            if y > 0:
-                year = y
-        except (TypeError, ValueError):
-            pass
-        if not director:
-            director = _flatten_meta_field(m.get("director"))[:127]
-        if not cast:
-            cast = _flatten_meta_field(m.get("cast"))[:1023]
-        if not genres:
-            genres = _flatten_meta_field(m.get("genres"))[:127]
-        if not overview:
-            overview = _flatten_meta_field(m.get("overview"))[:1023]
-
-    if is_tdvd_file(path) and zipfile.is_zipfile(path):
-        try:
-            with zipfile.ZipFile(path, "r") as zf:
-                t_info = _find_zip_member(zf, "thumbnail.png")
-                has_thumbnail = t_info is not None and t_info.file_size > 0
-                m_info = _find_zip_member(zf, "metadata.json")
-                if m_info and 0 < m_info.file_size < 65536:
-                    meta = json.loads(zf.read(m_info).decode("utf-8", errors="replace"))
-                    apply_meta(meta)
-        except Exception:
-            pass
-    elif os.path.isdir(path):
-        tpath = os.path.join(path, "thumbnail.png")
-        try:
-            has_thumbnail = os.path.isfile(tpath) and os.path.getsize(tpath) > 0
-        except OSError:
-            pass
-
-    if not director:
-        if os.path.isdir(path):
-            sidecar = os.path.join(path, "metadata.json")
-        else:
-            root_no_ext, _ = os.path.splitext(path)
-            sidecar = root_no_ext + ".json"
-        if os.path.isfile(sidecar):
-            try:
-                if 0 < os.path.getsize(sidecar) < 65536:
-                    with open(sidecar, "r", encoding="utf-8", errors="replace") as sf:
-                        apply_meta(json.load(sf))
-            except Exception:
-                pass
+    try:
+        year = max(0, int(meta.get("year") or 0))
+    except (TypeError, ValueError):
+        pass
+    meta_title = str(meta.get("title") or "").strip()
 
     return CatalogItem(
-        id=item_id,
-        title=title,
+        id=disc_id_for_path(path),
+        title=(meta_title or title)[:255],
         path=path,
         size_bytes=size_bytes,
-        size_str=size_str,
-        has_thumbnail=has_thumbnail,
+        size_str=format_size(size_bytes),
+        has_thumbnail=bool(thumb and thumb.size > 0),
         year=year,
-        director=director,
-        cast=cast,
-        genres=genres,
-        overview=overview,
+        director=_flatten_meta_field(meta.get("director"))[:127],
+        cast=_flatten_meta_field(meta.get("cast"))[:1023],
+        genres=_flatten_meta_field(meta.get("genres"))[:127],
+        overview=_flatten_meta_field(meta.get("overview"))[:1023],
     )
 
 
@@ -351,6 +291,8 @@ class TinyDVDLibrary:
         self.imp_result_disc_path: str = ""
         self.imp_result_title: str = ""
         self.imp_logs: list[str] = []
+        self._detected_source: tuple[str, str] = ("", "")
+        self._detected_at: float = 0.0
 
         self.rescan()
 
@@ -466,7 +408,8 @@ class TinyDVDLibrary:
             try:
                 changed_cb()
             except Exception:
-                pass
+                # A UI callback failing must not stop the watcher thread, but say so
+                traceback.print_exc()
 
     def check_for_changes(self) -> bool:
         with self.catalog_lock:
@@ -686,71 +629,18 @@ class TinyDVDLibrary:
             self.check_for_changes()
 
     def read_thumbnail(self, disc_path: str) -> bytes | None:
-        if not disc_path:
-            return None
-        if is_tdvd_file(disc_path) and zipfile.is_zipfile(disc_path):
-            try:
-                with zipfile.ZipFile(disc_path, "r") as zf:
-                    info = _find_zip_member(zf, "thumbnail.png")
-                    if info and 0 < info.file_size < 16 * 1024 * 1024:
-                        return zf.read(info)
-            except Exception:
-                return None
-        if os.path.isdir(disc_path):
-            tpath = os.path.join(disc_path, "thumbnail.png")
-            try:
-                if os.path.isfile(tpath) and 0 < os.path.getsize(tpath) < 16 * 1024 * 1024:
-                    with open(tpath, "rb") as f:
-                        return f.read()
-            except OSError:
-                return None
-        return None
+        return tinydvd_archive.read_thumbnail(disc_path) if disc_path else None
 
-    def get_mkv_slice(self, disc_path: str, mkv_name: str):
-        """
-        Locate an embedded .mkv inside a .tdvd archive (returning raw byte range
-        or zip entry) or inside an unpacked directory.
-        """
-        if not disc_path or not mkv_name:
-            return None
-        if is_tdvd_file(disc_path) and zipfile.is_zipfile(disc_path):
-            try:
-                with zipfile.ZipFile(disc_path, "r") as zf, open(disc_path, "rb") as raw:
-                    info = _find_zip_member(zf, mkv_name)
-                    if not info:
-                        return None
-                    if info.compress_type == zipfile.ZIP_STORED:
-                        raw.seek(info.header_offset)
-                        hdr = raw.read(30)
-                        if len(hdr) < 30:
-                            return None
-                        name_len, extra_len = struct.unpack("<HH", hdr[26:30])
-                        data_offset = info.header_offset + 30 + name_len + extra_len
-                        return ("slice", disc_path, data_offset, info.file_size)
-                    return ("zip", disc_path, info.filename, info.file_size)
-            except Exception:
-                return None
-        if os.path.isdir(disc_path):
-            cand = os.path.join(disc_path, mkv_name)
-            if os.path.isfile(cand):
-                return ("file", cand, 0, os.path.getsize(cand))
-            low = mkv_name.lower()
-            try:
-                for name in os.listdir(disc_path):
-                    if name.lower() == low:
-                        full = os.path.join(disc_path, name)
-                        if os.path.isfile(full):
-                            return ("file", full, 0, os.path.getsize(full))
-            except OSError:
-                pass
-        return None
+    def locate_video(self, disc_path: str, mkv_name: str) -> tinydvd_archive.MemberLocation | None:
+        """Where an .mkv video's bytes are, inside an archive or a directory."""
+        return tinydvd_archive.locate_member(disc_path, mkv_name)
 
     def _notify_import_change(self) -> None:
         if self.on_import_change:
             try:
                 self.on_import_change()
             except Exception:
-                pass
+                traceback.print_exc()
 
     def _append_log(self, line: str) -> None:
         clean = (line or "").rstrip("\r\n")
@@ -761,8 +651,16 @@ class TinyDVDLibrary:
             if len(self.imp_logs) > IMPORT_MAX_LOGS:
                 self.imp_logs = self.imp_logs[-IMPORT_MAX_LOGS:]
 
+    def _default_source(self) -> tuple[str, str]:
+        """detect_default_source(), at most every few seconds: it walks /media."""
+        now = time.monotonic()
+        if now - self._detected_at > SOURCE_DETECT_TTL_SEC:
+            self._detected_source = detect_default_source()
+            self._detected_at = now
+        return self._detected_source
+
     def get_import_status(self) -> dict:
-        def_src, def_title = detect_default_source()
+        def_src, def_title = self._default_source()
         with self.import_lock:
             elapsed = int(time.time() - self.imp_start_time) if self.imp_start_time > 0 else 0
             return {
@@ -784,9 +682,11 @@ class TinyDVDLibrary:
             }
 
     def start_import(self, source: str, title: str = "", skip_enrichment: bool = False) -> tuple[bool, str]:
-        src = (source or "").strip()
+        src = os.path.expanduser((source or "").strip())
         if not src:
             return False, "Missing DVD source path."
+        if not os.path.exists(src):
+            return False, f"No such file, folder or drive: {src}"
 
         scripts_dir = os.path.dirname(os.path.abspath(__file__))
         convert_script = os.path.join(scripts_dir, "convert-to-tinydvd.py")
@@ -845,6 +745,38 @@ class TinyDVDLibrary:
         t.start()
         return True, ""
 
+    def _run_import_step(self, cmd: list[str], on_line) -> int:
+        """
+        Run one import step, streaming its output to on_line. Registers the
+        process under the lock, so a cancel can't slip in between starting it
+        and being able to kill it. Returns its exit status.
+        """
+        with self.import_lock:
+            if self.imp_cancel_requested:
+                raise RuntimeError("Import cancelled.")
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+                start_new_session=True,
+            )
+            self.imp_proc = proc
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    on_line(line.rstrip("\r\n"))
+            rc = proc.wait()
+        finally:
+            with self.import_lock:
+                self.imp_proc = None
+                cancelled = self.imp_cancel_requested
+        if cancelled:
+            raise RuntimeError("Import cancelled.")
+        return rc
+
     def _import_worker(
         self, src: str, desired_output: str, stem: str, convert_script: str, skip_enrichment: bool
     ) -> None:
@@ -874,27 +806,11 @@ class TinyDVDLibrary:
                 self._append_log(f">>> Running dvdbackup -M -i {src} -o {rip_tmp_dir}")
                 self._notify_import_change()
 
-                proc = subprocess.Popen(
-                    [dvdbackup_bin, "-M", "-i", src, "-o", rip_tmp_dir],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="replace",
-                    start_new_session=True,
-                )
-                with self.import_lock:
-                    self.imp_proc = proc
-                if proc.stdout:
-                    for line in proc.stdout:
-                        self._append_log(line)
-                        self._notify_import_change()
-                rc = proc.wait()
-                with self.import_lock:
-                    self.imp_proc = None
-                    cancelled = self.imp_cancel_requested
-                if cancelled:
-                    raise RuntimeError("Import cancelled.")
+                def on_rip_line(line: str) -> None:
+                    self._append_log(line)
+                    self._notify_import_change()
+
+                rc = self._run_import_step([dvdbackup_bin, "-M", "-i", src, "-o", rip_tmp_dir], on_rip_line)
                 if rc != 0:
                     raise RuntimeError(f"dvdbackup exited with status {rc}.")
 
@@ -916,46 +832,28 @@ class TinyDVDLibrary:
             if skip_enrichment:
                 cmd.append("--skip-enrichment")
 
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                start_new_session=True,
-            )
-            with self.import_lock:
-                self.imp_proc = proc
+            def on_convert_line(s: str) -> None:
+                nonlocal final_archive
+                self._append_log(s)
+                if s.startswith("[output] Final archive: "):
+                    final_archive = s[len("[output] Final archive: "):].strip()
+                elif s.startswith("[metadata]"):
+                    with self.import_lock:
+                        self.imp_stage_msg = "Looking up movie details..."
+                elif s.startswith("[package]"):
+                    with self.import_lock:
+                        self.imp_stage_msg = "Packaging .tdvd archive..."
+                elif s.startswith("=== "):
+                    with self.import_lock:
+                        self.imp_stage_msg = s.strip("= ").strip()[:200]
+                self._notify_import_change()
 
-            if proc.stdout:
-                for line in proc.stdout:
-                    s = line.rstrip("\r\n")
-                    self._append_log(s)
-                    if s.startswith("[output] Final archive: "):
-                        final_archive = s[len("[output] Final archive: "):].strip()
-                    elif s.startswith("[metadata]"):
-                        with self.import_lock:
-                            self.imp_stage_msg = "Enriching metadata..."
-                    elif s.startswith("[package]"):
-                        with self.import_lock:
-                            self.imp_stage_msg = "Packaging .tdvd archive..."
-                    elif s.startswith("=== "):
-                        with self.import_lock:
-                            self.imp_stage_msg = s.strip("= ").strip()[:200]
-                    self._notify_import_change()
-
-            rc = proc.wait()
-            with self.import_lock:
-                self.imp_proc = None
-                cancelled = self.imp_cancel_requested
-            if cancelled:
-                raise RuntimeError("Import cancelled.")
+            rc = self._run_import_step(cmd, on_convert_line)
             if rc != 0:
                 raise RuntimeError(f"convert-to-tinydvd failed with exit status {rc}.")
 
             self.rescan()
-            res_id = sanitize_id(os.path.basename(final_archive))
+            res_id = disc_id_for_path(final_archive)
             matched = self.find_by_id(res_id)
             res_title = matched.title if matched else stem
 

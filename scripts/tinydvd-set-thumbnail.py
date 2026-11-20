@@ -10,21 +10,17 @@ import sys
 import os
 import argparse
 import subprocess
-import zipfile
 import tempfile
 import glob
 
+import tinydvd_archive
+from tinydvd_archive import THUMBNAIL_NAME
+
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
-THUMBNAIL_CANDIDATES = ("thumbnail.png", "thumbnail.jpg", "cover.png", "cover.jpg", "poster.jpg", "poster.png")
 
 
-def is_tdvd_archive(path):
-    if not os.path.isfile(path):
-        return False
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".tdvd", ".tinydvd", ".tvd"):
-        return True
-    return zipfile.is_zipfile(path)
+def is_package(path):
+    return os.path.isdir(path) or tinydvd_archive.is_archive(path)
 
 
 def convert_image_to_png(input_path):
@@ -47,7 +43,7 @@ def convert_image_to_png(input_path):
         if os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
-            except Exception:
+            except OSError:
                 pass
     return None
 
@@ -91,73 +87,30 @@ def extract_frame(target, time_offset=None, verbose=False):
 
 
 def inspect_thumbnail(target):
-    """Check if target already has an embedded thumbnail."""
-    if os.path.isdir(target):
-        for cand in THUMBNAIL_CANDIDATES:
-            p = os.path.join(target, cand)
-            if os.path.isfile(p) and os.path.getsize(p) > 0:
-                return cand, os.path.getsize(p)
-        return None, 0
-
-    if is_tdvd_archive(target):
-        try:
-            with zipfile.ZipFile(target, "r") as zf:
-                name_map = {n.lower(): n for n in zf.namelist()}
-                for cand in THUMBNAIL_CANDIDATES:
-                    real = name_map.get(cand)
-                    if real:
-                        info = zf.getinfo(real)
-                        return real, info.file_size
-        except Exception:
-            return None, 0
+    """(name, size) of the target's embedded thumbnail, or (None, 0)."""
+    loc = tinydvd_archive.locate_member(target, THUMBNAIL_NAME)
+    if loc and loc.size > 0:
+        return THUMBNAIL_NAME, loc.size
     return None, 0
 
 
 def process_target(target, custom_img_bytes=None, time_offset=None, force=False, verbose=False):
-    """Add or update thumbnail in target (.tdvd file or directory)."""
+    """Add or update the thumbnail in target (.tdvd file or directory)."""
+    if not is_package(target):
+        return False, "not a .tdvd archive or TinyDVD directory"
+
     existing_name, existing_size = inspect_thumbnail(target)
     if existing_name and not force:
         return False, f"already has thumbnail '{existing_name}' ({existing_size // 1024} KB); use --force to overwrite"
 
     img_data = custom_img_bytes
+    if img_data is None:
+        img_data = extract_frame(target, time_offset, verbose)
+        if not img_data:
+            return False, "couldn't extract a frame from its videos"
 
-    if os.path.isdir(target):
-        if img_data is None:
-            img_data = extract_frame(target, time_offset, verbose)
-            if not img_data:
-                return False, "couldn't extract a frame from its videos"
-
-        dest = os.path.join(target, "thumbnail.png")
-        with open(dest, "wb") as f:
-            f.write(img_data)
-        return True, f"thumbnail.png created ({len(img_data) // 1024} KB)"
-
-    elif is_tdvd_archive(target):
-        if img_data is None:
-            img_data = extract_frame(target, time_offset, verbose)
-            if not img_data:
-                return False, "couldn't extract a frame from its videos"
-
-        # Embed thumbnail.png into ZIP archive uncompressed (ZIP_STORED)
-        with zipfile.ZipFile(target, "a") as zf:
-            # If overwriting, remove existing candidate entries from central directory list
-            for cand in THUMBNAIL_CANDIDATES:
-                matches = [info for info in zf.filelist if info.filename.lower() == cand]
-                for m in matches:
-                    zf.filelist.remove(m)
-                    if m.filename in zf.NameToInfo:
-                        del zf.NameToInfo[m.filename]
-
-            zinfo = zipfile.ZipInfo(filename="thumbnail.png")
-            zinfo.compress_type = zipfile.ZIP_STORED
-            zinfo.file_size = len(img_data)
-            zinfo.external_attr = 0o644 << 16
-            zf.writestr(zinfo, img_data)
-
-        return True, f"thumbnail.png embedded ({len(img_data) // 1024} KB)"
-
-    else:
-        return False, "not a valid .tdvd archive or directory"
+    tinydvd_archive.write_members(target, {THUMBNAIL_NAME: img_data})
+    return True, f"{THUMBNAIL_NAME} saved ({len(img_data) // 1024} KB)"
 
 
 def main():
@@ -202,7 +155,7 @@ def main():
     custom_img_path = args.image
 
     if custom_img_path is None and len(targets) == 2:
-        if (is_tdvd_archive(targets[0]) or os.path.isdir(targets[0])) and os.path.isfile(targets[1]):
+        if is_package(targets[0]) and os.path.isfile(targets[1]):
             ext = os.path.splitext(targets[1])[1].lower()
             if ext in IMAGE_EXTENSIONS:
                 custom_img_path = targets[1]

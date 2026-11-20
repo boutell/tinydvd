@@ -2,7 +2,7 @@
 """
 tinydvd-thumbnailer: FreeDesktop/GNOME thumbnailer for .tdvd packages.
 
-Uses the package's embedded thumbnail.png / cover image when there is one.
+Uses the package's embedded thumbnail.png when there is one.
 Otherwise it picks a frame from the disc's videos:
 
 1. The menu video of the title set that holds the main feature
@@ -21,70 +21,26 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import struct
 import subprocess
 import sys
 import tempfile
-import zipfile
 
-EMBEDDED_CANDIDATES = ["thumbnail.png", "thumbnail.jpg", "cover.png", "cover.jpg", "poster.jpg", "poster.png"]
+import tinydvd_archive
+
 TITLE_VIDEO_RE = re.compile(r"^VTS_(\d\d)_VIDEO\.mkv$", re.IGNORECASE)
 MIN_MENU_BYTES = 100 * 1024
 MENU_OFFSET = 5          # seconds into the menu video, once any fade-in is over
 FEATURE_OFFSET = 30      # seconds into the largest video, past any fade-in
 
 
-def extract_embedded_image(path):
-    """Return the bytes of an embedded thumbnail / cover image, or None."""
-    if os.path.isdir(path):
-        for name in EMBEDDED_CANDIDATES:
-            p = os.path.join(path, name)
-            if os.path.isfile(p):
-                with open(p, "rb") as f:
-                    return f.read()
-        return None
-    if zipfile.is_zipfile(path):
-        with zipfile.ZipFile(path, "r") as zf:
-            name_map = {n.lower(): n for n in zf.namelist()}
-            for cand in EMBEDDED_CANDIDATES:
-                real_name = name_map.get(cand)
-                if real_name:
-                    return zf.read(real_name)
-    return None
-
-
 def list_videos(path):
-    """
-    Return {basename: (size, source)} for the package's .mkv videos, where
-    source is either a URL ffmpeg can open and seek in directly, or
-    ("zip", name) for a compressed archive entry that has to be streamed.
-    """
+    """{basename: (size, MemberLocation)} for the package's .mkv videos."""
     videos = {}
-    if os.path.isdir(path):
-        for name in os.listdir(path):
-            if name.lower().endswith(".mkv"):
-                full = os.path.join(path, name)
-                videos[name] = (os.path.getsize(full), "file:" + os.path.abspath(full))
-        return videos
-    if not zipfile.is_zipfile(path):
-        return videos
-    with zipfile.ZipFile(path, "r") as zf, open(path, "rb") as raw:
-        for info in zf.infolist():
-            name = os.path.basename(info.filename)
-            if not name.lower().endswith(".mkv"):
-                continue
-            if info.compress_type == zipfile.ZIP_STORED:
-                # .tdvd stores videos uncompressed, so ffmpeg can read the
-                # entry's bytes in place and seek without streaming the file
-                raw.seek(info.header_offset)
-                header = raw.read(30)
-                name_len, extra_len = struct.unpack("<HH", header[26:30])
-                start = info.header_offset + 30 + name_len + extra_len
-                end = start + info.file_size
-                source = f"subfile,,start,{start},end,{end},,:file:{os.path.abspath(path)}"
-            else:
-                source = ("zip", info.filename)
-            videos[name] = (info.file_size, source)
+    for name, size in tinydvd_archive.list_members(path).items():
+        if name.lower().endswith(".mkv"):
+            loc = tinydvd_archive.locate_member(path, name)
+            if loc:
+                videos[name] = (size, loc)
     return videos
 
 
@@ -106,8 +62,11 @@ def frame_candidates(videos, time_offset=None):
     return candidates
 
 
-def grab_frame(package, source, seconds, out_path, max_size):
-    """Write one frame at `seconds` to out_path as PNG. Returns True on success."""
+def grab_frame(source, seconds, out_path, max_size):
+    """
+    Write one frame at `seconds` to out_path as PNG. source is an ffmpeg input
+    URL, or a MemberLocation to pipe in. Returns True on success.
+    """
     # Unsqueeze anamorphic DVD frames (e.g. 720x480 SAR 32:27 -> 854x480 SAR 1:1) into square pixels
     unsquish = "scale='round(iw*max(1,if(gt(sar,0),sar,1))/2)*2':'round(ih/min(1,if(gt(sar,0),sar,1))/2)*2',setsar=1"
     if max_size:
@@ -115,27 +74,23 @@ def grab_frame(package, source, seconds, out_path, max_size):
     else:
         vf = ["-vf", unsquish]
     out = ["-frames:v", "1", "-f", "image2", "-c:v", "png", out_path]
-    if isinstance(source, str):
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(seconds), "-i", source] + vf + out
+    url = source if isinstance(source, str) else source.ffmpeg_input()
+    if url:
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(seconds), "-i", url] + vf + out
         ok = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     else:
         # Compressed archive entry: stream it, decoding up to `seconds`
         cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", "pipe:0", "-ss", str(seconds)] + vf + out
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with zipfile.ZipFile(package, "r") as zf, zf.open(source[1]) as stream:
+        try:
+            source.copy_to(proc.stdin)
+        except OSError:
+            pass  # ffmpeg stops reading once it has its frame
+        finally:
             try:
-                while True:
-                    chunk = stream.read(65536)
-                    if not chunk:
-                        break
-                    proc.stdin.write(chunk)
-            except (BrokenPipeError, OSError):
+                proc.stdin.close()
+            except OSError:
                 pass
-            finally:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
         ok = proc.wait() == 0
     return ok and os.path.exists(out_path) and os.path.getsize(out_path) > 0
 
@@ -146,7 +101,7 @@ def pick_frame(package, out_path, max_size=0, time_offset=None, verbose=False):
     for name, seconds in frame_candidates(videos, time_offset):
         if verbose:
             print(f"  Trying {name} at {seconds}s...", file=sys.stderr)
-        if grab_frame(package, videos[name][1], seconds, out_path, max_size):
+        if grab_frame(videos[name][1], seconds, out_path, max_size):
             return name, seconds
     return None
 
@@ -157,7 +112,7 @@ def write_image(img_bytes, out_path, max_size):
         tmp.write(img_bytes)
         tmp_path = tmp.name
     try:
-        return grab_frame(None, "file:" + tmp_path, 0, out_path, max_size)
+        return grab_frame("file:" + tmp_path, 0, out_path, max_size)
     finally:
         os.unlink(tmp_path)
 
@@ -180,7 +135,7 @@ def main():
     max_size = 0 if args.size == 0 else max(64, min(args.size, 1024))
 
     if not args.frame_only and args.time is None:
-        img = extract_embedded_image(inp)
+        img = tinydvd_archive.read_thumbnail(inp)
         if img and write_image(img, out, max_size):
             sys.exit(0)
 

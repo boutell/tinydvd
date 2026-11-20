@@ -453,44 +453,53 @@ int tdvd_desktop_is_vm_running(tdvd_desktop_ctx_t *ctx) {
     return dvd_vm_bridge_is_running(ctx->bridge) ? 1 : 0;
 }
 
+/* The one table of player actions, shared by the desktop player and web
+ * sessions. Mouse coordinates are in DVD frame pixels. Returns 1 if the
+ * action was recognised and taken. */
+static int dispatch_vm_action(dvd_vm_bridge_t *vm, const char *action, int x, int y, double darg) {
+    static const struct {
+        const char *name;
+        void (*fn)(dvd_vm_bridge_t *);
+    } simple_actions[] = {
+        { "up",           dvd_vm_bridge_up_button },
+        { "down",         dvd_vm_bridge_down_button },
+        { "left",         dvd_vm_bridge_left_button },
+        { "right",        dvd_vm_bridge_right_button },
+        { "activate",     dvd_vm_bridge_activate_button },
+        { "pause",        dvd_vm_bridge_toggle_pause },
+        { "menu",         dvd_vm_bridge_menu },
+        { "prev_chapter", dvd_vm_bridge_prev_chapter },
+        { "next_chapter", dvd_vm_bridge_next_chapter },
+        { "cycle_subs",   dvd_vm_bridge_cycle_subtitles },
+        { "cycle_audio",  dvd_vm_bridge_cycle_audio },
+    };
+    if (!vm || !action) return 0;
+    for (size_t i = 0; i < sizeof(simple_actions) / sizeof(simple_actions[0]); i++) {
+        if (strcmp(action, simple_actions[i].name) == 0) {
+            simple_actions[i].fn(vm);
+            return 1;
+        }
+    }
+    if (strcmp(action, "escape") == 0) return dvd_vm_bridge_escape(vm) ? 1 : 0;
+    if (strcmp(action, "seek_rel") == 0) { dvd_vm_bridge_seek_relative(vm, (int)darg); return 1; }
+    if (strcmp(action, "seek_frac") == 0) { dvd_vm_bridge_seek_fraction(vm, darg); return 1; }
+    if (strcmp(action, "mouse_move") == 0) { dvd_vm_bridge_mouse_move(vm, x, y); return 1; }
+    if (strcmp(action, "mouse_click") == 0) { dvd_vm_bridge_mouse_click(vm, x, y); return 1; }
+    return 0;
+}
+
 int tdvd_desktop_vm_action(tdvd_desktop_ctx_t *ctx, const char *action, int x, int y, double darg) {
     if (!ctx || !ctx->bridge || !action) return 0;
-    dvd_vm_bridge_t *bridge = ctx->bridge;
 
-    if (strcmp(action, "up") == 0) { dvd_vm_bridge_up_button(bridge); return 1; }
-    if (strcmp(action, "down") == 0) { dvd_vm_bridge_down_button(bridge); return 1; }
-    if (strcmp(action, "left") == 0) { dvd_vm_bridge_left_button(bridge); return 1; }
-    if (strcmp(action, "right") == 0) { dvd_vm_bridge_right_button(bridge); return 1; }
-    if (strcmp(action, "activate") == 0) { dvd_vm_bridge_activate_button(bridge); return 1; }
-    if (strcmp(action, "pause") == 0) { dvd_vm_bridge_toggle_pause(bridge); return 1; }
-    if (strcmp(action, "menu") == 0) { dvd_vm_bridge_menu(bridge); return 1; }
-    if (strcmp(action, "escape") == 0) { return dvd_vm_bridge_escape(bridge) ? 1 : 0; }
-    if (strcmp(action, "prev_chapter") == 0) { dvd_vm_bridge_prev_chapter(bridge); return 1; }
-    if (strcmp(action, "next_chapter") == 0) { dvd_vm_bridge_next_chapter(bridge); return 1; }
-    if (strcmp(action, "seek_rel") == 0) { dvd_vm_bridge_seek_relative(bridge, (int)darg); return 1; }
-    if (strcmp(action, "seek_frac") == 0) { dvd_vm_bridge_seek_fraction(bridge, darg); return 1; }
-    if (strcmp(action, "cycle_subs") == 0) { dvd_vm_bridge_cycle_subtitles(bridge); return 1; }
-    if (strcmp(action, "cycle_audio") == 0) { dvd_vm_bridge_cycle_audio(bridge); return 1; }
-
-    if (strcmp(action, "mouse_move") == 0 && ctx->spu && ctx->mpv) {
-        int x_dvd = 0, y_dvd = 0;
-        if (window_to_dvd(ctx->window, mpv_controller_get_display_aspect(ctx->mpv),
-                          spu_compositor_get_frame_height(ctx->spu), x, y, &x_dvd, &y_dvd)) {
-            dvd_vm_bridge_mouse_move(bridge, x_dvd, y_dvd);
-            return 1;
+    /* The desktop passes mouse positions in window pixels */
+    if (strcmp(action, "mouse_move") == 0 || strcmp(action, "mouse_click") == 0) {
+        if (!ctx->spu || !ctx->mpv) return 0;
+        if (!window_to_dvd(ctx->window, mpv_controller_get_display_aspect(ctx->mpv),
+                           spu_compositor_get_frame_height(ctx->spu), x, y, &x, &y)) {
+            return 0;
         }
-        return 0;
     }
-    if (strcmp(action, "mouse_click") == 0 && ctx->spu && ctx->mpv) {
-        int x_dvd = 0, y_dvd = 0;
-        if (window_to_dvd(ctx->window, mpv_controller_get_display_aspect(ctx->mpv),
-                          spu_compositor_get_frame_height(ctx->spu), x, y, &x_dvd, &y_dvd)) {
-            dvd_vm_bridge_mouse_click(bridge, x_dvd, y_dvd);
-            return 1;
-        }
-        return 0;
-    }
-    return 0;
+    return dispatch_vm_action(ctx->bridge, action, x, y, darg);
 }
 
 /* =========================================================================
@@ -1318,8 +1327,17 @@ void tdvd_vm_session_destroy(tdvd_vm_session_t *s) {
 int tdvd_vm_session_load(tdvd_vm_session_t *s, const char *disc_path, const char *disc_id) {
     if (!s || !disc_path || !disc_path[0]) return -1;
 
+    /* Stop the old VM without holding s->lock: stopping joins its thread, and
+     * that thread may be blocked in a callback that is waiting on a client */
+    pthread_mutex_lock(&s->lock);
+    dvd_vm_bridge_t *old_vm = s->vm;
+    s->vm = NULL;
+    pthread_mutex_unlock(&s->lock);
+    if (old_vm) dvd_vm_bridge_destroy(old_vm);
+
     pthread_mutex_lock(&s->lock);
     if (s->vm) {
+        /* A concurrent load won the race; replace its VM */
         dvd_vm_bridge_destroy(s->vm);
         s->vm = NULL;
     }
@@ -1350,23 +1368,8 @@ int tdvd_vm_session_load(tdvd_vm_session_t *s, const char *disc_path, const char
 void tdvd_vm_session_dispatch_action(tdvd_vm_session_t *s, const char *action, int x, int y) {
     if (!s || !action) return;
     pthread_mutex_lock(&s->lock);
-    dvd_vm_bridge_t *vm = s->vm;
-    if (vm) {
-        if (strcmp(action, "Up") == 0) dvd_vm_bridge_up_button(vm);
-        else if (strcmp(action, "Down") == 0) dvd_vm_bridge_down_button(vm);
-        else if (strcmp(action, "Left") == 0) dvd_vm_bridge_left_button(vm);
-        else if (strcmp(action, "Right") == 0) dvd_vm_bridge_right_button(vm);
-        else if (strcmp(action, "Activate") == 0) dvd_vm_bridge_activate_button(vm);
-        else if (strcmp(action, "Menu") == 0) dvd_vm_bridge_menu(vm);
-        else if (strcmp(action, "Escape") == 0) dvd_vm_bridge_escape(vm);
-        else if (strcmp(action, "TogglePause") == 0) dvd_vm_bridge_toggle_pause(vm);
-        else if (strcmp(action, "PrevChapter") == 0) dvd_vm_bridge_prev_chapter(vm);
-        else if (strcmp(action, "NextChapter") == 0) dvd_vm_bridge_next_chapter(vm);
-        else if (strcmp(action, "CycleSubtitles") == 0) dvd_vm_bridge_cycle_subtitles(vm);
-        else if (strcmp(action, "CycleAudio") == 0) dvd_vm_bridge_cycle_audio(vm);
-        else if (strcmp(action, "mouse_move") == 0) dvd_vm_bridge_mouse_move(vm, x, y);
-        else if (strcmp(action, "mouse_click") == 0) dvd_vm_bridge_mouse_click(vm, x, y);
-    }
+    /* Web clients send mouse positions already in DVD frame pixels */
+    dispatch_vm_action(s->vm, action, x, y, 0.0);
     pthread_mutex_unlock(&s->lock);
 }
 

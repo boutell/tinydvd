@@ -17,23 +17,12 @@ import subprocess
 import shutil
 import tempfile
 import contextlib
-import zipfile
 import json
 from fractions import Fraction
 
-try:
-    from . import tinydvd_metadata
-except (ImportError, ValueError):
-    try:
-        import tinydvd_metadata
-    except ImportError:
-        scripts_dir = os.path.dirname(os.path.abspath(__file__))
-        if scripts_dir not in sys.path:
-            sys.path.insert(0, scripts_dir)
-        try:
-            import tinydvd_metadata
-        except ImportError:
-            tinydvd_metadata = None
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import tinydvd_archive  # noqa: E402
+import tinydvd_metadata  # noqa: E402
 
 SECTOR_SIZE = 2048
 MVOB_MAGIC = 0x4D564F42  # "MVOB" in little-endian uint32
@@ -309,6 +298,19 @@ def generate_qpfile(keyframes, output_path):
 VIDEO_RATES = {"ntsc": (30000 / 1001, "30000/1001"), "pal": (25.0, "25")}
 
 
+def find_dvd_files(input_dir, pattern):
+    """
+    Files matching a glob pattern such as "VTS_01_[1-9]*.VOB", named in
+    upper or lower case, from the disc folder or else its VIDEO_TS folder.
+    """
+    for sdir in (input_dir, os.path.join(input_dir, "VIDEO_TS")):
+        for pat in (pattern, pattern.lower()):
+            matched = sorted(glob.glob(os.path.join(sdir, pat)))
+            if matched:
+                return matched
+    return []
+
+
 def ifo_video_standard(input_dir, ifo_name, attr_offset):
     """
     Return "ntsc" or "pal" from a video attributes field of an IFO file:
@@ -316,18 +318,15 @@ def ifo_video_standard(input_dir, ifo_name, attr_offset):
     0x200 the title video (VTS_NN_0.IFO). Bits 5-4 of its first byte are the
     video standard, 0 = NTSC (525/60) and 1 = PAL (625/50). None if unreadable.
     """
-    for sdir in (input_dir, os.path.join(input_dir, "VIDEO_TS")):
-        for name in (ifo_name, ifo_name.lower()):
-            path = os.path.join(sdir, name)
-            if os.path.isfile(path):
-                try:
-                    with open(path, "rb") as f:
-                        f.seek(attr_offset)
-                        b = f.read(1)
-                except OSError:
-                    return None
-                if len(b) == 1:
-                    return "pal" if ((b[0] >> 4) & 0x03) == 1 else "ntsc"
+    for path in find_dvd_files(input_dir, ifo_name):
+        try:
+            with open(path, "rb") as f:
+                f.seek(attr_offset)
+                b = f.read(1)
+        except OSError:
+            return None
+        if len(b) == 1:
+            return "pal" if ((b[0] >> 4) & 0x03) == 1 else "ntsc"
     return None
 
 
@@ -387,32 +386,25 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
             if sar:
                 vf += f",setsar={sar.replace(':', '/')}"
             if seg["audio_sectors"] > 0:
-                cmd = [
-                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-                    "-probesize", "50M", "-analyzeduration", "50M",
-                    "-f", "mpeg", "-i", seg_vob,
-                    "-vf", vf,
-                    "-af", f"apad=whole_dur={dur:.6f}",
-                    "-map", "0:v:0", "-map", "0:a:0",
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-                    "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
-                    "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
-                    seg_mkv
-                ]
+                # The segment's own audio, padded out to its full duration
+                audio_args = ["-af", f"apad=whole_dur={dur:.6f}", "-map", "0:v:0", "-map", "0:a:0"]
+                extra_input = []
             else:
-                cmd = [
-                    "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-                    "-probesize", "50M", "-analyzeduration", "50M",
-                    "-f", "mpeg", "-i", seg_vob,
-                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
-                    "-vf", vf,
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-t", f"{dur:.6f}",
-                    "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
-                    "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
-                    "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
-                    seg_mkv
-                ]
+                # No audio: add silence, so every segment has an audio track to concatenate
+                extra_input = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+                audio_args = ["-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}"]
+            cmd = [
+                "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+                "-probesize", "50M", "-analyzeduration", "50M",
+                "-f", "mpeg", "-i", seg_vob,
+                *extra_input,
+                "-vf", vf,
+                *audio_args,
+                "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
+                "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+                seg_mkv
+            ]
 
             res = subprocess.run(cmd)
             if res.returncode != 0:
@@ -552,7 +544,7 @@ def emit_mvob_files(vob_paths, vts_id, vobus, output_dir, keep_audio=False):
                     wrote_video_ref = False
                 elif is_video_sector(sector):
                     # Write ONLY the first video sector of the VOBU (hollowed with mvob_video_ref_t)
-                    # and skip all remaining video sectors in this VOBU!
+                    # and skip the rest of the VOBU's video sectors
                     if not wrote_video_ref:
                         ref_bytes = _make_ref_bytes_for_vobu(vts_id, current_vobu)
                         hollowed = hollow_video_sector(sector, ref_bytes)
@@ -586,34 +578,17 @@ def emit_mvob_files(vob_paths, vts_id, vobus, output_dir, keep_audio=False):
 
 def copy_ifo_and_bup(input_dir, output_dir):
     """Copy all .IFO and .BUP files matching the original DVD structure."""
-    patterns = ["*.IFO", "*.ifo", "*.BUP", "*.bup"]
-    search_dirs = [input_dir]
-    if os.path.isdir(os.path.join(input_dir, "VIDEO_TS")):
-        search_dirs.append(os.path.join(input_dir, "VIDEO_TS"))
-
     copied = 0
-    for sdir in search_dirs:
-        for pat in patterns:
-            for fpath in glob.glob(os.path.join(sdir, pat)):
-                dest = os.path.join(output_dir, os.path.basename(fpath).upper())
-                shutil.copy2(fpath, dest)
-                copied += 1
+    for pattern in ("*.IFO", "*.BUP"):
+        for fpath in find_dvd_files(input_dir, pattern):
+            shutil.copy2(fpath, os.path.join(output_dir, os.path.basename(fpath).upper()))
+            copied += 1
     print(f"[transcode] Copied {copied} IFO/BUP navigation metadata files.")
 
 
 def process_vmgm(input_dir, output_dir, fps=None, crf=18, preset="slow", sar=None, keep_audio=False):
     """Process VIDEO_TS.VOB (VMGM domain) if present."""
-    search_dirs = [input_dir]
-    if os.path.isdir(os.path.join(input_dir, "VIDEO_TS")):
-        search_dirs.append(os.path.join(input_dir, "VIDEO_TS"))
-
-    vmgm_vobs = []
-    for sdir in search_dirs:
-        m = glob.glob(os.path.join(sdir, "VIDEO_TS.VOB")) or glob.glob(os.path.join(sdir, "video_ts.vob"))
-        if m:
-            vmgm_vobs.extend(m)
-            break
-
+    vmgm_vobs = find_dvd_files(input_dir, "VIDEO_TS.VOB")
     if not vmgm_vobs:
         return
 
@@ -639,25 +614,8 @@ def process_vmgm(input_dir, output_dir, fps=None, crf=18, preset="slow", sar=Non
 def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", tune="film", sar=None, keep_audio=False):
     print(f"\n=== Processing Video Title Set VTS_{vts_id:02d} ===")
 
-    search_dirs = [input_dir]
-    if os.path.isdir(os.path.join(input_dir, "VIDEO_TS")):
-        search_dirs.append(os.path.join(input_dir, "VIDEO_TS"))
-
-    vob_files = []
-    for sdir in search_dirs:
-        matched = sorted(glob.glob(os.path.join(sdir, f"VTS_{vts_id:02d}_[1-9]*.VOB")))
-        if not matched:
-            matched = sorted(glob.glob(os.path.join(sdir, f"VTS_{vts_id:02d}_[1-9]*.vob")))
-        if matched:
-            vob_files.extend(matched)
-            break
-
-    menu_vobs = []
-    for sdir in search_dirs:
-        m = glob.glob(os.path.join(sdir, f"VTS_{vts_id:02d}_0.VOB")) or glob.glob(os.path.join(sdir, f"VTS_{vts_id:02d}_0.vob"))
-        if m:
-            menu_vobs.extend(m)
-            break
+    vob_files = find_dvd_files(input_dir, f"VTS_{vts_id:02d}_[1-9]*.VOB")
+    menu_vobs = find_dvd_files(input_dir, f"VTS_{vts_id:02d}_0.VOB")
 
     if not vob_files and not menu_vobs:
         print(f"Notice: No VOB files found for VTS_{vts_id:02d}")
@@ -748,6 +706,7 @@ def resolve_dvd_source(input_path):
         if ext in [".iso", ".img", ".nrg"]:
             print(f"[source] ISO file detected: {input_path}")
             mountpoint = None
+            extracted = False
             if sys.platform == "darwin":
                 cmd = ["hdiutil", "attach", "-nobrowse", "-readonly", input_path]
                 res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -773,6 +732,9 @@ def resolve_dvd_source(input_path):
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if res.returncode == 0:
                         mountpoint = tmp_extract
+                        extracted = True
+                    else:
+                        shutil.rmtree(tmp_extract, ignore_errors=True)
                 else:
                     raise ValueError(
                         f"Cannot read ISO image '{input_path}' directly on Linux because '7z' is not installed. "
@@ -785,11 +747,11 @@ def resolve_dvd_source(input_path):
                     yield mountpoint
                 finally:
                     print(f"[source] Cleaning up mount: {mountpoint}")
-                    if sys.platform == "darwin":
+                    if extracted:
+                        shutil.rmtree(mountpoint, ignore_errors=True)
+                    elif sys.platform == "darwin":
                         subprocess.run(["hdiutil", "detach", mountpoint, "-force"],
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    elif mountpoint.startswith("/tmp/tinydvd_iso_") or "tinydvd_iso_" in mountpoint:
-                        shutil.rmtree(mountpoint, ignore_errors=True)
                 return
 
     raise ValueError(f"Could not resolve DVD source at '{input_path}'. Must be a directory, an ISO image, or a VOB/IFO file.")
@@ -805,61 +767,59 @@ def is_already_converted_dir(path):
     return has_mvob and has_mkv
 
 
-def ensure_thumbnail_in_staging(staging_dir):
-    """Ensure a thumbnail.png exists in the staging directory, picked the same
-    way the Nautilus thumbnailer picks one (see tinydvd-thumbnailer)."""
-    thumb_path = os.path.join(staging_dir, "thumbnail.png")
-    if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-        return
+def pick_thumbnail(source_dir):
+    """
+    PNG bytes for the package thumbnail: the source's own thumbnail.png, or a
+    frame picked the same way the file-manager thumbnailer picks one.
+    """
+    existing = tinydvd_archive.read_thumbnail(source_dir)
+    if existing:
+        return existing
     here = os.path.dirname(os.path.realpath(__file__))
-    thumbnailer = next((os.path.join(here, n) for n in ("tinydvd-thumbnailer.py", "tinydvd-thumbnailer")
-                        if os.path.isfile(os.path.join(here, n))), None)
-    if not thumbnailer:
-        print("[package] tinydvd-thumbnailer not found; skipping thumbnail.png")
-        return
-    cmd = [sys.executable, thumbnailer, "--frame-only", "-s", "0", staging_dir, thumb_path]
-    if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode != 0:
-        print("[package] Couldn't pick a thumbnail frame; skipping thumbnail.png")
-        if os.path.exists(thumb_path):
-            os.unlink(thumb_path)
+    thumbnailer = os.path.join(here, "tinydvd-thumbnailer.py")
+    if not os.path.isfile(thumbnailer):
+        print("[package] tinydvd-thumbnailer not found; no thumbnail")
+        return None
+    fd, tmp_png = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        cmd = [sys.executable, thumbnailer, "--frame-only", "-s", "0", source_dir, tmp_png]
+        if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            with open(tmp_png, "rb") as f:
+                data = f.read()
+            if data:
+                return data
+        print("[package] Couldn't pick a thumbnail frame; no thumbnail")
+        return None
+    finally:
+        os.unlink(tmp_png)
 
 
-def package_tdvd_archive(staging_dir, output_archive_path):
+# Archive member order: navigation data first, then the small files, then
+# the large videos, so the player finds what it needs near the start
+PACKAGE_ORDER = {".ifo": 0, ".bup": 0, ".json": 1, ".png": 1, ".jpg": 1, ".jpeg": 1,
+                 ".mvob": 2, ".mkv": 3, ".txt": 4}
+
+
+def package_tdvd_archive(source_dir, output_archive_path, extra=None):
     """
-    Packages a tinydvd directory into a single uncompressed ZIP_STORED (.tdvd / .tinydvd)
-    archive with O(1) central directory lookup and contiguous byte ranges for zero-copy playback.
+    Write a TinyDVD directory to a single uncompressed (ZIP_STORED) archive,
+    which the player reads in place. extra is {name: bytes} of members to add
+    or to use instead of the source's own files of the same name.
     """
-    parent_dir = os.path.dirname(os.path.abspath(output_archive_path))
-    if parent_dir:
-        os.makedirs(parent_dir, exist_ok=True)
-
-    ensure_thumbnail_in_staging(staging_dir)
-
-    all_files = []
-    for fname in sorted(os.listdir(staging_dir)):
-        fpath = os.path.join(staging_dir, fname)
-        if os.path.islink(fpath) or not os.path.isfile(fpath):
+    extra = dict(extra or {})
+    extra_lower = {name.lower() for name in extra}
+    files = []
+    for fname in sorted(os.listdir(source_dir)):
+        fpath = os.path.join(source_dir, fname)
+        prio = PACKAGE_ORDER.get(os.path.splitext(fname)[1].lower())
+        if prio is None or fname.lower() in extra_lower or os.path.islink(fpath) or not os.path.isfile(fpath):
             continue
-        ext = os.path.splitext(fname)[1].lower()
-        if ext in (".ifo", ".bup"):
-            prio = 0
-        elif ext in (".json", ".png", ".jpg", ".jpeg"):
-            prio = 1
-        elif ext == ".mvob":
-            prio = 2
-        elif ext == ".mkv":
-            prio = 3
-        elif ext == ".txt":
-            prio = 4
-        else:
-            continue
-        all_files.append((prio, fname, fpath))
+        files.append((prio, fname, fpath))
+    files.sort()
 
-    all_files.sort(key=lambda item: (item[0], item[1]))
-    print(f"\n[package] Creating single-file archive {output_archive_path} ({len(all_files)} constituent files, ZIP_STORED)...")
-    with zipfile.ZipFile(output_archive_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-        for _, fname, fpath in all_files:
-            zf.write(fpath, arcname=fname)
+    print(f"\n[package] Creating archive {output_archive_path} ({len(files) + len(extra)} files, uncompressed)...")
+    tinydvd_archive.create_archive(output_archive_path, [(fname, fpath) for _, fname, fpath in files], extra)
     total_mb = os.path.getsize(output_archive_path) / (1024.0 * 1024.0)
     print(f"[package] Wrote {output_archive_path} ({total_mb:.1f} MB)")
 
@@ -893,88 +853,80 @@ def run_conversion_to_dir(raw_input, target_dir, args):
                 process_vts(input_path, target_dir, vid, args.fps, args.crf, args.preset, args.tune, args.sar, keep_audio=args.keep_mvob_audio)
 
 
-def _load_meta_dict(meta_dir=None, meta_tdvd=None):
-    if meta_dir:
-        mpath = os.path.join(meta_dir, "metadata.json")
-        if os.path.isfile(mpath):
-            try:
-                with open(mpath, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-    if meta_tdvd and os.path.isfile(meta_tdvd):
-        try:
-            with zipfile.ZipFile(meta_tdvd, "r") as zf:
-                if "metadata.json" in zf.namelist():
-                    return json.loads(zf.read("metadata.json").decode("utf-8"))
-        except Exception:
-            pass
-    return {}
-
-
-def _write_meta_into_tdvd(tdvd_path, meta):
-    data_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
-    if tinydvd_metadata:
-        tinydvd_metadata.write_metadata_to_tdvd(tdvd_path, meta)
-        return
-    with zipfile.ZipFile(tdvd_path, "a", allowZip64=True) as zf:
-        for m in [info for info in zf.filelist if info.filename.lower() == "metadata.json"]:
-            zf.filelist.remove(m)
-            if m.filename in zf.NameToInfo:
-                del zf.NameToInfo[m.filename]
-        zinfo = zipfile.ZipInfo(filename="metadata.json")
-        zinfo.compress_type = zipfile.ZIP_STORED
-        zinfo.external_attr = 0o644 << 16
-        zf.writestr(zinfo, data_bytes)
-
-
-def resolve_unique_output_path(desired_output_path, meta_dir=None, meta_tdvd=None):
+def output_candidates(desired_path, year):
     """
-    Never overwrite an existing .tdvd archive:
-    1) Year first: if metadata has a release year not already in the stem, try '<Stem> (<Year>).tdvd'.
-    2) Numeric suffix: try '<Stem> (2).tdvd', '<Stem> (3).tdvd', ... and append ' (N)' to metadata title.
+    Archive names to try, in order, so an existing archive is never
+    overwritten: the desired name, then '<name> (<year>)', then '<name> (2)',
+    '<name> (3)', and so on. Yields (path, copy number or None).
     """
-    desired_output_path = os.path.abspath(desired_output_path)
-    meta = _load_meta_dict(meta_dir=meta_dir, meta_tdvd=meta_tdvd)
-
-    if not os.path.exists(desired_output_path):
-        return desired_output_path, None
-
-    parent_dir = os.path.dirname(desired_output_path)
-    base = os.path.basename(desired_output_path)
-    stem, ext = os.path.splitext(base)
-
-    new_year = 0
-    try:
-        new_year = int(meta.get("year") or 0)
-    except Exception:
-        new_year = 0
-
-    if new_year > 0 and f"({new_year})" not in stem:
-        year_cand = os.path.join(parent_dir, f"{stem} ({new_year}){ext}")
-        if not os.path.exists(year_cand):
-            print(f"[duplicate] Existing archive at {desired_output_path}; saving with release year -> {year_cand}")
-            return year_cand, None
-        stem = f"{stem} ({new_year})"
-
+    stem, ext = os.path.splitext(desired_path)
+    yield desired_path, None
+    if year and f"({year})" not in os.path.basename(stem):
+        yield f"{stem} ({year}){ext}", None
+        stem = f"{stem} ({year})"
     n = 2
     while True:
-        cand = os.path.join(parent_dir, f"{stem} ({n}){ext}")
-        if not os.path.exists(cand):
-            print(f"[duplicate] Existing archive found; saving unique copy -> {cand}")
-            updated_meta = None
-            if meta:
-                orig_title = str(meta.get("title") or stem).strip()
-                suffix = f" ({n})"
-                if not orig_title.endswith(suffix):
-                    meta["title"] = f"{orig_title}{suffix}"
-                updated_meta = meta
-                if meta_dir:
-                    mpath = os.path.join(meta_dir, "metadata.json")
-                    with open(mpath, "w", encoding="utf-8") as mf:
-                        json.dump(meta, mf, indent=2, ensure_ascii=False)
-            return cand, updated_meta
+        yield f"{stem} ({n}){ext}", n
         n += 1
+
+
+def _meta_bytes(meta):
+    return json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def build_archive(source_dir, desired_path, meta):
+    """
+    Package source_dir as a .tdvd under desired_path or the first free
+    variant of it. The archive is written to a hidden temporary file and only
+    then moved into place, so the library never sees a half-written archive.
+    Returns the path written.
+    """
+    parent = os.path.dirname(desired_path) or "."
+    try:
+        year = int(meta.get("year") or 0)
+    except (TypeError, ValueError):
+        year = 0
+    base_title = str(meta.get("title") or "").strip()
+
+    candidates = output_candidates(desired_path, year)
+    cand, copy_no = next(candidates)
+    while os.path.exists(cand):
+        cand, copy_no = next(candidates)
+
+    def meta_for(n):
+        if not meta:
+            return {}
+        out = dict(meta)
+        if n and base_title:
+            out["title"] = f"{base_title} ({n})"
+        return out
+
+    extra = {}
+    thumb = pick_thumbnail(source_dir)
+    if thumb:
+        extra[tinydvd_archive.THUMBNAIL_NAME] = thumb
+    if meta:
+        extra[tinydvd_archive.METADATA_NAME] = _meta_bytes(meta_for(copy_no))
+
+    fd, tmp = tempfile.mkstemp(prefix=".tdvd_tmp_", suffix=os.path.splitext(desired_path)[1] or ".tdvd", dir=parent)
+    os.close(fd)
+    try:
+        package_tdvd_archive(source_dir, tmp, extra)
+        while True:
+            if cand != desired_path:
+                print(f"[duplicate] An archive already has that name; saving as {cand}")
+            if tinydvd_archive.place_without_overwrite(tmp, cand):
+                return cand
+            # Another import took the name since we checked: use the next one
+            cand, n = next(candidates)
+            while os.path.exists(cand):
+                cand, n = next(candidates)
+            if meta and n != copy_no:
+                copy_no = n
+                tinydvd_archive.rewrite_archive(tmp, {tinydvd_archive.METADATA_NAME: _meta_bytes(meta_for(n))})
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def main():
@@ -997,68 +949,51 @@ def main():
                              "often 4:3 warning screens before a widescreen movie.")
     parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
     parser.add_argument("--skip-enrichment", action="store_true",
-                        help="Skip automatic metadata enrichment (director, cast, genres, overview, year)")
+                        help="Don't look up the movie's details (director, cast, genres, overview, year) online. "
+                             "The lookup sends only the title, to Wikidata/Wikipedia and any service you give a key for.")
     parser.add_argument("--tmdb-key", default=os.environ.get("TMDB_API_KEY", ""),
-                        help="TMDb API v3 key (or set TMDB_API_KEY environment variable)")
+                        help="Your TMDb API key (or set TMDB_API_KEY)")
+    parser.add_argument("--omdb-key", default=os.environ.get("OMDB_API_KEY", ""),
+                        help="Your OMDb API key (or set OMDB_API_KEY)")
 
     args = parser.parse_args()
 
     raw_input = os.path.abspath(args.input)
     output_path = os.path.abspath(args.output)
-    is_single_file = output_path.lower().endswith((".tdvd", ".tinydvd"))
+    is_single_file = tinydvd_archive.is_tdvd_path(output_path)
 
     print("convert-to-tinydvd")
     print(f"Input:  {raw_input}")
     print(f"Output: {output_path}")
 
-    def do_enrich(target, hint=None):
+    def lookup_meta(source_dir):
+        """Metadata for the archive: looked up online, or the source's own."""
+        existing = tinydvd_archive.read_metadata(source_dir)
         if args.skip_enrichment:
-            return
+            return existing
+        print("\n[metadata] Looking up movie details...")
         try:
-            if tinydvd_metadata:
-                print("\n[metadata] Automatically enriching movie metadata & disc ID...")
-                tinydvd_metadata.enrich_movie(target, title_hint_path=hint or target, tmdb_key=args.tmdb_key)
-            else:
-                scripts_dir = os.path.dirname(os.path.abspath(__file__))
-                meta_script = os.path.join(scripts_dir, "tinydvd_metadata.py")
-                if os.path.isfile(meta_script):
-                    print("\n[metadata] Automatically enriching movie metadata & disc ID...")
-                    cmd = [sys.executable, meta_script, target]
-                    if args.tmdb_key:
-                        cmd += ["--tmdb-key", args.tmdb_key]
-                    subprocess.run(cmd, check=False)
+            return tinydvd_metadata.enrich_movie(
+                source_dir, title_hint_path=output_path, tmdb_key=args.tmdb_key,
+                omdb_key=args.omdb_key, write=False)
         except Exception as e:
-            print(f"[warning] Metadata enrichment failed: {e}", file=sys.stderr)
+            print(f"[warning] Metadata lookup failed: {e}", file=sys.stderr)
+            return existing
 
     if is_single_file:
         parent_dir = os.path.dirname(output_path) or "."
         os.makedirs(parent_dir, exist_ok=True)
         if is_already_converted_dir(raw_input):
-            ext = os.path.splitext(output_path)[1] or ".tdvd"
-            tmp_fd, tmp_tdvd = tempfile.mkstemp(prefix=".tdvd_tmp_", suffix=ext, dir=parent_dir)
-            os.close(tmp_fd)
-            try:
-                package_tdvd_archive(raw_input, tmp_tdvd)
-                do_enrich(tmp_tdvd, hint=output_path)
-                output_path, updated_meta = resolve_unique_output_path(output_path, meta_tdvd=tmp_tdvd)
-                if updated_meta:
-                    _write_meta_into_tdvd(tmp_tdvd, updated_meta)
-                os.replace(tmp_tdvd, output_path)
-            finally:
-                if os.path.exists(tmp_tdvd):
-                    try:
-                        os.unlink(tmp_tdvd)
-                    except Exception:
-                        pass
+            output_path = build_archive(raw_input, output_path, lookup_meta(raw_input))
         else:
             with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
                 run_conversion_to_dir(raw_input, stage_dir, args)
-                do_enrich(stage_dir, hint=output_path)
-                output_path, _ = resolve_unique_output_path(output_path, meta_dir=stage_dir)
-                package_tdvd_archive(stage_dir, output_path)
+                output_path = build_archive(stage_dir, output_path, lookup_meta(stage_dir))
     else:
         run_conversion_to_dir(raw_input, output_path, args)
-        do_enrich(output_path, hint=output_path)
+        meta = lookup_meta(output_path)
+        if meta and not args.skip_enrichment:
+            tinydvd_metadata.write_metadata(output_path, meta)
 
     print(f"[output] Final archive: {output_path}")
     print("\nConversion completed successfully!")

@@ -5,7 +5,7 @@
 Unlike standard rippers that throw away menus or split a disc into dozens of disconnected files, **tinydvd** keeps everything that makes a DVD a DVD:
 - **Full Interactive DVD Menus:** Root menus, animated transitions, scene selection, language/audio setup, and bonus feature navigation work just like a real DVD player.
 - **Massive Space Savings:** Replaces bulky 1990s MPEG-2 video streams with modern H.264 video in `.mkv` containers, while collapsing the DVD navigation/subtitle stream into tiny `.mvob` ("Meta-VOB") files (~99% smaller than original `.VOB`s).
-- **Single-File `.tdvd` Format:** Packages the entire converted disc into a single `.tdvd` (or `.tinydvd`) file with instant, zero-copy random access—ideal for double-clicking in file managers.
+- **Single-File `.tdvd` Format:** Packages the entire converted disc into a single `.tdvd` (or `.tinydvd`) file that the player reads in place, with no unpacking, so you can double-click it in a file manager.
 - **Closed Captions, Subtitles & Multi-Track Audio:** Preserves original DVD Closed Captions (SDH), multi-language subtitles, and multiple audio tracks with instant toggling during playback.
 - **Modern Player Controls:** Navigate menus with keyboard or mouse, jump around the clip timeline (`-10s`/`+10s`, `-60s`/`+60s`, `0%`–`90%`), and step through chapters with On-Screen Display (OSD) feedback.
 
@@ -92,7 +92,7 @@ This builds the player binary at `./build/tinydvd`.
 
 ### Common End-to-End Linux Desktop Use Cases
 
-If you (or an automated assistant) are looking to get from a physical disc to watching your movies with zero friction, follow these two standard recipes:
+Two common ways to go from a physical disc to watching it:
 
 #### Recipe 1: "How do I just import a DVD and put it with my other videos?"
 
@@ -109,7 +109,7 @@ If you (or an automated assistant) are looking to get from a physical disc to wa
    ```bash
    ./scripts/convert-to-tinydvd ./rips/DUNE ~/Videos/Dune.tdvd
    ```
-   - **Automatic Enrichment:** Metadata enrichment (director, cast, genres, year, plot overview) runs **by default** during conversion. (To opt out of network metadata lookup, pass `--skip-enrichment`).
+   - **Movie details:** By default the converter looks up the director, cast, genres, year and a plot summary. It sends only the title (and year, if the file name has one) to Wikidata and Wikipedia, plus TMDb or OMDb if you give it your own API key. Pass `--skip-enrichment` to turn this off. See [Movie metadata](#movie-metadata-tinydvd_metadatapy).
    - **Automatic Thumbnail:** An optimal menu thumbnail is embedded automatically so GNOME Files / Nautilus displays rich cover art.
    - **Clean up the raw rip:** Once conversion finishes, delete the temporary raw rip to reclaim space:
      ```bash
@@ -117,7 +117,7 @@ If you (or an automated assistant) are looking to get from a physical disc to wa
      ```
 
 3. **Browse and play in Videos:**
-   Tell the user to open their standard `~/Videos` folder in their desktop file manager (e.g. GNOME Files / Nautilus):
+   Open your `~/Videos` folder in your file manager (e.g. GNOME Files / Nautilus):
    ```bash
    xdg-open ~/Videos
    ```
@@ -130,23 +130,26 @@ If you (or an automated assistant) are looking to get from a physical disc to wa
 
 #### Recipe 2: "How do I just serve my tinydvds with the web player?"
 
-To stream your collection to any web browser, tablet, phone, or smart TV on your local network:
+To stream your collection to a web browser, tablet, phone or smart TV:
 
-1. **Point the player app directly at `~/Videos`:**
+1. **Point the server at `~/Videos`:**
    ```bash
-   # Run the server on ~/Videos:
+   # Serve ~/Videos to this computer only (http://localhost:8080):
    tinydvd --serve ~/Videos
 
-   # Or bind to 0.0.0.0 on port 8080 for access from other devices on your LAN:
-   tinydvd --serve ~/Videos --port 8080 --bind 0.0.0.0
+   # Let other devices on your network connect too:
+   tinydvd --serve ~/Videos --bind 0.0.0.0
    ```
+   The web player asks for a password. On first run `tinydvd` makes a random one, saves it in your config folder (`~/.config/tinydvd/web-password` on Linux, `~/Library/Application Support/tinydvd/web-password` on macOS) and prints it when the server starts. To choose your own, put it in that file, or set `TINYDVD_WEB_PASSWORD`, or pass `--web-password-file`.
+
+   The server speaks plain HTTP. That's fine at home; don't expose it to the internet without a TLS reverse proxy in front.
 
 2. **Graceful Tolerance of Non-TinyDVD Files:**
    You do not need to separate your `.tdvd` files into their own isolated folder. TinyDVD expands `~` automatically and scans `~/Videos`, **tolerating and silently ignoring** any non-TinyDVD files (such as `.mp4`, `.mkv`, `.avi`, `.srt`, or downloads) and other subdirectories. Only `.tdvd` archives (and unpacked TinyDVD folders) are added to the library catalog.
 
-3. **Enjoy & Import in Your Browser:**
-   Open `http://localhost:8080` (or `http://<your-ip>:8080` from any other device). You can:
-   - Click **"+ Import DVD"** in the header to rip, convert, enrich, and add a new DVD (from an optical drive, mounted disc volume, folder, or `.iso`) straight into your library from the browser.
+3. **Watch in your browser:**
+   Open `http://localhost:8080` (or `http://<your-ip>:8080` from another device, if you used `--bind 0.0.0.0`). You can:
+   - Import DVDs from the browser, if you started the server with `--allow-web-import`. This is off by default because it lets anyone who has the password run the ripping and conversion tools on any path the server can read. With it on, **"+ Import DVD"** rips, converts and adds a disc (from an optical drive, mounted disc, folder or `.iso`) to your library.
    - Search your catalog live by **actor, director, genre, title, or year**.
    - Click any card to launch the interactive DVD player in full cinema mode.
    - Enjoy multi-session isolation: multiple family members or tabs can watch different movies or menus at the same time without interfering with each other.
@@ -169,7 +172,7 @@ dvdbackup -M -i /dev/sr0 -o ./rips
 
 #### Step 2: Convert with `convert-to-tinydvd`
 
-Run [`scripts/convert-to-tinydvd`](file:///Users/boutell/boutell/tinydvd/scripts/convert-to-tinydvd.py) on your ripped DVD folder or `.iso` image to produce a single `.tdvd` file (or an unpacked folder):
+Run [`scripts/convert-to-tinydvd`](scripts/convert-to-tinydvd.py) on your ripped DVD folder or `.iso` image to produce a single `.tdvd` file (or an unpacked folder):
 
 ```bash
 # Produce a single-file .tdvd archive (metadata enrichment is enabled by default):
@@ -178,8 +181,8 @@ Run [`scripts/convert-to-tinydvd`](file:///Users/boutell/boutell/tinydvd/scripts
 # Skip online metadata enrichment if offline or desired:
 ./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --skip-enrichment
 
-# Supply TMDb API key for enhanced metadata lookup:
-./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --tmdb-key "your_api_key"
+# Also look the movie up on TMDb or OMDb, with your own API keys:
+./scripts/convert-to-tinydvd ./rips/MY_MOVIE ~/Videos/MY_MOVIE.tdvd --tmdb-key "your_tmdb_key" --omdb-key "your_omdb_key"
 
 # Or from an unencrypted ISO image:
 ./scripts/convert-to-tinydvd /path/to/movie.iso ~/Videos/MY_MOVIE.tdvd
@@ -221,39 +224,53 @@ You can stream any `.tdvd` movie or an entire folder of movies to modern web bro
 # Or serve an entire collection with catalog browsing and search:
 ./build/tinydvd --serve ./tinydvds/
 
-# Custom port and network bind (e.g. for access across your local LAN):
+# Custom port, reachable from other devices on your network:
 ./build/tinydvd --serve ./tinydvds/ --port 8080 --bind 0.0.0.0
+
+# Also allow importing DVDs from the browser:
+./build/tinydvd --serve ./tinydvds/ --allow-web-import
 ```
 
-* **Built-in DVD Importer**: Click **"+ Import DVD"** directly in the library header to rip an optical disc (`dvdbackup`), convert & enrich it to `.tdvd`, and automatically refresh the catalog without leaving the browser.
+* **Login**: one shared password (see [Recipe 2](#recipe-2-how-do-i-just-serve-my-tinydvds-with-the-web-player)). Logins last 30 days; changing the password signs everyone out.
+* **Built-in DVD Importer** (with `--allow-web-import`): Click **"+ Import DVD"** in the library header to rip an optical disc (`dvdbackup`), convert it to `.tdvd`, and refresh the catalog without leaving the browser.
 * **Multi-Session Isolation**: Every browser tab and device gets its own independent DVD VM and playback timeline—different family members can watch or browse different movies at the same time without interfering with each other.
-* **Instant Fast Remuxing & Caching**: Video chunks are remuxed on-demand into fast-start MP4 with HTTP 206 byte-range seeking and cached on disk.
+* **Remuxing & Caching**: Browsers can't play MKV, so each video is copied into an MP4 (no re-encoding) the first time it's played. The copies are kept in your cache folder (`~/.cache/tinydvd` or `~/Library/Caches/tinydvd`), up to 20 GB, oldest removed first. The first play of a long title waits for its copy to finish.
 * **Live Catalog Search**: Search your collection instantly by **actor, director, genre, title, year**, or plot summary.
 
-### Movie Metadata & Search Enrichment (`tinydvd_metadata.py`)
+### Movie Metadata (`tinydvd_metadata.py`)
 
-To enrich your `.tdvd` collection with cast, directors, release years, and plot summaries from public movie databases:
+To add cast, directors, release years and plot summaries to `.tdvd` files you already have:
 
 ```bash
-# Automatically compute disc ID and enrich from public databases:
+# Look up one movie:
 ./scripts/tinydvd_metadata.py ./tinydvds/MY_MOVIE.tdvd
 
-# Scan and enrich an entire directory of movies:
+# Look up every movie in a folder:
 ./scripts/tinydvd_metadata.py ./tinydvds/
 
-# Use a TMDb API key for full director, top cast, and genre metadata:
-export TMDB_API_KEY="your_api_key_here"
+# Also use TMDb and/or OMDb, with your own free API keys:
+export TMDB_API_KEY="your_tmdb_key"
+export OMDB_API_KEY="your_omdb_key"
 ./scripts/tinydvd_metadata.py ./tinydvds/Dune.tdvd
 
 # Or manually supply/override metadata fields:
 ./scripts/tinydvd_metadata.py ./tinydvds/Dune.tdvd --director "Denis Villeneuve" --year 2021 --cast "Timothée Chalamet, Zendaya"
 ```
 
+Where the details come from, in this order:
+- **[TMDb](https://www.themoviedb.org/settings/api)**, if you have set a key. This product uses the TMDB API but is not endorsed or certified by TMDB.
+- **[OMDb](https://www.omdbapi.com/apikey.aspx)**, if you have set a key.
+- **[Wikidata](https://www.wikidata.org/)**, with no key needed. Its data is CC0. The plot summary comes from the movie's English Wikipedia article (CC BY-SA 4.0); its source and link are saved in the metadata next to it.
+
+Only the title, and the year if known, is sent. When several films share a title, the one whose running time is closest to the disc's main feature wins.
+
+Changing a `.tdvd` file (metadata or thumbnail) writes a new copy next to it and swaps it in, so an interrupted update never damages the original. It needs enough free space for a second copy while it runs.
+
 ### Thumbnails & Cover Art (`tinydvd-set-thumbnail`)
 
 New `.tdvd` files get a thumbnail during conversion. It's a frame from the disc's main menu: the menu video of the title set that holds the main feature. If there's no such menu, it's a frame 30 seconds into the main feature, past any fade-in. The disc-level menu video is skipped, because it usually holds the copyright warnings.
 
-You can embed or update thumbnails in existing `.tdvd` archives at any time, without re-encoding or copying video data:
+You can embed or update thumbnails in existing `.tdvd` archives at any time, without re-encoding:
 
 ```bash
 # Automatically extract and embed a menu/movie frame in an existing .tdvd:
@@ -320,6 +337,8 @@ To remove it all again:
 | **F** | Toggle Fullscreen |
 | **Q** / **Ctrl-C** | Quit |
 
+`tinydvd --help` prints the same list.
+
 ---
 
 ## 3. Technical Details (Under the Hood)
@@ -330,7 +349,7 @@ Each DVD title set and menu domain is decomposed into two paired assets:
 
 1. **Compact Meta-VOB (`VIDEO_TS.mvob`, `VTS_xx_0.mvob`, `VTS_xx_1..N.mvob`):**
    - Preserves original 2048-byte Navigation Packs (`NV_PCK`) with PCI button highlight tables and DSI metadata.
-   - Collapses **all** MPEG-2 video sectors in each VOBU into a **single** 2048-byte sector containing the 40-byte [`mvob_video_ref_t`](file:///Users/boutell/boutell/tinydvd/src/mvob_parser.h#L16-L27) pointer descriptor.
+   - Collapses **all** MPEG-2 video sectors in each VOBU into a **single** 2048-byte sector containing the 40-byte [`mvob_video_ref_t`](src/mvob_parser.h#L16-L27) pointer descriptor.
    - Preserves Subpicture (`SPU`) 2-bit RLE overlay sectors (`0x20..0x3F`) for interactive menu buttons, Closed Captions (SDH), and subtitles.
    - Reduces `.mvob` container size by **~98.8%** compared to original `.VOB` files (e.g., ~96 MB total across a 7.8 GB dual-layer DVD).
 
@@ -341,14 +360,14 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Keeps each video's frame size (720x480 NTSC or 720x576 PAL), frame rate (29.97 or 25, read from the disc's IFO files) and aspect ratio (4:3 or 16:9), so menu button and subtitle coordinates match the video 1:1.
    - Keeps film at its exact timing, including soft-telecined NTSC film's 3:2 cadence, and deinterlaces only the frames the disc marks as interlaced (one frame per field, 59.94 or 50 per second), so mixed film and video titles play like they do on a DVD player.
 
-3. **Custom DVD Virtual Machine & Smooth Playback Engine ([`src/dvd_vm_bridge.c`](file:///Users/boutell/boutell/tinydvd/src/dvd_vm_bridge.c)):**
-   - Replaces `libdvdnav` and `libdvdread` with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots), a compact `.mvob` indexer, and a clean-room, bounds-checked `.IFO`/`.BUP` & PCI/HLI parser ([`src/dvd_ifo.c`](file:///Users/boutell/boutell/tinydvd/src/dvd_ifo.c)).
-   - Tracks expected presentation timestamps across VOBUs: when consecutive VOBUs have contiguous timestamps, `libmpv` ([`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c)) continues playing smoothly without issuing redundant seeks.
-   - Composites 2-bit RLE DVD subpictures and menu button highlights over the `libmpv` OpenGL video frame via [`src/spu_compositor.c`](file:///Users/boutell/boutell/tinydvd/src/spu_compositor.c), including timed DCSQ `STP_DSP` expiration for movie Closed Captions and subtitles.
+3. **Custom DVD Virtual Machine & Smooth Playback Engine ([`src/dvd_vm_bridge.c`](src/dvd_vm_bridge.c)):**
+   - Replaces `libdvdnav` and `libdvdread` with a dedicated DVD VM instruction evaluator (`Groups 0..6`, `GPRM[0..15]`, `SPRM[0..23]`, `RSM` resume slots), a compact `.mvob` indexer, and a clean-room, bounds-checked `.IFO`/`.BUP` & PCI/HLI parser ([`src/dvd_ifo.c`](src/dvd_ifo.c)).
+   - Tracks expected presentation timestamps across VOBUs: when consecutive VOBUs have contiguous timestamps, `libmpv` ([`src/mpv_controller.c`](src/mpv_controller.c)) continues playing smoothly without issuing redundant seeks.
+   - Composites 2-bit RLE DVD subpictures and menu button highlights over the `libmpv` OpenGL video frame via [`src/spu_compositor.c`](src/spu_compositor.c), including timed DCSQ `STP_DSP` expiration for movie Closed Captions and subtitles.
 
-4. **Single-File `.tdvd` / `.tinydvd` Container ([`src/tdvd_archive.c`](file:///Users/boutell/boutell/tinydvd/src/tdvd_archive.c)):**
-   - Uses a standard uncompressed ZIP (`ZIP_STORED`, with automatic `ZIP64` support for files > 4 GB) so the Central Directory at the end of the file provides $O(1)$ lookup of every constituent `.IFO`, `.mvob`, and `.mkv` file's contiguous `[offset, size)` byte range.
-   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows `.IFO`/`.BUP` tables to be loaded directly into memory while `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](file:///Users/boutell/boutell/tinydvd/src/mpv_controller.c) using `pread`) are streamed and seeked **directly in-place from the `.tdvd` file without unpacking to `/tmp`**.
+4. **Single-File `.tdvd` / `.tinydvd` Container ([`src/tdvd_archive.c`](src/tdvd_archive.c)):**
+   - Uses a standard uncompressed ZIP (`ZIP_STORED`, with `ZIP64` for files over 4 GB). The ZIP index at the end of the file gives the byte range of every `.IFO`, `.mvob` and `.mkv` inside it.
+   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows `.IFO`/`.BUP` tables to be loaded directly into memory while `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](src/mpv_controller.c) using `pread`) are streamed and seeked **directly in-place from the `.tdvd` file without unpacking to `/tmp`**.
    - Any `.tdvd` file can also be inspected with standard tools (`unzip -l MY_MOVIE.tdvd`).
 
 ### Binary Descriptor (`mvob_video_ref_t`)
@@ -395,14 +414,11 @@ tinydvds/MY_MOVIE/
 ### Running Tests
 
 ```bash
-# C unit & integration tests (MVOB parser, SPU compositor, and DVD VM bridge)
-./build/test_mvob
-./build/test_spu
-./build/test_dvd_vm
-
-# Python transcoder & packager integration test
-python3 tests/test_transcode.py
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
+
+This runs the C tests (MVOB parser, subtitle compositor, DVD VM) and the Python tests (web server, archive helpers, converter). The DVD VM and playback tests need a converted disc at `tinydvds/Dune.tdvd`, which isn't in the repository; without one they skip those parts.
 
 ---
 

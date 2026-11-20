@@ -145,67 +145,19 @@ target_compile_definitions(test_web PRIVATE
 )
 target_compile_options(test_web PRIVATE -Wall -Wextra)
 
-# Installation rules for Linux / GNOME desktop integration
-include(GNUInstallDirs)
+# Tests: run them all with `ctest --test-dir build --output-on-failure`.
+# The DVD VM and web tests use a real converted disc when one is present
+# (tinydvds/Dune.tdvd, not in the repository) and skip those parts otherwise.
+enable_testing()
+add_test(NAME mvob_parser COMMAND test_mvob)
+add_test(NAME spu_compositor COMMAND test_spu)
+add_test(NAME dvd_vm COMMAND test_dvd_vm WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME web_server COMMAND test_web WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME archive_helpers COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_archive.py)
+add_test(NAME transcoder COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_transcode.py)
+set_tests_properties(mvob_parser spu_compositor dvd_vm web_server archive_helpers transcoder
+                     PROPERTIES TIMEOUT 300)
 
-install(TARGETS tinydvd
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-)
-
-install(TARGETS tinydvd_core
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
-    RUNTIME DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
-)
-
-install(FILES
-    scripts/tinydvd_app.py
-    scripts/tinydvd_core.py
-    scripts/tinydvd_desktop_ui.py
-    scripts/tinydvd_library.py
-    scripts/tinydvd_metadata.py
-    scripts/tinydvd_web_server.py
-    scripts/convert-to-tinydvd.py
-    scripts/tinydvd-thumbnailer.py
-    scripts/tinydvd-set-thumbnail.py
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd/scripts
-)
-
-install(FILES src/web_assets.h
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/tinydvd
-)
-
-install(PROGRAMS scripts/convert-to-tinydvd.py
-    DESTINATION ${CMAKE_INSTALL_BINDIR}
-    RENAME convert-to-tinydvd
-)
-
-install(FILES data/tinydvd.desktop
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
-)
-
-install(FILES data/tinydvd.xml
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/mime/packages
-)
-
-install(FILES data/icons/tinydvd.svg
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps
-)
-
-install(FILES data/icons/tinydvd.svg
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/mimetypes
-    RENAME video-x-tinydvd.svg
-)
-
-install(PROGRAMS scripts/tinydvd-thumbnailer.py
-    DESTINATION ${CMAKE_INSTALL_BINDIR}
-    RENAME tinydvd-thumbnailer
-)
-
-install(PROGRAMS scripts/tinydvd-set-thumbnail.py
-    DESTINATION ${CMAKE_INSTALL_BINDIR}
-    RENAME tinydvd-set-thumbnail
-)
-
-install(FILES data/tinydvd.thumbnailer
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/thumbnailers
-)
+# Installing is done by ./install, which also sets up the Python runtime and
+# desktop integration. There are deliberately no install() rules here, so
+# there is only one definition of the installed layout.

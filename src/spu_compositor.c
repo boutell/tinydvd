@@ -329,7 +329,9 @@ static void parse_dcsq(spu_compositor_t *spu, const uint8_t *data, size_t total_
             }
         }
 
-        if (next_dcsq == curr || next_dcsq >= total_size) {
+        /* The last DCSQ points to itself. Only follow links that move forward,
+         * so a malformed chain that loops back can't spin forever. */
+        if (next_dcsq <= curr || next_dcsq >= total_size) {
             break;
         }
         curr = next_dcsq;
@@ -407,8 +409,16 @@ void spu_compositor_feed_sector(spu_compositor_t *spu, const uint8_t *sector, si
     }
 
     if (spu->accum_size + spu_payload_len > spu->accum_capacity) {
-        spu->accum_capacity = (spu->accum_size + spu_payload_len) * 2;
-        spu->packet_accum = (uint8_t *)realloc(spu->packet_accum, spu->accum_capacity);
+        size_t new_cap = (spu->accum_size + spu_payload_len) * 2;
+        uint8_t *grown = (uint8_t *)realloc(spu->packet_accum, new_cap);
+        if (!grown) {
+            /* Out of memory: drop this subpicture unit */
+            spu->accum_size = 0;
+            spu->expected_packet_len = 0;
+            return;
+        }
+        spu->packet_accum = grown;
+        spu->accum_capacity = new_cap;
     }
 
     memcpy(spu->packet_accum + spu->accum_size, spu_payload, spu_payload_len);

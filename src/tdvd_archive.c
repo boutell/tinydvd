@@ -80,8 +80,8 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
         return NULL;
     }
 
-    fseeko(f, file_size - (off_t)tail_len, SEEK_SET);
-    if (fread(tail, 1, tail_len, f) != tail_len) {
+    if (fseeko(f, file_size - (off_t)tail_len, SEEK_SET) != 0 ||
+        fread(tail, 1, tail_len, f) != tail_len) {
         free(tail);
         fclose(f);
         return NULL;
@@ -122,7 +122,7 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
     }
     free(tail);
 
-    if (cd_offset + cd_size > (uint64_t)file_size) {
+    if (cd_size > (uint64_t)file_size || cd_offset > (uint64_t)file_size - cd_size) {
         fclose(f);
         return NULL;
     }
@@ -132,15 +132,20 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
         fclose(f);
         return NULL;
     }
-    fseeko(f, (off_t)cd_offset, SEEK_SET);
-    if (fread(cd_buf, 1, (size_t)cd_size, f) != (size_t)cd_size) {
+    if (fseeko(f, (off_t)cd_offset, SEEK_SET) != 0 ||
+        fread(cd_buf, 1, (size_t)cd_size, f) != (size_t)cd_size) {
         free(cd_buf);
         fclose(f);
         return NULL;
     }
 
     tdvd_archive_t *ar = (tdvd_archive_t *)calloc(1, sizeof(tdvd_archive_t));
-    ar->archive_path = strdup(archive_path);
+    if (!ar || !(ar->archive_path = strdup(archive_path))) {
+        free(ar);
+        free(cd_buf);
+        fclose(f);
+        return NULL;
+    }
 
     size_t pos = 0;
     for (uint64_t idx = 0; idx < cd_num_entries && pos + 46 <= (size_t)cd_size; idx++) {
@@ -208,10 +213,18 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path) {
         uint16_t lh_fname_len = read_le16(lh + 26);
         uint16_t lh_extra_len = read_le16(lh + 28);
         uint64_t data_offset  = lh_offset + 30ULL + lh_fname_len + lh_extra_len;
+        if (data_offset > (uint64_t)file_size || uncomp_size > (uint64_t)file_size - data_offset) {
+            continue; /* entry claims bytes past the end of the file */
+        }
 
         if (ar->entry_count >= ar->entry_capacity) {
-            ar->entry_capacity = ar->entry_capacity ? (ar->entry_capacity * 2) : 64;
-            ar->entries = (tdvd_entry_t *)realloc(ar->entries, ar->entry_capacity * sizeof(tdvd_entry_t));
+            size_t new_cap = ar->entry_capacity ? (ar->entry_capacity * 2) : 64;
+            tdvd_entry_t *grown = (tdvd_entry_t *)realloc(ar->entries, new_cap * sizeof(tdvd_entry_t));
+            if (!grown) {
+                break;
+            }
+            ar->entries = grown;
+            ar->entry_capacity = new_cap;
         }
         tdvd_entry_t *dst = &ar->entries[ar->entry_count++];
         strncpy(dst->name, bname, sizeof(dst->name) - 1);

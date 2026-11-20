@@ -247,7 +247,7 @@ mpv_controller_t *mpv_controller_init(void *(*get_proc_address)(void *, const ch
     mpv_observe_property(ctrl->mpv, 3, "video-params/aspect", MPV_FORMAT_DOUBLE);
     mpv_observe_property(ctrl->mpv, 4, "eof-reached", MPV_FORMAT_FLAG);
 
-    /* Register zero-copy tdvd:// byte-slice stream protocol for .tdvd single-file containers */
+    /* Register the tdvd:// protocol, which reads a byte range of a .tdvd file in place */
     mpv_stream_cb_add_ro(ctrl->mpv, "tdvd", ctrl, tdvd_stream_open);
 
     if (get_proc_address) {

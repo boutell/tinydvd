@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -113,10 +114,10 @@ struct dvd_vm_bridge {
     char         loaded_mkv_path[1024];
     char         current_video_name[64];
     int64_t      expected_next_pts_nanos;
-    int64_t      current_pts_nanos;
+    _Atomic int64_t current_pts_nanos; /* read by other threads */
     size_t       current_vobu_idx;
     int64_t      seek_target_vobu_idx;
-    bool         user_paused;
+    _Atomic bool user_paused;          /* read and written by other threads */
 
     /* Active NV_PCK highlight state */
     bool         has_active_hli;
@@ -129,7 +130,10 @@ struct dvd_vm_bridge {
     /* Threading & user input */
     pthread_t    thread;
     pthread_mutex_t lock;
-    bool         running;
+    _Atomic bool running;
+    /* Whether Esc has a menu level to go up to; computed on the VM thread so
+     * dvd_vm_bridge_escape() never reads VM state from another thread */
+    _Atomic bool escape_available;
     bool         thread_started;
 
     user_action_type_t pending_action;
@@ -139,6 +143,7 @@ struct dvd_vm_bridge {
 };
 
 static void emit_highlight_event(dvd_vm_bridge_t *b);
+static void refresh_escape_available(dvd_vm_bridge_t *b);
 
 /* TINYDVD_TRACE=1 logs navigation to stderr: every PGC entered and every
  * navigation command run, with the general registers. For diagnosing discs
@@ -150,6 +155,15 @@ static int trace_enabled(void) {
         enabled = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
     }
     return enabled;
+}
+
+/* TINYDVD_FAST_TEST=1 shortens waits for automated tests. Read once. */
+static bool fast_test_mode(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("TINYDVD_FAST_TEST") != NULL ? 1 : 0;
+    }
+    return enabled == 1;
 }
 
 #define VM_TRACE(...) do { if (trace_enabled()) fprintf(stderr, "[trace] " __VA_ARGS__); } while (0)
@@ -210,6 +224,14 @@ static dvd_pgc_t *lookup_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, i
     dvd_pgcit_t *pgcit = (dom == DVD_DOMAIN_VTSTT) ? get_title_pgcit(b, vts_nr) : get_menu_pgcit(b, dom, vts_nr);
     if (!pgcit || pgc_nr < 1 || pgc_nr > pgcit->nr_of_pgci_srp) return NULL;
     return pgcit->pgci_srp[pgc_nr - 1].pgc;
+}
+
+/* First cell of program pgn (1-based) in pgc, or 1 if the program map is
+ * missing or points outside the cell table */
+static int program_first_cell(const dvd_pgc_t *pgc, int pgn) {
+    if (!pgc || !pgc->program_map || pgn < 1 || pgn > pgc->nr_of_programs) return 1;
+    int cell = pgc->program_map[pgn - 1];
+    return (cell >= 1 && cell <= pgc->nr_of_cells) ? cell : 1;
 }
 
 static int find_menu_pgc_by_entry_id(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int menu_id) {
@@ -409,15 +431,18 @@ static bool vm_jump_vts_ptt(dvd_vm_bridge_t *b, int vts_nr, int vts_ttn, int ptt
         return vm_enter_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, 1, 1);
     }
     dvd_ttu_t *ttu = &vtsi->vts_ptt_srpt->title[vts_ttn - 1];
+    if (ttu->nr_of_ptts == 0 || !ttu->ptt) {
+        /* Title with no chapter table: start at its first PGC */
+        b->sprm[5] = (uint16_t)vts_ttn;
+        b->sprm[7] = 1;
+        return vm_enter_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, 1, 1);
+    }
     if (pttn < 1 || pttn > ttu->nr_of_ptts) pttn = 1;
     int pgcn = ttu->ptt[pttn - 1].pgcn;
     int pgn  = ttu->ptt[pttn - 1].pgn;
 
     dvd_pgc_t *pgc = lookup_pgc(b, DVD_DOMAIN_VTSTT, vts_nr, pgcn);
-    int cell_nr = 1;
-    if (pgc && pgc->program_map && pgn >= 1 && pgn <= pgc->nr_of_programs) {
-        cell_nr = pgc->program_map[pgn - 1];
-    }
+    int cell_nr = program_first_cell(pgc, pgn);
 
     b->sprm[5] = (uint16_t)vts_ttn;
     b->sprm[7] = (uint16_t)pttn;
@@ -492,11 +517,7 @@ static vm_link_result_t vm_exec_link_sub(dvd_vm_bridge_t *b, uint8_t link_sub, c
         }
         case 0x06: { /* LinkPGN */
             int pgn = bytes[7] & 0x7F;
-            int cell = 1;
-            if (b->current_pgc && b->current_pgc->program_map && pgn >= 1 && pgn <= b->current_pgc->nr_of_programs) {
-                cell = b->current_pgc->program_map[pgn - 1];
-            }
-            b->cell_nr = cell;
+            b->cell_nr = program_first_cell(b->current_pgc, pgn);
             b->expected_next_pts_nanos = -1;
             return VM_LINK_PGC_CHANGED;
         }
@@ -863,8 +884,14 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
                           sector[44] == 0x00);
             if (is_nv) {
                 if (b->vobu_count >= b->vobu_capacity) {
-                    b->vobu_capacity = b->vobu_capacity ? (b->vobu_capacity * 2) : 2048;
-                    b->vobu_index = (mvob_vobu_entry_t *)realloc(b->vobu_index, b->vobu_capacity * sizeof(mvob_vobu_entry_t));
+                    size_t new_cap = b->vobu_capacity ? (b->vobu_capacity * 2) : 2048;
+                    mvob_vobu_entry_t *grown = (mvob_vobu_entry_t *)realloc(b->vobu_index, new_cap * sizeof(mvob_vobu_entry_t));
+                    if (!grown) {
+                        fprintf(stderr, "[dvd_vm] Out of memory indexing VOBUs; index truncated\n");
+                        break;
+                    }
+                    b->vobu_index = grown;
+                    b->vobu_capacity = new_cap;
                 }
                 cur_entry = &b->vobu_index[b->vobu_count++];
                 memset(cur_entry, 0, sizeof(*cur_entry));
@@ -927,7 +954,7 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
     }
 }
 
-static bool vm_enter_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr, int start_cell) {
+static bool vm_enter_pgc_impl(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr, int start_cell) {
     if (!b || !b->running || b->enter_depth >= 16) {
         return false;
     }
@@ -1273,10 +1300,8 @@ static bool vm_step_chapter(dvd_vm_bridge_t *b, int delta_chap) {
     if (next_chap < 1) next_chap = 1;
     if (next_chap > total_chaps) next_chap = total_chaps;
 
-    int target_cell = next_chap;
-    if (pgc->program_map && pgc->nr_of_programs > 0 && next_chap <= pgc->nr_of_programs) {
-        target_cell = pgc->program_map[next_chap - 1];
-    }
+    int target_cell = (pgc->program_map && pgc->nr_of_programs > 0)
+                          ? program_first_cell(pgc, next_chap) : next_chap;
     if (target_cell < 1) target_cell = 1;
     if (target_cell > pgc->nr_of_cells) target_cell = pgc->nr_of_cells;
 
@@ -1673,6 +1698,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
             (b->domain == DVD_DOMAIN_VTSM || b->domain == DVD_DOMAIN_VMGM)) {
             b->effective_root_vts = b->vts_nr;
             b->effective_root_pgc_nr = b->pgc_nr;
+            refresh_escape_available(b);
         }
         refresh_button_highlight_on_spu(b, false);
     }
@@ -1712,7 +1738,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
         return false;
     }
 
-    /* Check if this VOBU's timestamp is consecutive with the previous VOBU!
+    /* Check if this VOBU's timestamp is consecutive with the previous VOBU.
      * If consecutive (within 1.5s tolerance for GOP variations), let playback continue smoothly without seeking! */
     bool need_seek = true;
     if (b->expected_next_pts_nanos >= 0) {
@@ -1759,7 +1785,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
     /* Wait for VOBU duration while polling user button navigation */
     uint64_t start_wall = monotonic_nanos();
     uint64_t target_dur = entry->duration_nanos ? entry->duration_nanos : 500000000ULL;
-    if (getenv("TINYDVD_FAST_TEST") != NULL) {
+    if (fast_test_mode()) {
         target_dur = 0;
     }
     uint64_t vobu_end_pts = entry->pts_nanos + target_dur;
@@ -1778,7 +1804,7 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
             continue;
         }
 
-        if (getenv("TINYDVD_FAST_TEST") != NULL) {
+        if (fast_test_mode()) {
             break;
         }
 
@@ -1875,6 +1901,54 @@ static void vm_finish_pgc(dvd_vm_bridge_t *b) {
     b->domain = DVD_DOMAIN_EXIT;
 }
 
+/* Whether Esc can go up a menu level from the current location (VM thread only).
+ * Mirrors the ACT_ESCAPE handling in process_pending_user_action. */
+static bool compute_escape_available(dvd_vm_bridge_t *b) {
+    if (b->domain == DVD_DOMAIN_VTSTT) {
+        /* Playing a title: Esc goes to the root menu if the disc has one */
+        int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
+        int pgcn = (b->effective_root_pgc_nr > 0 && b->effective_root_vts == target_vts)
+                   ? b->effective_root_pgc_nr
+                   : find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
+        dvd_pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
+        if (target_vts != 1 && is_dummy_rsm_menu(menu_pgc)) {
+            int vts1_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, 1, 3);
+            dvd_pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
+            if (vts1_menu && !is_dummy_rsm_menu(vts1_menu)) {
+                menu_pgc = vts1_menu;
+            }
+        }
+        dvd_pgc_t *vmgm_menu = lookup_pgc(b, DVD_DOMAIN_VMGM, 0, 1);
+        return !is_dummy_rsm_menu(menu_pgc) || vmgm_menu != NULL;
+    }
+    if (b->domain == DVD_DOMAIN_VTSM) {
+        int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
+        int root_pgcn = (b->effective_root_pgc_nr > 0 && b->effective_root_vts == target_vts)
+                        ? b->effective_root_pgc_nr
+                        : find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
+        /* A menu with an explicit GoUp parent, or a sub-menu below the root */
+        if (b->current_pgc && b->current_pgc->goup_pgc_nr > 0 &&
+            b->current_pgc->goup_pgc_nr != b->pgc_nr) {
+            return true;
+        }
+        return b->pgc_nr != root_pgcn;
+    }
+    /* At the top-level root or title menu */
+    return false;
+}
+
+static void refresh_escape_available(dvd_vm_bridge_t *b) {
+    atomic_store(&b->escape_available, compute_escape_available(b));
+}
+
+static bool vm_enter_pgc(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, int pgc_nr, int start_cell) {
+    bool ok = vm_enter_pgc_impl(b, dom, vts_nr, pgc_nr, start_cell);
+    if (b && b->running) {
+        refresh_escape_available(b);
+    }
+    return ok;
+}
+
 static void *vm_thread_func(void *arg) {
     dvd_vm_bridge_t *b = (dvd_vm_bridge_t *)arg;
 
@@ -1882,10 +1956,14 @@ static void *vm_thread_func(void *arg) {
     vm_enter_pgc(b, DVD_DOMAIN_FP, 0, 1, 1);
 
     while (b->running && b->domain != DVD_DOMAIN_EXIT) {
+        refresh_escape_available(b);
         dvd_pgc_t *pgc = b->current_pgc;
-        if (!pgc || pgc->nr_of_cells == 0 || b->cell_nr > pgc->nr_of_cells) {
+        if (!pgc || pgc->nr_of_cells == 0 || !pgc->cell_playback || b->cell_nr > pgc->nr_of_cells) {
             vm_finish_pgc(b);
             continue;
+        }
+        if (b->cell_nr < 1) {
+            b->cell_nr = 1;
         }
 
         int cur_cell_nr = b->cell_nr;
@@ -1951,6 +2029,7 @@ static void *vm_thread_func(void *arg) {
             if (b->resolving_root_menu && (b->domain == DVD_DOMAIN_VTSM || b->domain == DVD_DOMAIN_VMGM)) {
                 b->effective_root_vts = b->vts_nr;
                 b->effective_root_pgc_nr = b->pgc_nr;
+                refresh_escape_available(b);
             }
             if (b->player) {
                 player_adapter_set_paused(b->player, true);
@@ -1972,7 +2051,7 @@ static void *vm_thread_func(void *arg) {
                     interrupted = true;
                     break;
                 }
-                if (getenv("TINYDVD_FAST_TEST") != NULL) {
+                if (fast_test_mode()) {
                     /* In fast-forward test mode, stop waiting if interactive menu buttons are active */
                     if (b->has_active_hli && b->active_hli.hl_gi.btn_ns > 0) {
                         break;
@@ -2133,61 +2212,11 @@ void dvd_vm_bridge_activate_button(dvd_vm_bridge_t *b)           { queue_action(
 void dvd_vm_bridge_menu(dvd_vm_bridge_t *b)                      { queue_action(b, ACT_MENU, 0, 0); }
 
 bool dvd_vm_bridge_escape(dvd_vm_bridge_t *b) {
-    if (!b || !b->running) return false;
-
-    pthread_mutex_lock(&b->lock);
-
-    /* If playing a movie or title clip, Esc takes you up to the Root Menu if available */
-    if (b->domain == DVD_DOMAIN_VTSTT) {
-        int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
-        int pgcn = (b->effective_root_pgc_nr > 0 && b->effective_root_vts == target_vts)
-                   ? b->effective_root_pgc_nr
-                   : find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
-        dvd_pgc_t *menu_pgc = lookup_pgc(b, DVD_DOMAIN_VTSM, target_vts, pgcn);
-        if (target_vts != 1 && is_dummy_rsm_menu(menu_pgc)) {
-            int vts1_pgcn = find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, 1, 3);
-            dvd_pgc_t *vts1_menu = lookup_pgc(b, DVD_DOMAIN_VTSM, 1, vts1_pgcn);
-            if (vts1_menu && !is_dummy_rsm_menu(vts1_menu)) {
-                menu_pgc = vts1_menu;
-            }
-        }
-        dvd_pgc_t *vmgm_menu = lookup_pgc(b, DVD_DOMAIN_VMGM, 0, 1);
-        bool has_menu = (!is_dummy_rsm_menu(menu_pgc) || vmgm_menu != NULL);
-        if (!has_menu) {
-            pthread_mutex_unlock(&b->lock);
-            return false; /* No menu on disc to go up to: Esc exits */
-        }
-        b->pending_action = ACT_ESCAPE;
-        pthread_mutex_unlock(&b->lock);
-        return true;
+    if (!b || !b->running || !atomic_load(&b->escape_available)) {
+        return false; /* No menu level to go up to: Esc exits */
     }
-
-    /* If inside a Video Title Set Menu, check if we can go up a menu level */
-    if (b->domain == DVD_DOMAIN_VTSM) {
-        int target_vts = (b->vts_nr >= 1) ? b->vts_nr : 1;
-        int root_pgcn = (b->effective_root_pgc_nr > 0 && b->effective_root_vts == target_vts)
-                        ? b->effective_root_pgc_nr
-                        : find_menu_pgc_by_entry_id(b, DVD_DOMAIN_VTSM, target_vts, 3);
-
-        /* Case A: Menu PGC defines an explicit parent GoUp menu */
-        if (b->current_pgc && b->current_pgc->goup_pgc_nr > 0 &&
-            b->current_pgc->goup_pgc_nr != b->pgc_nr) {
-            b->pending_action = ACT_ESCAPE;
-            pthread_mutex_unlock(&b->lock);
-            return true;
-        }
-
-        /* Case B: Inside a sub-menu (Scene selection, audio, languages, etc.) and not root */
-        if (b->pgc_nr != root_pgcn) {
-            b->pending_action = ACT_ESCAPE;
-            pthread_mutex_unlock(&b->lock);
-            return true;
-        }
-    }
-
-    /* Already at the top-level Root Menu or Title Menu: cannot navigate up any further */
-    pthread_mutex_unlock(&b->lock);
-    return false;
+    queue_action(b, ACT_ESCAPE, 0, 0);
+    return true;
 }
 
 void dvd_vm_bridge_toggle_pause(dvd_vm_bridge_t *b)              { queue_action(b, ACT_TOGGLE_PAUSE, 0, 0); }

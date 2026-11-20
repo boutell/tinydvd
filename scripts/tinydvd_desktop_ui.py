@@ -76,6 +76,57 @@ SDLK_DOWN = 81 | SDLK_SCANCODE_MASK
 SDLK_UP = 82 | SDLK_SCANCODE_MASK
 SDLK_KP_ENTER = 88 | SDLK_SCANCODE_MASK
 
+# Player keys: (keys, shift_only, VM action, argument). The first matching
+# row wins, so the Shift rows come first. 0-9 seek to 0%-90% (see
+# player_key_action). Q, F and Escape are handled by the app itself.
+PLAYER_KEYS = [
+    ((SDLK_LEFT,), True, b"seek_rel", -60.0),
+    ((SDLK_RIGHT,), True, b"seek_rel", 60.0),
+    ((SDLK_UP,), False, b"up", 0.0),
+    ((SDLK_DOWN,), False, b"down", 0.0),
+    ((SDLK_LEFT,), False, b"left", 0.0),
+    ((SDLK_RIGHT,), False, b"right", 0.0),
+    ((SDLK_COMMA,), False, b"seek_rel", -10.0),
+    ((SDLK_PERIOD,), False, b"seek_rel", 10.0),
+    ((SDLK_LEFTBRACKET, SDLK_PAGEUP), False, b"prev_chapter", 0.0),
+    ((SDLK_RIGHTBRACKET, SDLK_PAGEDOWN), False, b"next_chapter", 0.0),
+    ((SDLK_c, SDLK_s), False, b"cycle_subs", 0.0),
+    ((SDLK_a,), False, b"cycle_audio", 0.0),
+    ((SDLK_RETURN, SDLK_KP_ENTER), False, b"activate", 0.0),
+    ((SDLK_SPACE,), False, b"pause", 0.0),
+    ((SDLK_m,), False, b"menu", 0.0),
+]
+
+# Help for the keys above, shown by `tinydvd --help`. Keep the two in step.
+PLAYER_KEY_HELP = [
+    ("Arrow keys", "In a menu: move between buttons"),
+    ("Left / Right", "In a title: seek -10s / +10s"),
+    ("Shift + Left / Right", "Seek -60s / +60s"),
+    ("Down / Up", "In a title: seek -60s / +60s"),
+    (", / .", "Seek -10s / +10s"),
+    ("[ / ] or PgUp / PgDn", "Previous / next chapter"),
+    ("0 - 9", "Jump to 0% - 90% of the title"),
+    ("Enter / mouse click", "Activate the selected menu button"),
+    ("Space", "Toggle pause"),
+    ("C / S", "Cycle subtitles and closed captions"),
+    ("A", "Cycle audio tracks"),
+    ("M", "Go to the disc's root menu"),
+    ("Escape", "Go up a menu level, or back to the library"),
+    ("F", "Toggle fullscreen"),
+    ("Q", "Quit"),
+]
+
+
+def player_key_action(sym: int, mod: int) -> tuple[bytes, float] | None:
+    """(VM action, argument) for a key pressed while a disc plays, or None."""
+    if SDLK_0 <= sym <= SDLK_9:
+        return b"seek_frac", float(sym - SDLK_0) * 0.10
+    shifted = bool(mod & KMOD_SHIFT)
+    for keys, shift_only, action, arg in PLAYER_KEYS:
+        if sym in keys and (shifted or not shift_only):
+            return action, arg
+    return None
+
 SDL_SCANCODE_A = 4
 SDL_SCANCODE_C = 6
 SDL_SCANCODE_F = 9
@@ -1886,43 +1937,11 @@ def run_desktop_app(core: TinyDVDCore, dvd_path: str, start_fullscreen: bool) ->
                 if ev.type == EVT_KEYDOWN:
                     sym = ev.keysym
                     mod = ev.keymod
+                    action = player_key_action(sym, mod) if in_player_view else None
                     if sym == SDLK_q:
                         running = False
-                    elif sym == SDLK_UP and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"up", 0, 0, 0.0)
-                    elif sym == SDLK_DOWN and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"down", 0, 0, 0.0)
-                    elif sym == SDLK_LEFT and in_player_view:
-                        if mod & KMOD_SHIFT:
-                            core.lib.tdvd_desktop_vm_action(ctx, b"seek_rel", 0, 0, -60.0)
-                        else:
-                            core.lib.tdvd_desktop_vm_action(ctx, b"left", 0, 0, 0.0)
-                    elif sym == SDLK_RIGHT and in_player_view:
-                        if mod & KMOD_SHIFT:
-                            core.lib.tdvd_desktop_vm_action(ctx, b"seek_rel", 0, 0, 60.0)
-                        else:
-                            core.lib.tdvd_desktop_vm_action(ctx, b"right", 0, 0, 0.0)
-                    elif sym == SDLK_COMMA and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"seek_rel", 0, 0, -10.0)
-                    elif sym == SDLK_PERIOD and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"seek_rel", 0, 0, 10.0)
-                    elif sym in (SDLK_LEFTBRACKET, SDLK_PAGEUP) and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"prev_chapter", 0, 0, 0.0)
-                    elif sym in (SDLK_RIGHTBRACKET, SDLK_PAGEDOWN) and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"next_chapter", 0, 0, 0.0)
-                    elif SDLK_0 <= sym <= SDLK_9 and in_player_view:
-                        frac = float(sym - SDLK_0) * 0.10
-                        core.lib.tdvd_desktop_vm_action(ctx, b"seek_frac", 0, 0, frac)
-                    elif sym in (SDLK_c, SDLK_s) and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"cycle_subs", 0, 0, 0.0)
-                    elif sym == SDLK_a and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"cycle_audio", 0, 0, 0.0)
-                    elif sym in (SDLK_RETURN, SDLK_KP_ENTER) and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"activate", 0, 0, 0.0)
-                    elif sym == SDLK_SPACE and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"pause", 0, 0, 0.0)
-                    elif sym == SDLK_m and in_player_view:
-                        core.lib.tdvd_desktop_vm_action(ctx, b"menu", 0, 0, 0.0)
+                    elif action:
+                        core.lib.tdvd_desktop_vm_action(ctx, action[0], 0, 0, action[1])
                     elif sym == SDLK_ESCAPE:
                         if in_player_view:
                             if not core.lib.tdvd_desktop_vm_action(ctx, b"escape", 0, 0, 0.0):

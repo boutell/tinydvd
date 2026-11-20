@@ -58,6 +58,23 @@ int main(void) {
     assert(spu_compositor_get_frame_height(spu) == SPU_HEIGHT);
     printf("OK\n");
 
+    /* A malformed subpicture whose two command blocks link to each other
+     * must be parsed once, not forever */
+    printf("Testing looping command-block chain... ");
+    {
+        uint8_t unit[24] = {0};
+        unit[0] = 0; unit[1] = sizeof(unit);   /* total size */
+        unit[2] = 0; unit[3] = 8;              /* first command block at 8 */
+        unit[8] = 0; unit[9] = 0;              /* block A: delay 0 */
+        unit[10] = 0; unit[11] = 16;           /*          next -> block B */
+        unit[12] = 0xFF;                       /*          end of commands */
+        unit[16] = 0; unit[17] = 0;            /* block B: delay 0 */
+        unit[18] = 0; unit[19] = 8;            /*          next -> block A again */
+        unit[20] = 0xFF;
+        spu_compositor_feed_spu_data(spu, unit, sizeof(unit), 0);
+    }
+    printf("OK\n");
+
     spu_compositor_destroy(spu);
     printf("All SPU Compositor tests passed!\n");
     return 0;

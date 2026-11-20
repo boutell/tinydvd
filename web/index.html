@@ -1,0 +1,1707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TinyDVD Web Player</title>
+  <style>
+    :root {
+      --bg: #0b0c10;
+      --surface: #1f2833;
+      --surface-glass: rgba(31, 40, 51, 0.85);
+      --accent: #66fcf1;
+      --accent-dim: #45a29e;
+      --text: #c5c6c7;
+      --text-bright: #ffffff;
+      --danger: #ff4d4d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      height: 100vh;
+      width: 100vw;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+    }
+    #library-view {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+      padding: 24px;
+      background: radial-gradient(circle at top, #1a1e24 0%, #0b0c10 100%);
+    }
+    .library-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    .library-title {
+      font-size: 1.8rem;
+      font-weight: 700;
+      color: var(--text-bright);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .library-title span { color: var(--accent); }
+    .library-search-box {
+      position: relative;
+      display: flex;
+      align-items: center;
+      width: 380px;
+      max-width: 100%;
+    }
+    .search-input {
+      width: 100%;
+      padding: 9px 14px 9px 36px;
+      background: var(--surface);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 20px;
+      color: var(--text-bright);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .search-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 10px rgba(102, 252, 241, 0.25);
+    }
+    .search-icon {
+      position: absolute;
+      left: 12px;
+      pointer-events: none;
+      font-size: 13px;
+      opacity: 0.6;
+    }
+    .movie-year-badge {
+      position: absolute;
+      top: 8px; right: 8px;
+      background: rgba(0,0,0,0.8);
+      color: var(--accent);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 6px;
+      border: 1px solid rgba(102, 252, 241, 0.4);
+      backdrop-filter: blur(4px);
+    }
+    .movie-director {
+      font-size: 0.8rem;
+      color: var(--accent-dim);
+      margin-bottom: 3px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .movie-cast {
+      font-size: 0.75rem;
+      color: #8892b0;
+      margin-bottom: 6px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      line-height: 1.3;
+    }
+    .movie-genres {
+      font-size: 0.7rem;
+      color: var(--text);
+      margin-bottom: 8px;
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .genre-chip {
+      background: rgba(255,255,255,0.08);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+    .empty-search {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 60px 20px;
+      color: var(--text);
+      font-size: 1.1rem;
+    }
+    .catalog-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 20px;
+    }
+    .movie-card {
+      background: var(--surface);
+      border-radius: 10px;
+      overflow: hidden;
+      cursor: pointer;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+      border: 1px solid rgba(255,255,255,0.08);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .movie-card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 12px 24px rgba(0,0,0,0.5);
+      border-color: var(--accent);
+    }
+    .movie-thumb-wrap {
+      width: 100%;
+      padding-top: 133.33%; /* 3:4 aspect ratio */
+      position: relative;
+      background: #14171a;
+    }
+    .movie-thumb {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+    }
+    .movie-info {
+      padding: 12px 14px;
+    }
+    .movie-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-bright);
+      margin-bottom: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .movie-meta {
+      font-size: 0.8rem;
+      color: var(--text);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: auto;
+    }
+    #player-view {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 50;
+      overflow: hidden;
+    }
+    #player-view:fullscreen,
+    #player-view:-webkit-full-screen {
+      width: 100vw !important;
+      height: 100vh !important;
+      background: #000 !important;
+    }
+    .viewport-box {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+      background: #000;
+    }
+    .video-stage {
+      position: relative;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: #000;
+      max-width: 100%;
+      max-height: 100%;
+      overflow: hidden;
+    }
+    video#video {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #000;
+      object-fit: fill;
+    }
+    canvas#overlay-canvas {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: auto;
+      touch-action: none;
+    }
+    .hud-layer {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      transition: opacity 0.3s ease;
+    }
+    .hud-layer.idle { opacity: 0; }
+    .hud-layer > * { pointer-events: auto; }
+    .top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      background: linear-gradient(180deg, rgba(0,0,0,0.8) 0%, rgba(0,0,0,0) 100%);
+    }
+    .top-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .hud-btn {
+      background: var(--surface-glass);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: var(--text-bright);
+      padding: 8px 14px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 500;
+      cursor: pointer;
+      backdrop-filter: blur(8px);
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .hud-btn:hover {
+      background: rgba(102, 252, 241, 0.2);
+      border-color: var(--accent);
+    }
+    .hud-btn.active {
+      background: var(--accent);
+      color: #0b0c10;
+    }
+    .status-pill {
+      font-size: 0.75rem;
+      padding: 4px 10px;
+      border-radius: 20px;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.1);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #4cd137;
+    }
+    .status-dot.disconnected { background: var(--danger); }
+    .osd-message {
+      position: absolute;
+      top: 60px; right: 20px;
+      background: var(--surface-glass);
+      border: 1px solid var(--accent);
+      color: var(--text-bright);
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 500;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+      opacity: 0;
+      transform: translateY(-8px);
+      transition: opacity 0.2s, transform 0.2s;
+      pointer-events: none;
+    }
+    .osd-message.visible { opacity: 1; transform: translateY(0); }
+    .bottom-bar {
+      background: linear-gradient(0deg, rgba(0,0,0,0.85) 0%, rgba(0,0,0,0) 100%);
+      padding: 20px 24px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .progress-bar-container {
+      width: 100%;
+      height: 6px;
+      background: rgba(255,255,255,0.2);
+      border-radius: 3px;
+      cursor: pointer;
+      position: relative;
+      transition: height 0.15s;
+    }
+    .progress-bar-container:hover { height: 10px; }
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      width: 0%;
+      position: relative;
+    }
+    .controls-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .controls-left, .controls-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .time-display {
+      font-size: 0.85rem;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      margin-left: 8px;
+    }
+    /* Touch D-Pad Remote Control Overlay */
+    .dpad-overlay {
+      position: absolute;
+      right: 24px;
+      bottom: 90px;
+      background: rgba(20, 24, 30, 0.85);
+      border: 1px solid rgba(255,255,255,0.15);
+      backdrop-filter: blur(12px);
+      border-radius: 18px;
+      padding: 14px;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+      z-index: 60;
+    }
+    .dpad-overlay.visible { display: flex; }
+    .dpad-grid {
+      display: grid;
+      grid-template-columns: 48px 48px 48px;
+      grid-template-rows: 48px 48px 48px;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .dpad-btn {
+      background: var(--surface);
+      border: 1px solid rgba(255,255,255,0.15);
+      color: var(--text-bright);
+      border-radius: 8px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 1.1rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.1s, transform 0.05s;
+    }
+    .dpad-btn:active { background: var(--accent); color: #000; transform: scale(0.92); }
+    .dpad-btn.ok-btn {
+      background: var(--accent-dim);
+      color: #fff;
+      font-size: 0.9rem;
+    }
+    .dpad-actions {
+      display: flex;
+      gap: 8px;
+      width: 100%;
+    }
+    .dpad-actions .hud-btn {
+      flex: 1;
+      justify-content: center;
+      padding: 8px 6px;
+      font-size: 0.8rem;
+    }
+    /* Modal Shortcuts Help */
+    .shortcuts-modal {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(0,0,0,0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 100;
+    }
+    .shortcuts-modal.visible { display: flex; }
+    .shortcuts-box {
+      background: var(--surface);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 440px;
+      width: 90%;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.8);
+    }
+    .shortcuts-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--text-bright);
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .shortcuts-list {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px 16px;
+      font-size: 0.9rem;
+      margin-bottom: 20px;
+    }
+    .key-badge {
+      background: #0b0c10;
+      border: 1px solid rgba(255,255,255,0.2);
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 0.8rem;
+      color: var(--accent);
+      text-align: center;
+    }
+    .play-overlay {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.65);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      z-index: 60;
+      cursor: pointer;
+    }
+    .play-overlay.visible { display: flex; }
+    .play-overlay-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 14px;
+      padding: 24px 32px;
+      background: var(--surface-glass);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 16px;
+      box-shadow: 0 16px 36px rgba(0,0,0,0.7);
+      transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .play-overlay-card:hover {
+      transform: scale(1.05);
+      border-color: var(--accent);
+    }
+    .play-overlay-icon {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #0b0c10;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-size: 26px;
+      padding-left: 4px;
+    }
+    .play-overlay-text {
+      color: var(--text-bright);
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .library-header-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .import-open-btn {
+      background: var(--accent);
+      color: #0b0c10;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: transform 0.12s ease, opacity 0.15s ease, box-shadow 0.15s ease;
+    }
+    .import-open-btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 14px rgba(102, 252, 241, 0.35);
+    }
+    .import-open-btn:active { transform: translateY(0); }
+    .import-box {
+      background: var(--surface);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 12px;
+      padding: 24px;
+      max-width: 560px;
+      width: 92%;
+      box-shadow: 0 16px 40px rgba(0,0,0,0.85);
+      user-select: text;
+    }
+    .import-field {
+      margin-bottom: 14px;
+    }
+    .import-label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text-bright);
+      margin-bottom: 6px;
+    }
+    .import-hint {
+      font-size: 0.78rem;
+      color: #8892b0;
+      margin-top: 4px;
+    }
+    .import-input {
+      width: 100%;
+      padding: 9px 12px;
+      background: #0b0c10;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 8px;
+      color: var(--text-bright);
+      font-size: 0.9rem;
+      outline: none;
+    }
+    .import-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 8px rgba(102, 252, 241, 0.25);
+    }
+    .import-checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.88rem;
+      color: var(--text);
+      margin: 10px 0 18px;
+      cursor: pointer;
+    }
+    .import-checkbox-row input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+    .import-progress-box {
+      background: #0b0c10;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .import-progress-box.visible { display: block; }
+    .import-stage-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .import-elapsed {
+      font-family: monospace;
+      font-size: 0.85rem;
+      color: var(--text);
+    }
+    .import-error-msg {
+      color: var(--danger);
+      background: rgba(255, 77, 77, 0.12);
+      border: 1px solid rgba(255, 77, 77, 0.35);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.85rem;
+      margin-bottom: 10px;
+      display: none;
+    }
+    .import-log {
+      background: #06070a;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 6px;
+      padding: 8px 10px;
+      height: 180px;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.76rem;
+      line-height: 1.4;
+      color: #a8b2d1;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .import-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .import-btn-primary {
+      background: var(--accent);
+      color: #0b0c10;
+      border: none;
+      padding: 9px 18px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .import-btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .import-btn-danger {
+      background: rgba(255, 77, 77, 0.18);
+      color: #ff8080;
+      border: 1px solid rgba(255, 77, 77, 0.45);
+      padding: 9px 16px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- LIBRARY CATALOG VIEW -->
+  <div id="library-view" style="display:none;">
+    <div class="library-header">
+      <div class="library-title">Tiny<span>DVD</span> Cinema</div>
+      <div class="library-search-box">
+        <span class="search-icon">&#128269;</span>
+        <input id="search-input" type="search" class="search-input" placeholder="Search title, actor, director, genre..." autocomplete="off">
+      </div>
+      <div class="library-header-right">
+        <div id="library-stats" style="font-size:0.9rem; color:var(--text);"></div>
+        <button id="btn-open-import" class="import-open-btn" style="display:none;">+ Import DVD</button>
+        <button id="btn-logout" class="hud-btn" title="Log out">Log out</button>
+      </div>
+    </div>
+    <div id="catalog-grid" class="catalog-grid"></div>
+  </div>
+
+  <!-- CINEMA PLAYER VIEW -->
+  <div id="player-view" style="display:flex;">
+    <div id="viewport-box" class="viewport-box">
+      <div id="video-stage" class="video-stage">
+        <video id="video" playsinline preload="auto"></video>
+        <canvas id="overlay-canvas"></canvas>
+        <div id="play-overlay" class="play-overlay">
+          <div class="play-overlay-card">
+            <div class="play-overlay-icon">&#9654;</div>
+            <div class="play-overlay-text">Click anywhere to start</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="hud-layer" class="hud-layer">
+        <div class="top-bar">
+          <div class="top-left">
+            <button id="btn-back-lib" class="hud-btn">&#8592; Library</button>
+            <div id="movie-label" style="font-weight:600; color:var(--text-bright); font-size:1rem;"></div>
+          </div>
+          <div class="top-right" style="display:flex; align-items:center; gap:10px;">
+            <div class="status-pill">
+              <div id="status-dot" class="status-dot"></div>
+              <span id="status-text">Connected</span>
+            </div>
+            <button id="btn-shortcuts" class="hud-btn" title="Keyboard Shortcuts">?</button>
+          </div>
+        </div>
+
+        <div id="osd" class="osd-message"></div>
+
+        <!-- D-PAD REMOTE OVERLAY -->
+        <div id="dpad-overlay" class="dpad-overlay">
+          <div class="dpad-grid">
+            <div></div>
+            <button id="pad-up" class="dpad-btn">&#9650;</button>
+            <div></div>
+            <button id="pad-left" class="dpad-btn">&#9664;</button>
+            <button id="pad-ok" class="dpad-btn ok-btn">OK</button>
+            <button id="pad-right" class="dpad-btn">&#9654;</button>
+            <div></div>
+            <button id="pad-down" class="dpad-btn">&#9660;</button>
+            <div></div>
+          </div>
+          <div class="dpad-actions">
+            <button id="pad-menu" class="hud-btn">Menu</button>
+            <button id="pad-esc" class="hud-btn">Esc</button>
+          </div>
+        </div>
+
+        <div class="bottom-bar">
+          <div id="progress-bar" class="progress-bar-container">
+            <div id="progress-fill" class="progress-bar-fill"></div>
+          </div>
+          <div class="controls-row">
+            <div class="controls-left">
+              <button id="btn-play-pause" class="hud-btn" title="Play (Space)"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M8 5v14l11-7z"/></svg></button>
+              <button id="btn-prev-chapter" class="hud-btn" title="Previous Chapter">&#9198;</button>
+              <button id="btn-next-chapter" class="hud-btn" title="Next Chapter">&#9197;</button>
+              <button id="btn-menu" class="hud-btn">Menu</button>
+              <button id="btn-esc" class="hud-btn">Esc</button>
+              <div id="time-display" class="time-display">00:00 / 00:00</div>
+            </div>
+            <div class="controls-right">
+              <button id="btn-toggle-remote" class="hud-btn" title="Toggle On-Screen Remote">Remote</button>
+              <button id="btn-subs" class="hud-btn" title="Cycle Subtitles">CC</button>
+              <button id="btn-audio" class="hud-btn" title="Cycle Audio Track">Audio</button>
+              <button id="btn-fullscreen" class="hud-btn" title="Fullscreen">[ &nbsp; ]</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SHORTCUTS MODAL -->
+  <div id="shortcuts-modal" class="shortcuts-modal">
+    <div class="shortcuts-box">
+      <div class="shortcuts-title">
+        <span>Keyboard Shortcuts</span>
+        <button id="btn-close-shortcuts" class="hud-btn" style="padding:4px 8px;">&times;</button>
+      </div>
+      <div class="shortcuts-list">
+        <div class="key-badge">&uarr; &darr; &larr; &rarr;</div><div>Navigate DVD Menu buttons</div>
+        <div class="key-badge">Enter</div><div>Activate highlighted button</div>
+        <div class="key-badge">Space</div><div>Play / Pause video</div>
+        <div class="key-badge">M</div><div>DVD Root / Title Menu</div>
+        <div class="key-badge">Esc</div><div>Back up a menu / Library</div>
+        <div class="key-badge">[ / ]</div><div>Previous / Next Chapter</div>
+        <div class="key-badge">C</div><div>Cycle Subtitles / CC</div>
+        <div class="key-badge">A</div><div>Cycle Audio Track</div>
+        <div class="key-badge">F</div><div>Toggle Fullscreen</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- IMPORT DVD MODAL -->
+  <div id="import-modal" class="shortcuts-modal">
+    <div class="import-box">
+      <div class="shortcuts-title">
+        <span>Import DVD to Library</span>
+        <button id="btn-close-import" class="hud-btn" style="padding:4px 8px;">&times;</button>
+      </div>
+
+      <div id="import-form">
+        <div class="import-field">
+          <label class="import-label" for="import-source">DVD Drive or Source Path</label>
+          <input id="import-source" type="text" class="import-input" placeholder="/dev/sr0 or /path/to/DVD_FOLDER or movie.iso" autocomplete="off">
+          <div class="import-hint">Optical drive device (e.g. /dev/sr0), mounted disc volume, DVD backup folder, or .iso file.</div>
+        </div>
+        <div class="import-field">
+          <label class="import-label" for="import-title">Movie Title (optional)</label>
+          <input id="import-title" type="text" class="import-input" placeholder="Auto-detect from disc label (e.g. Eulogy)" autocomplete="off">
+        </div>
+        <label class="import-checkbox-row">
+          <input id="import-enrich" type="checkbox" checked>
+          <span>Fetch movie metadata (director, cast, year, genres)</span>
+        </label>
+      </div>
+
+      <div id="import-progress-box" class="import-progress-box">
+        <div class="import-stage-row">
+          <span id="import-stage-text">Preparing import...</span>
+          <span id="import-elapsed" class="import-elapsed">00:00</span>
+        </div>
+        <div id="import-error-msg" class="import-error-msg"></div>
+        <pre id="import-log" class="import-log"></pre>
+      </div>
+
+      <div class="import-actions">
+        <button id="btn-cancel-import" class="import-btn-danger" style="display:none;">Cancel Import</button>
+        <button id="btn-done-import" class="hud-btn">Close</button>
+        <button id="btn-start-import" class="import-btn-primary">Start Import</button>
+        <button id="btn-play-imported" class="import-btn-primary" style="display:none;">Play Now &#9654;</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const stage = document.getElementById('video-stage');
+    const canvas = document.getElementById('overlay-canvas');
+    const ctx = canvas.getContext('2d');
+    const hud = document.getElementById('hud-layer');
+    const osd = document.getElementById('osd');
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+    const dpad = document.getElementById('dpad-overlay');
+    const libraryView = document.getElementById('library-view');
+    const playerView = document.getElementById('player-view');
+    const catalogGrid = document.getElementById('catalog-grid');
+    const progressFill = document.getElementById('progress-fill');
+    const timeDisplay = document.getElementById('time-display');
+    const movieLabel = document.getElementById('movie-label');
+    const playOverlay = document.getElementById('play-overlay');
+
+    let ws = null;
+    let isLibraryMode = false;
+    let activeButtons = [];
+    let hudIdleTimer = null;
+    let currentVideoSrc = '';
+    let isPaused = false;
+    let hasOverlay = false;
+    let currentOverlaySeq = 0;
+    let pendingSeekPts = null;
+
+    let sessionId = sessionStorage.getItem('tinydvd_session_id');
+    if (!sessionId) {
+      sessionId = 's_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+      sessionStorage.setItem('tinydvd_session_id', sessionId);
+    }
+
+    function formatTime(sec) {
+      if (!sec || isNaN(sec) || !isFinite(sec)) return '00:00';
+      const s = Math.floor(sec % 60);
+      const m = Math.floor((sec / 60) % 60);
+      const h = Math.floor(sec / 3600);
+      const pad = n => (n < 10 ? '0' + n : n);
+      return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+    }
+
+    function showOSD(msg) {
+      if (!msg) return;
+      osd.textContent = msg;
+      osd.classList.add('visible');
+      clearTimeout(osd._timer);
+      osd._timer = setTimeout(() => osd.classList.remove('visible'), 2000);
+    }
+
+    function wakeHUD() {
+      hud.classList.remove('idle');
+      clearTimeout(hudIdleTimer);
+      hudIdleTimer = setTimeout(() => {
+        if (!video.paused) hud.classList.add('idle');
+      }, 3000);
+    }
+    document.addEventListener('mousemove', wakeHUD);
+    document.addEventListener('pointerdown', wakeHUD);
+
+    const SVG_PLAY = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M8 5v14l11-7z"/></svg>';
+    const SVG_PAUSE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
+
+    function updatePlayPauseBtn() {
+      const btn = document.getElementById('btn-play-pause');
+      if (!btn) return;
+      if (video.paused) {
+        btn.innerHTML = SVG_PLAY;
+        btn.setAttribute('title', 'Play (Space)');
+      } else {
+        btn.innerHTML = SVG_PAUSE;
+        btn.setAttribute('title', 'Pause (Space)');
+      }
+    }
+
+    function clearOverlayCanvas() {
+      currentOverlaySeq++;
+      activeButtons = [];
+      hasOverlay = false;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.width = canvas.width;
+    }
+    function showPlayOverlay() {
+      if (playOverlay) playOverlay.classList.add('visible');
+    }
+
+    function hidePlayOverlay() {
+      if (playOverlay) playOverlay.classList.remove('visible');
+    }
+
+    function attemptPlay() {
+      if (!video.src || isPaused) return;
+      const p = video.play();
+      if (p !== undefined && p.catch) {
+        p.then(() => {
+          hidePlayOverlay();
+          updatePlayPauseBtn();
+          sendWS({ type: 'client_playback', state: 'playing', pts: video.currentTime });
+        }).catch(err => {
+          console.warn('Autoplay prevented by browser:', err.name);
+          showPlayOverlay();
+          updatePlayPauseBtn();
+          sendWS({ type: 'client_playback', state: 'paused', pts: video.currentTime });
+        });
+      }
+    }
+
+    if (playOverlay) {
+      playOverlay.onclick = (e) => {
+        e.stopPropagation();
+        isPaused = false;
+        attemptPlay();
+      };
+    }
+    playerView.addEventListener('pointerdown', (e) => {
+      if (playOverlay && playOverlay.classList.contains('visible')) {
+        isPaused = false;
+        attemptPlay();
+      }
+    });
+
+    let currentSeq = 0;
+    let isSeeking = false;
+
+    video.addEventListener('play', () => {
+      if (isPaused) {
+        video.pause();
+        return;
+      }
+      hidePlayOverlay();
+      if (activeButtons.length === 0) clearOverlayCanvas();
+      updatePlayPauseBtn();
+      sendWS({ type: 'client_playback', state: 'playing', pts: video.currentTime, seq: currentSeq });
+    });
+    video.addEventListener('playing', () => {
+      if (isPaused) {
+        video.pause();
+        return;
+      }
+      hidePlayOverlay();
+      if (activeButtons.length === 0) clearOverlayCanvas();
+      updatePlayPauseBtn();
+      sendWS({ type: 'client_playback', state: 'playing', pts: video.currentTime, seq: currentSeq });
+    });
+    video.addEventListener('pause', () => {
+      updatePlayPauseBtn();
+      sendWS({ type: 'client_playback', state: 'paused', pts: video.currentTime, seq: currentSeq });
+    });
+    video.addEventListener('timeupdate', () => {
+      if (!video.paused && !video.ended && !isSeeking) {
+        sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
+      }
+    });
+    video.addEventListener('seeking', () => {
+      isSeeking = true;
+    });
+    video.addEventListener('seeked', () => {
+      isSeeking = false;
+      if (isPaused) {
+        video.pause();
+      }
+      sendWS({ type: 'seek_completed', pts: video.currentTime, seq: currentSeq });
+      sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
+    });
+    function seekTo(pts, seq) {
+      if (pts === undefined || pts === null) return;
+      if (seq !== undefined) currentSeq = seq;
+      if (isPaused) {
+        video.pause();
+      }
+      if (video.readyState >= 1 && isFinite(video.duration)) {
+        if (Math.abs(video.currentTime - pts) > 0.05) {
+          isSeeking = true;
+          video.currentTime = pts;
+        } else {
+          sendWS({ type: 'seek_completed', pts: video.currentTime, seq: currentSeq });
+        }
+        pendingSeekPts = null;
+      } else {
+        pendingSeekPts = pts;
+      }
+    }
+    video.addEventListener('loadedmetadata', () => {
+      if (pendingSeekPts !== null) {
+        isSeeking = true;
+        video.currentTime = pendingSeekPts;
+        pendingSeekPts = null;
+      }
+      if (isPaused) {
+        video.pause();
+      }
+    });
+    video.addEventListener('canplay', () => {
+      if (pendingSeekPts !== null) {
+        isSeeking = true;
+        video.currentTime = pendingSeekPts;
+        pendingSeekPts = null;
+      }
+      if (isPaused) {
+        video.pause();
+      }
+      sendWS({ type: 'file_loaded', seq: currentSeq });
+    });
+    video.addEventListener('ended', () => {
+      sendWS({ type: 'time_update', pts: video.duration || (video.currentTime + 1.0), seq: currentSeq });
+      sendWS({ type: 'video_ended', seq: currentSeq });
+      updatePlayPauseBtn();
+    });
+
+    function resizeStage() {
+      if (playerView.style.display === 'none') return;
+      const vp = document.getElementById('viewport-box');
+      const containerW = vp && vp.clientWidth > 0 ? vp.clientWidth : window.innerWidth;
+      const containerH = vp && vp.clientHeight > 0 ? vp.clientHeight : window.innerHeight;
+      if (!containerW || !containerH) return;
+      let aspect = 16 / 9;
+      if (video.videoWidth && video.videoHeight) {
+        const rawAspect = video.videoWidth / video.videoHeight;
+        if (Math.abs(rawAspect - 1.5) < 0.05 || Math.abs(rawAspect - 1.25) < 0.05) {
+          aspect = 16 / 9;
+        } else {
+          aspect = rawAspect;
+        }
+      }
+      let w = containerW;
+      let h = containerW / aspect;
+      if (h > containerH) {
+        h = containerH;
+        w = containerH * aspect;
+      }
+      if (stage) {
+        stage.style.width = Math.round(w) + 'px';
+        stage.style.height = Math.round(h) + 'px';
+      }
+    }
+    window.addEventListener('resize', resizeStage);
+    document.addEventListener('fullscreenchange', () => {
+      resizeStage();
+      setTimeout(resizeStage, 50);
+      setTimeout(resizeStage, 150);
+      setTimeout(resizeStage, 300);
+    });
+    document.addEventListener('webkitfullscreenchange', () => {
+      resizeStage();
+      setTimeout(resizeStage, 50);
+      setTimeout(resizeStage, 150);
+      setTimeout(resizeStage, 300);
+    });
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(() => resizeStage());
+      const vp = document.getElementById('viewport-box');
+      if (vp) ro.observe(vp);
+      ro.observe(document.body);
+    }
+    video.addEventListener('loadedmetadata', resizeStage);
+    video.addEventListener('canplay', resizeStage);
+    video.addEventListener('play', resizeStage);
+    video.addEventListener('playing', resizeStage);
+
+    function alignCanvas() {
+      resizeStage();
+    }
+
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws?session=${encodeURIComponent(sessionId)}`);
+      ws.onopen = () => {
+        statusDot.classList.remove('disconnected');
+        statusText.textContent = 'Connected';
+      };
+      ws.onclose = () => {
+        statusDot.classList.add('disconnected');
+        statusText.textContent = 'Reconnecting...';
+        setTimeout(connectWS, 1500);
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          handleServerMessage(msg);
+        } catch (err) { console.error('WS parse error', err); }
+      };
+    }
+
+    function sendWS(obj) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(obj));
+      }
+    }
+
+    function handleServerMessage(msg) {
+      switch (msg.type) {
+        case 'video_load':
+          clearOverlayCanvas();
+          if (msg.seq !== undefined) currentSeq = msg.seq;
+          if (libraryView.style.display !== 'none' && !isLibraryMode) {
+            libraryView.style.display = 'none';
+          }
+          if (playerView.style.display === 'none') {
+            playerView.style.display = 'flex';
+          }
+          resizeStage();
+          if (msg.paused !== undefined) {
+            isPaused = !!msg.paused;
+          }
+          if (msg.src && msg.src !== currentVideoSrc) {
+            currentVideoSrc = msg.src;
+            video.src = msg.src;
+            pendingSeekPts = (msg.pts !== undefined && msg.pts > 0) ? msg.pts : null;
+            if (!isPaused) {
+              attemptPlay();
+            } else {
+              video.pause();
+            }
+          } else if (msg.pts !== undefined) {
+            // Same file already in the element: canplay will not fire again,
+            // so acknowledge the load ourselves once it has data.
+            if (video.readyState >= 2) sendWS({ type: 'file_loaded', seq: currentSeq });
+            seekTo(msg.pts, msg.seq);
+            if (!isPaused) {
+              attemptPlay();
+            } else {
+              video.pause();
+            }
+          }
+          updatePlayPauseBtn();
+          setTimeout(resizeStage, 50);
+          setTimeout(resizeStage, 200);
+          break;
+        case 'seek':
+          if (msg.seq !== undefined) currentSeq = msg.seq;
+          if (msg.paused !== undefined) {
+            isPaused = !!msg.paused;
+          }
+          if (msg.pts !== undefined) {
+            seekTo(msg.pts, msg.seq);
+          }
+          if (isPaused) {
+            video.pause();
+          } else {
+            attemptPlay();
+          }
+          updatePlayPauseBtn();
+          break;
+        case 'pause':
+          isPaused = !!msg.paused;
+          if (isPaused) {
+            video.pause();
+          } else {
+            attemptPlay();
+          }
+          updatePlayPauseBtn();
+          break;
+        case 'highlight':
+          currentOverlaySeq++;
+          const seq = currentOverlaySeq;
+          activeButtons = msg.buttons || [];
+          if (msg.data_url && activeButtons.length > 0) {
+            canvas.width = msg.w || 720;
+            canvas.height = msg.h || 480;
+            const img = new Image();
+            img.onload = () => {
+              if (seq === currentOverlaySeq && activeButtons.length > 0) {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                hasOverlay = true;
+              }
+            };
+            img.src = msg.data_url;
+          } else {
+            clearOverlayCanvas();
+          }
+          break;
+        case 'osd':
+          showOSD(msg.text);
+          break;
+        case 'state':
+          if (msg.session_id) {
+            sessionId = msg.session_id;
+            sessionStorage.setItem('tinydvd_session_id', sessionId);
+          }
+          if (msg.movie_title) movieLabel.textContent = msg.movie_title;
+          break;
+      }
+    }
+
+    // Sync playback clock back to server
+    setInterval(() => {
+      updatePlayPauseBtn();
+      if (!video.paused && !video.ended && !isSeeking) {
+        sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
+      }
+      // Update time display
+      if (video.duration && isFinite(video.duration)) {
+        const pct = (video.currentTime / video.duration) * 100;
+        progressFill.style.width = pct + '%';
+        timeDisplay.textContent = `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`;
+      } else {
+        timeDisplay.textContent = formatTime(video.currentTime);
+      }
+    }, 250);
+
+    // DVD Canvas Mouse/Touch Interaction
+    function getDvdCoords(e) {
+      const r = canvas.getBoundingClientRect();
+      const sx = canvas.width / r.width;
+      const sy = canvas.height / r.height;
+      return {
+        x: Math.round((e.clientX - r.left) * sx),
+        y: Math.round((e.clientY - r.top) * sy)
+      };
+    }
+
+    canvas.addEventListener('pointermove', (e) => {
+      const { x, y } = getDvdCoords(e);
+      let onBtn = false;
+      for (const b of activeButtons) {
+        if (x >= b.x1 && x <= b.x2 && y >= b.y1 && y <= b.y2) {
+          onBtn = true; break;
+        }
+      }
+      canvas.style.cursor = onBtn ? 'pointer' : 'default';
+      sendWS({ type: 'mouse_move', x, y });
+    });
+
+    canvas.addEventListener('pointerdown', (e) => {
+      const { x, y } = getDvdCoords(e);
+      sendWS({ type: 'mouse_click', x, y });
+    });
+
+    // Keyboard navigation
+    window.addEventListener('keydown', (e) => {
+      if (playerView.style.display === 'none') return;
+      wakeHUD();
+      switch (e.key) {
+        case 'ArrowUp': e.preventDefault(); sendWS({ type: 'key', key: 'up' }); break;
+        case 'ArrowDown': e.preventDefault(); sendWS({ type: 'key', key: 'down' }); break;
+        case 'ArrowLeft':
+          if (activeButtons.length > 0) {
+            e.preventDefault(); sendWS({ type: 'key', key: 'left' });
+          } else {
+            video.currentTime = Math.max(0, video.currentTime - 10);
+            sendWS({ type: 'time_update', pts: video.currentTime });
+          }
+          break;
+        case 'ArrowRight':
+          if (activeButtons.length > 0) {
+            e.preventDefault(); sendWS({ type: 'key', key: 'right' });
+          } else {
+            video.currentTime = Math.min(video.duration || 99999, video.currentTime + 10);
+            sendWS({ type: 'time_update', pts: video.currentTime });
+          }
+          break;
+        case 'Enter': e.preventDefault(); sendWS({ type: 'key', key: 'activate' }); break;
+        case ' ':
+          e.preventDefault();
+          if (activeButtons.length > 0) {
+            sendWS({ type: 'key', key: 'activate' });
+          } else {
+            if (video.paused) attemptPlay();
+            else video.pause();
+          }
+          break;
+        case 'm': case 'M': e.preventDefault(); sendWS({ type: 'key', key: 'menu' }); break;
+        case 'Escape':
+          e.preventDefault();
+          sendWS({ type: 'key', key: 'escape' });
+          break;
+        case 'f': case 'F':
+          e.preventDefault();
+          toggleFullscreen();
+          break;
+        case 'c': case 'C': e.preventDefault(); sendWS({ type: 'key', key: 'cycle_subs' }); break;
+        case 'a': case 'A': e.preventDefault(); sendWS({ type: 'key', key: 'cycle_audio' }); break;
+        case '[': e.preventDefault(); sendWS({ type: 'key', key: 'prev_chapter' }); break;
+        case ']': e.preventDefault(); sendWS({ type: 'key', key: 'next_chapter' }); break;
+        case '?': toggleShortcuts(); break;
+      }
+    });
+
+    // Controls UI Handlers
+    document.getElementById('btn-play-pause').onclick = () => {
+      if (video.paused) {
+        attemptPlay();
+      } else {
+        video.pause();
+      }
+    };
+    document.getElementById('btn-menu').onclick = () => sendWS({ type: 'key', key: 'menu' });
+    document.getElementById('btn-esc').onclick = () => sendWS({ type: 'key', key: 'escape' });
+    document.getElementById('btn-prev-chapter').onclick = () => sendWS({ type: 'key', key: 'prev_chapter' });
+    document.getElementById('btn-next-chapter').onclick = () => sendWS({ type: 'key', key: 'next_chapter' });
+    document.getElementById('btn-subs').onclick = () => sendWS({ type: 'key', key: 'cycle_subs' });
+    document.getElementById('btn-audio').onclick = () => sendWS({ type: 'key', key: 'cycle_audio' });
+    document.getElementById('pad-up').onclick = () => sendWS({ type: 'key', key: 'up' });
+    document.getElementById('pad-down').onclick = () => sendWS({ type: 'key', key: 'down' });
+    document.getElementById('pad-left').onclick = () => sendWS({ type: 'key', key: 'left' });
+    document.getElementById('pad-right').onclick = () => sendWS({ type: 'key', key: 'right' });
+    document.getElementById('pad-ok').onclick = () => sendWS({ type: 'key', key: 'activate' });
+    document.getElementById('pad-menu').onclick = () => sendWS({ type: 'key', key: 'menu' });
+    document.getElementById('pad-esc').onclick = () => sendWS({ type: 'key', key: 'escape' });
+
+    const toggleRemoteBtn = document.getElementById('btn-toggle-remote');
+    toggleRemoteBtn.onclick = () => {
+      dpad.classList.toggle('visible');
+      toggleRemoteBtn.classList.toggle('active', dpad.classList.contains('visible'));
+    };
+
+    function toggleFullscreen() {
+      const pv = document.getElementById('player-view');
+      if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+        if (pv.requestFullscreen) pv.requestFullscreen().catch(() => {});
+        else if (pv.webkitRequestFullscreen) pv.webkitRequestFullscreen();
+      } else {
+        if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
+        else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      }
+      resizeStage();
+      setTimeout(resizeStage, 50);
+      setTimeout(resizeStage, 150);
+      setTimeout(resizeStage, 300);
+      setTimeout(resizeStage, 500);
+    }
+    document.getElementById('btn-fullscreen').onclick = toggleFullscreen;
+
+    document.getElementById('progress-bar').onclick = (e) => {
+      if (!video.duration || !isFinite(video.duration)) return;
+      const r = e.currentTarget.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+      video.currentTime = frac * video.duration;
+      sendWS({ type: 'time_update', pts: video.currentTime });
+    };
+
+    function toggleShortcuts() {
+      document.getElementById('shortcuts-modal').classList.toggle('visible');
+    }
+    document.getElementById('btn-shortcuts').onclick = toggleShortcuts;
+    document.getElementById('btn-close-shortcuts').onclick = toggleShortcuts;
+
+    // Every API call goes through here. A 401 means the login has expired.
+    // Calls with a body are POSTs: anything that changes state must be a POST.
+    function api(path, body) {
+      const opts = (body === undefined) ? {} : {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      };
+      return fetch(path, opts).then(r => {
+        if (r.status === 401) {
+          window.location.href = '/login';
+          throw new Error('Not logged in');
+        }
+        return r;
+      });
+    }
+
+    function playDisc(item) {
+      return api('/api/play', { session: sessionId, disc: item.id })
+        .then(r => {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          startMovie(item);
+        })
+        .catch(err => console.error('Play error', err));
+    }
+
+    // Web import is off unless the server was started with --allow-web-import
+    let importEnabled = false;
+
+    // Library Management
+    let allCatalogItems = [];
+    let lastCatalogSig = '';
+    let searchHandlersBound = false;
+
+    function loadLibrary(isBackground) {
+      api('/api/library')
+        .then(r => r.json())
+        .then(data => {
+          if (!data || !data.items) return;
+          importEnabled = Boolean(data.import_enabled);
+          if (btnOpenImport) btnOpenImport.style.display = importEnabled ? '' : 'none';
+          if (importEnabled && !isBackground) pollImportStatus();
+          isLibraryMode = data.is_directory;
+          if (isLibraryMode) {
+            const sig = JSON.stringify(data.items);
+            if (isBackground && sig === lastCatalogSig) return;
+            lastCatalogSig = sig;
+            renderCatalog(data.items, Boolean(isBackground));
+            document.getElementById('btn-back-lib').style.display = 'inline-flex';
+          } else if (!isBackground) {
+            document.getElementById('btn-back-lib').style.display = 'none';
+            if (data.items.length > 0 && data.items[0].title) {
+              movieLabel.textContent = data.items[0].title;
+            }
+          }
+        })
+        .catch(err => console.error('Failed to load library', err));
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function renderCatalog(items, preserveState) {
+      allCatalogItems = items || [];
+      if (!preserveState) {
+        libraryView.style.display = 'flex';
+        playerView.style.display = 'none';
+      }
+
+      const searchInput = document.getElementById('search-input');
+      if (searchInput) {
+        if (!preserveState) {
+          searchInput.value = '';
+        }
+        if (!searchHandlersBound) {
+          searchInput.oninput = (e) => filterCatalog(e.target.value);
+          searchInput.onsearch = (e) => filterCatalog(e.target.value);
+          searchHandlersBound = true;
+        }
+      }
+
+      filterCatalog((preserveState && searchInput) ? searchInput.value : '');
+    }
+
+    function filterCatalog(query) {
+      const q = (query || '').toLowerCase().trim();
+
+      let matched = allCatalogItems;
+      if (q) {
+        matched = allCatalogItems.filter(item => {
+          return (item.title && item.title.toLowerCase().includes(q)) ||
+                 (item.director && item.director.toLowerCase().includes(q)) ||
+                 (item.cast && item.cast.toLowerCase().includes(q)) ||
+                 (item.genres && item.genres.toLowerCase().includes(q)) ||
+                 (item.overview && item.overview.toLowerCase().includes(q)) ||
+                 (item.year && item.year.toString().includes(q));
+        });
+      }
+
+      document.getElementById('library-stats').textContent = q
+        ? `${matched.length} of ${allCatalogItems.length} Movie${allCatalogItems.length === 1 ? '' : 's'}`
+        : `${allCatalogItems.length} Movie${allCatalogItems.length === 1 ? '' : 's'}`;
+
+      catalogGrid.innerHTML = '';
+      if (allCatalogItems.length === 0) {
+        catalogGrid.innerHTML = '<div class="empty-search">No TinyDVD movies found in library.<br><span style="font-size:0.9rem; opacity:0.7;">Place .tdvd files in your library folder' +
+          (importEnabled ? ' or import a DVD directly.</span><br><br><button id="btn-empty-import" class="import-open-btn">+ Import DVD</button>' : '.</span>') + '</div>';
+        const emptyBtn = document.getElementById('btn-empty-import');
+        if (emptyBtn) emptyBtn.onclick = openImportModal;
+        return;
+      }
+      if (matched.length === 0) {
+        catalogGrid.innerHTML = `<div class="empty-search">No movies found matching "<strong>${escapeHtml(q)}</strong>"</div>`;
+        return;
+      }
+
+      for (const item of matched) {
+        const card = document.createElement('div');
+        card.className = 'movie-card';
+        const thumbSrc = item.has_thumbnail ? `/api/thumbnail?disc=${encodeURIComponent(item.id)}` : '';
+        const genreHtml = item.genres
+          ? item.genres.split(',').map(g => `<span class="genre-chip">${escapeHtml(g.trim())}</span>`).join('')
+          : '';
+
+        card.innerHTML = `
+          <div class="movie-thumb-wrap">
+            ${thumbSrc ? `<img class="movie-thumb" src="${thumbSrc}" alt="${escapeHtml(item.title)}">` : `<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:3rem;">&#127916;</div>`}
+            ${item.year ? `<span class="movie-year-badge">${item.year}</span>` : ''}
+          </div>
+          <div class="movie-info">
+            <div class="movie-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
+            ${item.director ? `<div class="movie-director" title="Director">Dir. ${escapeHtml(item.director)}</div>` : ''}
+            ${item.cast ? `<div class="movie-cast" title="Cast">${escapeHtml(item.cast)}</div>` : ''}
+            ${genreHtml ? `<div class="movie-genres">${genreHtml}</div>` : ''}
+            <div class="movie-meta">
+              <span>${escapeHtml(item.size_str || '')}</span>
+              <span style="color:var(--accent); font-weight:600;">Play &#9654;</span>
+            </div>
+          </div>
+        `;
+        card.onclick = () => playDisc(item);
+        catalogGrid.appendChild(card);
+      }
+    }
+
+    function startMovie(item) {
+      if (item && item.title) {
+        movieLabel.textContent = item.year ? `${item.title} (${item.year})` : item.title;
+      }
+      libraryView.style.display = 'none';
+      playerView.style.display = 'flex';
+      setTimeout(resizeStage, 50);
+      if (video.src) {
+        attemptPlay();
+      }
+    }
+
+    document.getElementById('btn-back-lib').onclick = () => {
+      video.pause();
+      playerView.style.display = 'none';
+      libraryView.style.display = 'flex';
+      loadLibrary(true);
+    };
+
+    // Built-in DVD Import Workflow
+    const importModal = document.getElementById('import-modal');
+    const importSourceInput = document.getElementById('import-source');
+    const importTitleInput = document.getElementById('import-title');
+    const importEnrichCheck = document.getElementById('import-enrich');
+    const importForm = document.getElementById('import-form');
+    const importProgressBox = document.getElementById('import-progress-box');
+    const importStageText = document.getElementById('import-stage-text');
+    const importElapsed = document.getElementById('import-elapsed');
+    const importErrorMsg = document.getElementById('import-error-msg');
+    const importLog = document.getElementById('import-log');
+    const btnStartImport = document.getElementById('btn-start-import');
+    const btnCancelImport = document.getElementById('btn-cancel-import');
+    const btnPlayImported = document.getElementById('btn-play-imported');
+    const btnOpenImport = document.getElementById('btn-open-import');
+    let importPollTimer = null;
+    let lastImportState = 'idle';
+    let lastImportedDiscId = '';
+    let lastImportedTitle = '';
+    let importPrefilled = false;
+
+    function renderImportStatus(data) {
+      if (!data || data.enabled === false) return;
+      if (!importPrefilled && !data.active) {
+        if (!importSourceInput.value && data.default_source) {
+          importSourceInput.value = data.default_source;
+        }
+        if (!importTitleInput.value && data.default_title) {
+          importTitleInput.value = data.default_title;
+        }
+        importPrefilled = true;
+      }
+
+      const isActive = (data.state === 'ripping' || data.state === 'converting' || data.active);
+      if (btnOpenImport) {
+        btnOpenImport.textContent = isActive ? 'Importing DVD...' : '+ Import DVD';
+      }
+
+      if (data.state === 'idle' && !data.active) {
+        importForm.style.display = 'block';
+        importProgressBox.classList.remove('visible');
+        btnStartImport.style.display = 'inline-block';
+        btnStartImport.disabled = false;
+        btnCancelImport.style.display = 'none';
+        btnPlayImported.style.display = 'none';
+        importErrorMsg.style.display = 'none';
+      } else {
+        importForm.style.display = isActive ? 'none' : 'block';
+        importProgressBox.classList.add('visible');
+        importStageText.textContent = data.stage_msg || data.state;
+        importStageText.style.color = (data.state === 'error') ? 'var(--danger)' : 'var(--accent)';
+        importElapsed.textContent = formatTime(data.elapsed_sec || 0);
+
+        if (Array.isArray(data.logs)) {
+          const wasNearBottom = (importLog.scrollTop + importLog.clientHeight + 24 >= importLog.scrollHeight);
+          importLog.textContent = data.logs.join('\n');
+          if (wasNearBottom) importLog.scrollTop = importLog.scrollHeight;
+        }
+
+        if (data.state === 'error') {
+          importErrorMsg.textContent = data.error_msg || 'Import failed.';
+          importErrorMsg.style.display = 'block';
+        } else {
+          importErrorMsg.style.display = 'none';
+        }
+
+        btnStartImport.style.display = isActive ? 'none' : 'inline-block';
+        btnStartImport.disabled = false;
+        btnCancelImport.style.display = isActive ? 'inline-block' : 'none';
+
+        if (data.state === 'done' && data.result_disc_id) {
+          lastImportedDiscId = data.result_disc_id;
+          lastImportedTitle = data.result_title || '';
+          btnPlayImported.style.display = 'inline-block';
+        } else {
+          btnPlayImported.style.display = 'none';
+        }
+      }
+
+      if (lastImportState !== 'done' && data.state === 'done') {
+        loadLibrary();
+      }
+      lastImportState = data.state;
+
+      if (isActive && !importPollTimer) {
+        importPollTimer = setInterval(pollImportStatus, 1000);
+      } else if (!isActive && importPollTimer) {
+        clearInterval(importPollTimer);
+        importPollTimer = null;
+      }
+    }
+
+    function pollImportStatus() {
+      if (!importEnabled) return;
+      api('/api/import/status')
+        .then(r => r.json())
+        .then(renderImportStatus)
+        .catch(err => console.error('Import status error', err));
+    }
+
+    function openImportModal() {
+      importPrefilled = false;
+      importModal.classList.add('visible');
+      pollImportStatus();
+    }
+
+    function closeImportModal() {
+      importModal.classList.remove('visible');
+    }
+
+    function startImport() {
+      const src = importSourceInput.value.trim();
+      if (!src) {
+        importErrorMsg.textContent = 'Please enter a DVD drive device or source path.';
+        importErrorMsg.style.display = 'block';
+        importProgressBox.classList.add('visible');
+        return;
+      }
+      const title = importTitleInput.value.trim();
+      btnStartImport.disabled = true;
+      importErrorMsg.style.display = 'none';
+
+      api('/api/import/start', { source: src, title: title, skip_enrichment: !importEnrichCheck.checked })
+        .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+        .then(({ ok, data }) => {
+          if (!ok) {
+            importErrorMsg.textContent = (data && data.error) || 'Failed to start import.';
+            importErrorMsg.style.display = 'block';
+            importProgressBox.classList.add('visible');
+            btnStartImport.disabled = false;
+            return;
+          }
+          lastImportState = 'converting';
+          pollImportStatus();
+        })
+        .catch(err => {
+          importErrorMsg.textContent = 'Request failed: ' + err;
+          importErrorMsg.style.display = 'block';
+          importProgressBox.classList.add('visible');
+          btnStartImport.disabled = false;
+        });
+    }
+
+    function cancelImport() {
+      api('/api/import/cancel', {})
+        .then(() => pollImportStatus())
+        .catch(err => console.error('Cancel import error', err));
+    }
+
+    if (btnOpenImport) btnOpenImport.onclick = openImportModal;
+    document.getElementById('btn-close-import').onclick = closeImportModal;
+    document.getElementById('btn-done-import').onclick = closeImportModal;
+    btnStartImport.onclick = startImport;
+    btnCancelImport.onclick = cancelImport;
+    btnPlayImported.onclick = () => {
+      if (!lastImportedDiscId) return;
+      closeImportModal();
+      const item = allCatalogItems.find(x => x.id === lastImportedDiscId) || {
+        id: lastImportedDiscId,
+        title: lastImportedTitle || lastImportedDiscId
+      };
+      playDisc(item);
+    };
+    importModal.addEventListener('click', (e) => {
+      if (e.target === importModal) closeImportModal();
+    });
+
+    function connectLibrarySSE() {
+      if (typeof EventSource === 'undefined') return;
+      const es = new EventSource('/api/library/events');
+      es.addEventListener('library_update', () => {
+        loadLibrary(true);
+      });
+    }
+
+    document.getElementById('btn-logout').onclick = () => {
+      api('/logout', {}).finally(() => { window.location.href = '/login'; });
+    };
+
+    // Initialize
+    connectWS();
+    loadLibrary();
+    connectLibrarySSE();
+  </script>
+</body>
+</html>

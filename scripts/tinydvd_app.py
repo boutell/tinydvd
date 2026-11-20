@@ -9,6 +9,7 @@ canvas primitives.
 from __future__ import annotations
 
 import os
+import secrets
 import signal
 import sys
 
@@ -18,7 +19,7 @@ if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
 from tinydvd_core import TinyDVDCore
-from tinydvd_desktop_ui import run_desktop_app
+from tinydvd_desktop_ui import PLAYER_KEY_HELP, run_desktop_app
 from tinydvd_web_server import TinyDVDWebServer
 
 
@@ -38,34 +39,59 @@ def resolve_default_library_path() -> str:
     return movies if sys.platform == "darwin" else videos
 
 
+def config_dir() -> str:
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/tinydvd")
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "tinydvd")
+
+
+def load_web_password(password_file: str | None) -> tuple[str, str]:
+    """
+    The web login password and where it came from: TINYDVD_WEB_PASSWORD,
+    --web-password-file, or a random one saved (readable only by you) in the
+    config folder on first use.
+    """
+    env = os.environ.get("TINYDVD_WEB_PASSWORD", "")
+    if env:
+        return env, "the TINYDVD_WEB_PASSWORD environment variable"
+    path = password_file or os.path.join(config_dir(), "web-password")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            pw = f.read().strip()
+        if pw:
+            return pw, path
+    except FileNotFoundError:
+        if password_file:
+            raise
+    pw = secrets.token_urlsafe(12)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(pw + "\n")
+    return pw, path
+
+
 def print_usage(prog: str) -> None:
     print(f"tinydvd Player v{TINYDVD_VERSION}")
     print("Interactive DVD-Video Hybrid Player (.tdvd / H.264 + Meta-VOB)\n")
     print(f"Usage: {prog} [options] [movie.tdvd | library_directory]\n")
     print("Options:")
-    print("  -s, --serve          Start embedded web streaming server")
-    print("  -p, --port <port>    Web server port (default: 8080)")
-    print("  -b, --bind <ip>      Web server bind address (default: 0.0.0.0)")
-    print("  -f, --fullscreen     Start in fullscreen mode")
-    print("  -h, --help           Show this help text")
-    print("  -v, --version        Show version information\n")
-    print("Controls:")
-    print("  Arrow Keys (in menu) Navigate menu buttons")
-    print("  Enter / Space        Activate selected menu button")
-    print("  Mouse Click / Move   Direct DVD menu button selection")
-    print("  Left / Right Arrow   Seek -10s / +10s along clip timeline")
-    print("  Shift + Left / Right Seek -60s / +60s along clip timeline")
-    print("  Down / Up Arrow      Seek -60s / +60s along clip timeline")
-    print("  , / . (Comma/Period) Seek -10s / +10s along clip timeline")
-    print("  [ / ] or PgUp / PgDn Previous / Next Chapter")
-    print("  0 - 9                Jump to 0% - 90% of clip timeline")
-    print("  C / S                Cycle Closed Captions / Subtitles (Track 1..N, Off)")
-    print("  A                    Cycle Audio tracks")
-    print("  Space (in film)      Toggle pause")
-    print("  M                    Jump to DVD Root Menu")
-    print("  Escape               Go up a menu level (or return to library / exit)")
-    print("  F                    Toggle fullscreen")
-    print("  Q                    Quit")
+    print("  -s, --serve               Start the web player server")
+    print("  -p, --port <port>         Web server port (default: 8080)")
+    print("  -b, --bind <ip>           Web server address (default: 127.0.0.1, this computer only;")
+    print("                            use 0.0.0.0 to allow other devices on your network)")
+    print("  --web-password-file <f>   Read the web login password from this file")
+    print("                            (default: TINYDVD_WEB_PASSWORD, or a random password")
+    print("                            saved in your config folder on first run)")
+    print("  --allow-web-import        Let web users import DVDs (runs the ripping and")
+    print("                            conversion tools on paths they type)")
+    print("  -f, --fullscreen          Start in fullscreen mode")
+    print("  -h, --help                Show this help text")
+    print("  -v, --version             Show version information\n")
+    print("Player keys:")
+    width = max(len(keys) for keys, _ in PLAYER_KEY_HELP) + 2
+    for keys, desc in PLAYER_KEY_HELP:
+        print(f"  {keys.ljust(width)}{desc}")
 
 
 def main(argv: list[str]) -> int:
@@ -74,7 +100,9 @@ def main(argv: list[str]) -> int:
     start_fullscreen = False
     serve_mode = False
     port = 8080
-    bind_addr = "0.0.0.0"
+    bind_addr = "127.0.0.1"
+    password_file = None
+    allow_import = False
 
     i = 1
     while i < len(argv):
@@ -99,6 +127,12 @@ def main(argv: list[str]) -> int:
             if i + 1 < len(argv):
                 i += 1
                 bind_addr = argv[i]
+        elif arg == "--web-password-file":
+            if i + 1 < len(argv):
+                i += 1
+                password_file = argv[i]
+        elif arg == "--allow-web-import":
+            allow_import = True
         elif arg in ("-f", "--fullscreen"):
             start_fullscreen = True
         elif not arg.startswith("-"):
@@ -119,7 +153,14 @@ def main(argv: list[str]) -> int:
     core = TinyDVDCore()
 
     if serve_mode:
-        server = TinyDVDWebServer(core, dvd_path, bind_addr=bind_addr, port=port)
+        try:
+            password, password_source = load_web_password(password_file)
+        except OSError as e:
+            print(f"Can't read the web password: {e}", file=sys.stderr)
+            return 1
+        server = TinyDVDWebServer(core, dvd_path, password, bind_addr=bind_addr, port=port,
+                                  allow_import=allow_import)
+        print(f"  Password: {password}  (from {password_source})\n", flush=True)
 
         def on_sig(_signum, _frame):
             server.running = False

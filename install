@@ -379,10 +379,13 @@ fi
 
 echo "Runtime -> ${LIB_DIR}"
 install -m 755 "${CORE_LIB_SRC}" "${LIB_DIR}/${CORE_LIB_NAME}"
-install -m 644 "${ROOT_DIR}/src/web_assets.h" "${LIB_DIR}/web_assets.h"
+install -d "${LIB_DIR}/web"
+install -m 644 "${ROOT_DIR}/web/index.html" "${LIB_DIR}/web/index.html"
+rm -f "${LIB_DIR}/web_assets.h"
 
 RUNTIME_SCRIPTS=(
     tinydvd_app.py
+    tinydvd_archive.py
     tinydvd_core.py
     tinydvd_desktop_ui.py
     tinydvd_library.py

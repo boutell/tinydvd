@@ -1,104 +1,176 @@
 #!/usr/bin/env python3
 """
-Pure-Python HTTP / Range Streaming / Server-Sent Events (SSE) / RFC 6455 WebSocket
-web server backed by TinyDVDLibrary and libtinydvd_core's DVD VM sessions.
+TinyDVD web player: a small HTTP server (with Range requests, Server-Sent
+Events and RFC 6455 WebSockets) backed by TinyDVDLibrary and the DVD VM
+sessions in libtinydvd_core.
+
+Security model:
+  - Every page and API call needs a login (one shared password, see WebAuth).
+  - Anything that changes state is a POST, and is refused if the browser says
+    it came from another site (Origin check). The login cookie is
+    SameSite=Strict as well.
+  - Importing discs from the web is off unless the server is started with
+    allow_import=True, because it runs ripping and conversion tools on
+    whatever path the client names.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
+import secrets
 import select
-import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
 import uuid
-import zipfile
 
 from tinydvd_core import TDVD_VM_JSON_CB, TinyDVDCore
-from tinydvd_library import TinyDVDLibrary, sanitize_id
+from tinydvd_library import TinyDVDLibrary, disc_id_for_path, sanitize_id
 
 
 WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CHUNK_SIZE = 65536
 SESSION_TIMEOUT_SEC = 180
+MAX_SESSIONS = 32
+MAX_REQUEST_BODY = 64 * 1024
+WS_SEND_TIMEOUT_SEC = 2
 VALID_MEDIA_BASE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+AUTH_COOKIE = "tinydvd_auth"
+AUTH_LIFETIME_SEC = 30 * 24 * 3600
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_SEC = 60
+
+REMUX_CONCURRENCY = 2
+DEFAULT_CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024
+
+HTML_ROUTES = ("/", "/index.html")
 
 
 def load_web_index_html() -> bytes:
-    """Parse TINYDVD_INDEX_HTML from src/web_assets.h so there is one source of truth."""
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    hpath = None
-    for cand in (
-        os.path.join(base_dir, "src", "web_assets.h"),
-        os.path.join(base_dir, "web_assets.h"),
-    ):
-        if os.path.isfile(cand):
-            hpath = cand
-            break
-    if not hpath:
-        raise RuntimeError(f"Failed to locate web_assets.h under {base_dir}")
-    with open(hpath, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-
-    in_html = False
-    out_parts: list[str] = []
-    for line in lines:
-        s = line.strip()
-        if not in_html:
-            if "TINYDVD_INDEX_HTML[]" in s:
-                in_html = True
-            continue
-        if s.startswith('"'):
-            end_semi = s.endswith('";')
-            lit = s[:-1] if end_semi else s
-            if len(lit) >= 2 and lit[0] == '"' and lit[-1] == '"':
-                inner = lit[1:-1]
-                buf: list[str] = []
-                i = 0
-                n = len(inner)
-                while i < n:
-                    ch = inner[i]
-                    if ch == "\\" and i + 1 < n:
-                        nxt = inner[i + 1]
-                        if nxt == "n":
-                            buf.append("\n")
-                        elif nxt == "r":
-                            buf.append("\r")
-                        elif nxt == "t":
-                            buf.append("\t")
-                        elif nxt == '"':
-                            buf.append('"')
-                        elif nxt == "'":
-                            buf.append("'")
-                        elif nxt == "\\":
-                            buf.append("\\")
-                        else:
-                            buf.append(nxt)
-                        i += 2
-                    else:
-                        buf.append(ch)
-                        i += 1
-                out_parts.append("".join(buf))
-            if end_semi:
-                break
-        elif s == ";":
-            break
-
-    if not out_parts:
-        raise RuntimeError(f"Failed to parse TINYDVD_INDEX_HTML from {hpath}")
-    return "".join(out_parts).encode("utf-8")
+    """The web player page, web/index.html (next to scripts/ in the source tree and when installed)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "index.html")
+    with open(path, "rb") as f:
+        return f.read()
 
 
 INDEX_HTML_BYTES = load_web_index_html()
+
+LOGIN_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinyDVD Login</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #0b0d12; color: #e8e8ee; font: 16px/1.4 system-ui, sans-serif; }
+  form { background: #161a22; padding: 28px; border-radius: 12px; width: min(320px, calc(100vw - 32px));
+         box-sizing: border-box; }
+  h1 { margin: 0 0 16px; font-size: 1.3rem; }
+  h1 span { color: #f5a623; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; margin: 0 0 12px; border-radius: 8px;
+          border: 1px solid #333a48; background: #0b0d12; color: inherit; font-size: 1rem; }
+  button { width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #f5a623;
+           color: #111; font-weight: 600; font-size: 1rem; cursor: pointer; }
+  .error { color: #ff6b6b; margin: 0 0 12px; font-size: 0.9rem; }
+  .hint { color: #8a90a0; font-size: 0.8rem; margin: 12px 0 0; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>Tiny<span>DVD</span></h1>
+  {error}
+  <input type="password" name="password" placeholder="Password" autocomplete="current-password" autofocus required>
+  <button type="submit">Log in</button>
+  <p class="hint">The password was printed when the server started.</p>
+</form>
+</body>
+</html>
+"""
+
+
+def default_cache_dir() -> str:
+    """Per-user cache folder for remuxed MP4s."""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "tinydvd", "web-remux")
+
+
+class WebAuth:
+    """
+    One shared password. A successful login gets a signed, expiring cookie,
+    so no session table is needed and logins survive a server restart.
+    Changing the password signs everyone out.
+    """
+
+    def __init__(self, password: str):
+        if not password:
+            raise ValueError("A web password is required")
+        self._password_digest = hashlib.sha256(password.encode("utf-8")).digest()
+        self._key = hashlib.sha256(b"tinydvd-web-auth\0" + password.encode("utf-8")).digest()
+        self._revoked: set[str] = set()
+        self._lock = threading.Lock()
+        self._failures: dict[str, tuple[int, float]] = {}
+
+    def check_password(self, attempt: str) -> bool:
+        digest = hashlib.sha256((attempt or "").encode("utf-8")).digest()
+        return hmac.compare_digest(digest, self._password_digest)
+
+    def _sign(self, payload: str) -> str:
+        return hmac.new(self._key, payload.encode("ascii"), hashlib.sha256).hexdigest()
+
+    def issue_token(self) -> str:
+        payload = f"{int(time.time()) + AUTH_LIFETIME_SEC}.{secrets.token_hex(8)}"
+        return f"{payload}.{self._sign(payload)}"
+
+    def token_valid(self, token: str) -> bool:
+        parts = (token or "").split(".")
+        if len(parts) != 3 or not parts[0].isdigit():
+            return False
+        payload = f"{parts[0]}.{parts[1]}"
+        if not hmac.compare_digest(self._sign(payload), parts[2]):
+            return False
+        if int(parts[0]) < time.time():
+            return False
+        with self._lock:
+            return token not in self._revoked
+
+    def revoke(self, token: str) -> None:
+        if self.token_valid(token):
+            with self._lock:
+                self._revoked.add(token)
+
+    def locked_out(self, client: str) -> bool:
+        with self._lock:
+            count, since = self._failures.get(client, (0, 0.0))
+            if count >= LOGIN_MAX_FAILURES and time.time() - since < LOGIN_LOCKOUT_SEC:
+                return True
+            if time.time() - since >= LOGIN_LOCKOUT_SEC:
+                self._failures.pop(client, None)
+            return False
+
+    def record_failure(self, client: str) -> None:
+        with self._lock:
+            count, since = self._failures.get(client, (0, time.time()))
+            self._failures[client] = (count + 1, since)
+
+    def record_success(self, client: str) -> None:
+        with self._lock:
+            self._failures.pop(client, None)
 
 
 def compute_ws_accept_key(sec_key: str) -> str:
@@ -125,6 +197,14 @@ def ws_send_text(sock: socket.socket, text: str) -> bool:
         return False
 
 
+def _set_send_timeout(sock: socket.socket, seconds: int) -> None:
+    """Bound how long a send can block, without affecting the blocking reads on the same socket."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", seconds, 0))
+    except (OSError, struct.error):
+        pass
+
+
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     chunks: list[bytes] = []
     remaining = n
@@ -135,6 +215,13 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
+
+
+def _as_int(val, default: int = 0) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
 
 
 class WebSession:
@@ -175,7 +262,7 @@ class WebSession:
         msg = json_cstr.decode("utf-8", errors="replace")
         try:
             mtype = json.loads(msg).get("type")
-        except Exception:
+        except (ValueError, AttributeError):
             mtype = None
 
         with self.state_lock:
@@ -196,6 +283,8 @@ class WebSession:
         self.broadcast(msg)
 
     def broadcast(self, msg: str) -> None:
+        # Runs on the VM thread. Client sockets have a send timeout, so one
+        # stalled browser can hold this up for seconds at most, then is dropped.
         dead: list[socket.socket] = []
         with self.ws_lock:
             for sock in list(self.ws_clients):
@@ -204,8 +293,14 @@ class WebSession:
             for sock in dead:
                 if sock in self.ws_clients:
                     self.ws_clients.remove(sock)
+        for sock in dead:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)  # ends that client's reader thread
+            except OSError:
+                pass
 
     def add_ws_client(self, sock: socket.socket) -> None:
+        _set_send_timeout(sock, WS_SEND_TIMEOUT_SEC)
         with self.state_lock:
             replay = [
                 json.dumps({"type": "state", "session_id": self.session_id, "movie_title": self.disc_title}),
@@ -227,7 +322,6 @@ class WebSession:
             self.last_active_time = time.time()
 
     def remove_ws_client(self, sock: socket.socket) -> None:
-        should_pause = False
         with self.ws_lock:
             if sock in self.ws_clients:
                 self.ws_clients.remove(sock)
@@ -269,7 +363,7 @@ class WebSession:
         self.last_active_time = time.time()
         try:
             obj = json.loads(payload)
-        except Exception:
+        except ValueError:
             return
         if not isinstance(obj, dict):
             return
@@ -280,20 +374,20 @@ class WebSession:
             return
 
         mtype = obj.get("type")
-        if mtype == "key" and obj.get("key"):
-            self.core.lib.tdvd_vm_session_dispatch_action(vm, str(obj["key"]).encode("utf-8"), 0, 0)
-        elif mtype == "mouse_move":
-            x = int(obj.get("x") or 0)
-            y = int(obj.get("y") or 0)
-            self.core.lib.tdvd_vm_session_dispatch_action(vm, b"mouse_move", x, y)
-        elif mtype == "mouse_click":
-            x = int(obj.get("x") or 0)
-            y = int(obj.get("y") or 0)
-            self.core.lib.tdvd_vm_session_dispatch_action(vm, b"mouse_click", x, y)
+        if mtype == "key" and isinstance(obj.get("key"), str):
+            self.core.lib.tdvd_vm_session_dispatch_action(vm, obj["key"].encode("utf-8"), 0, 0)
+        elif mtype in ("mouse_move", "mouse_click"):
+            x = _as_int(obj.get("x"))
+            y = _as_int(obj.get("y"))
+            self.core.lib.tdvd_vm_session_dispatch_action(vm, mtype.encode("ascii"), x, y)
         elif mtype in ("file_loaded", "seek_completed", "time_update", "client_playback", "video_ended"):
-            seq = int(obj.get("seq") or 0)
-            pts_val = obj.get("pts")
-            pts_ns = int(max(0.0, float(pts_val)) * 1e9) if pts_val is not None else -1
+            seq = max(0, _as_int(obj.get("seq")))
+            pts_ns = -1
+            try:
+                if obj.get("pts") is not None:
+                    pts_ns = int(max(0.0, float(obj["pts"])) * 1e9)
+            except (TypeError, ValueError, OverflowError):
+                pts_ns = -1
             paused = -1
             if mtype == "client_playback":
                 if obj.get("state") == "paused":
@@ -301,7 +395,7 @@ class WebSession:
                 elif obj.get("state") == "playing":
                     paused = 0
             self.core.lib.tdvd_vm_session_notify_playback(
-                vm, mtype.encode("utf-8"), seq, pts_ns, paused
+                vm, mtype.encode("ascii"), seq, pts_ns, paused
             )
 
     def destroy(self) -> None:
@@ -347,6 +441,8 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
         # Suppress verbose per-request stdout/stderr logging.
         return
 
+    # -- Responses ---------------------------------------------------------
+
     def _send_bytes(
         self,
         code: int,
@@ -360,6 +456,7 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Connection", "close")
+            self.send_header("X-Content-Type-Options", "nosniff")
             if extra_headers:
                 for k, v in extra_headers.items():
                     self.send_header(k, v)
@@ -367,7 +464,7 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
             if body:
                 self.wfile.write(body)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         self.close_connection = True
 
@@ -379,140 +476,253 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
     def _send_error_text(self, code: int, msg: str) -> None:
         self._send_bytes(code, msg, "text/plain", msg.encode("utf-8"))
 
+    def _redirect(self, location: str, extra_headers: dict[str, str] | None = None) -> None:
+        headers = {"Location": location, "Cache-Control": "no-store"}
+        headers.update(extra_headers or {})
+        self._send_bytes(303, "See Other", "text/plain", b"", extra_headers=headers)
+
+    # -- Request plumbing --------------------------------------------------
+
     def do_GET(self) -> None:
-        self._dispatch()
+        self._dispatch("GET", b"")
 
     def do_POST(self) -> None:
-        # Drain any request body cleanly if Content-Length is provided
-        clen = int(self.headers.get("Content-Length") or 0)
-        if 0 < clen <= 1048576:
-            try:
-                self.rfile.read(clen)
-            except OSError:
-                pass
-        self._dispatch()
+        try:
+            clen = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            clen = -1
+        if clen < 0 or clen > MAX_REQUEST_BODY:
+            self._send_error_text(413, "Request Too Large")
+            return
+        try:
+            body = self.rfile.read(clen) if clen else b""
+        except OSError:
+            return
+        self._dispatch("POST", body)
 
-    def _dispatch(self) -> None:
+    def _auth_token(self) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie") or "")
+        except CookieError:
+            return ""
+        morsel = cookie.get(AUTH_COOKIE)
+        return morsel.value if morsel else ""
+
+    def _same_origin(self) -> bool:
+        """
+        False if a browser says this request came from another site. Browsers
+        send Origin on every cross-site POST and WebSocket handshake; clients
+        that send none (curl, tests) aren't browsers, so there is no
+        cross-site request to forge.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        return urllib.parse.urlsplit(origin).netloc.lower() == (self.headers.get("Host") or "").lower()
+
+    def _client_key(self) -> str:
+        addr = self.client_address
+        return str(addr[0]) if isinstance(addr, tuple) and addr else "local"
+
+    @staticmethod
+    def _json_body(body: bytes) -> dict:
+        try:
+            obj = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeDecodeError, ValueError):
+            return {}
+        return obj if isinstance(obj, dict) else {}
+
+    # -- Routing -----------------------------------------------------------
+
+    def _dispatch(self, method: str, body: bytes) -> None:
         app: TinyDVDWebServer = self.server.app_server
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path or "/"
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
-        session_param = sanitize_id(qs.get("session", [""])[0])
+        if path == "/login":
+            if method == "POST":
+                self._handle_login(app, body)
+            else:
+                self._send_login_page()
+            return
 
-        # 1. WebSocket upgrade
+        if not app.auth.token_valid(self._auth_token()):
+            if method == "GET" and (path in HTML_ROUTES or path.startswith("/player")):
+                self._redirect("/login")
+            else:
+                self._send_json(401, "Unauthorized", {"error": "Log in first"})
+            return
+
+        if method == "POST" and not self._same_origin():
+            self._send_json(403, "Forbidden", {"error": "Cross-site request refused"})
+            return
+
         ws_key = self.headers.get("Sec-WebSocket-Key")
-        if path.startswith("/ws") and ws_key:
-            self._handle_websocket(app, ws_key, session_param)
+        if method == "GET" and path.startswith("/ws") and ws_key:
+            if not self._same_origin():
+                self._send_error_text(403, "Forbidden")
+                return
+            self._handle_websocket(app, ws_key, sanitize_id(qs.get("session", [""])[0]))
             return
 
-        # 2. SPA HTML
-        if path in ("/", "/index.html") or path.startswith("/player"):
-            self._send_bytes(200, "OK", "text/html; charset=utf-8", INDEX_HTML_BYTES)
-            return
-
-        # 3. SSE Catalog Stream
-        if path == "/api/library/events":
-            self._handle_sse(app)
-            return
-
-        # 4. Catalog JSON
-        if path == "/api/library":
-            app.library.check_for_changes()
-            is_dir, items, _ = app.library.get_snapshot()
-            payload = {
-                "is_directory": is_dir,
-                "items": [it.to_api_dict() for it in items],
-            }
-            self._send_json(200, "OK", payload, cache_control="no-store")
-            return
-
-        # 5. Import Status
-        if path == "/api/import/status":
-            st = app.library.get_import_status()
-            st.pop("state_code", None)
-            st.pop("start_time", None)
-            st.pop("result_disc_path", None)
-            self._send_json(200, "OK", st, cache_control="no-store")
-            return
-
-        # 6. Import Start
-        if path == "/api/import/start":
-            src = qs.get("source", [""])[0]
-            title = qs.get("title", [""])[0]
-            skip_raw = qs.get("skip_enrichment", [""])[0].lower()
-            skip_enrich = skip_raw in ("1", "true", "yes")
-            ok, err = app.library.start_import(src, title=title, skip_enrichment=skip_enrich)
-            if ok:
-                self._send_json(200, "OK", {"status": "started"})
+        if method == "GET":
+            handler = {
+                "/api/library": self._get_library,
+                "/api/library/events": self._handle_sse,
+                "/api/import/status": self._get_import_status,
+            }.get(path)
+            if path in HTML_ROUTES or path.startswith("/player"):
+                self._send_bytes(200, "OK", "text/html; charset=utf-8", INDEX_HTML_BYTES,
+                                 extra_headers={"Cache-Control": "no-store"})
+            elif handler:
+                handler(app)
+            elif path == "/api/thumbnail" or path.startswith("/api/thumbnail/"):
+                self._get_thumbnail(app, path, qs)
+            elif path.startswith("/api/media/"):
+                self._get_media(app, path, qs)
             else:
-                self._send_json(409, "Conflict", {"status": "error", "error": err or "An import job is already in progress"})
+                self._send_error_text(404, "Not Found")
             return
 
-        # 7. Import Cancel
-        if path == "/api/import/cancel":
-            app.library.cancel_import()
-            self._send_json(200, "OK", {"status": "cancelling"})
-            return
-
-        # 8. Thumbnail PNG
-        if path == "/api/thumbnail" or path.startswith("/api/thumbnail/"):
-            disc_id = qs.get("disc", [""])[0]
-            if not disc_id and path.startswith("/api/thumbnail/"):
-                disc_id = path[len("/api/thumbnail/"):]
-            disc_id = sanitize_id(disc_id)
-            item = app.library.find_by_id(disc_id)
-            if not item and not disc_id:
-                is_dir, items, raw_target = app.library.get_snapshot()
-                disc_path = items[0].path if items else (raw_target if not is_dir else "")
+        if method == "POST":
+            handler = {
+                "/logout": self._post_logout,
+                "/api/play": self._post_play,
+                "/api/import/start": self._post_import_start,
+                "/api/import/cancel": self._post_import_cancel,
+            }.get(path)
+            if handler:
+                handler(app, self._json_body(body))
             else:
-                disc_path = item.path if item else ""
-
-            png_data = app.library.read_thumbnail(disc_path)
-            if png_data:
-                self._send_bytes(
-                    200,
-                    "OK",
-                    "image/png",
-                    png_data,
-                    extra_headers={"Cache-Control": "public, max-age=86400"},
-                )
-            else:
-                self._send_error_text(404, "Thumbnail Not Found")
+                self._send_error_text(404, "Not Found")
             return
 
-        # 9. Switch/start playback session
-        if path == "/api/play":
-            disc_id = sanitize_id(qs.get("disc", [""])[0])
-            item = app.library.find_by_id(disc_id)
-            if not item or item.id != disc_id:
-                self._send_error_text(404, "Movie Not Found")
-                return
-            sess = app.get_or_create_session(session_param, item.path, item.id, item.title)
-            if not sess:
-                self._send_error_text(500, "Failed to Start Session")
-                return
-            sess.switch_movie(item.path, item.id, item.title)
-            self._send_json(200, "OK", {"status": "ok", "session_id": sess.session_id})
+        self._send_error_text(405, "Method Not Allowed")
+
+    # -- Login -------------------------------------------------------------
+
+    def _send_login_page(self, error: str = "", code: int = 200) -> None:
+        err_html = f'<p class="error">{error}</p>' if error else ""
+        page = LOGIN_PAGE_TEMPLATE.replace("{error}", err_html).encode("utf-8")
+        self._send_bytes(code, "OK" if code == 200 else "Unauthorized", "text/html; charset=utf-8", page,
+                         extra_headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
+
+    def _handle_login(self, app: "TinyDVDWebServer", body: bytes) -> None:
+        if not self._same_origin():
+            self._send_error_text(403, "Forbidden")
             return
-
-        # 10. MP4 Range streaming (safe remux without shell)
-        if path.startswith("/api/media/"):
-            fname = path[len("/api/media/"):]
-            base_name = os.path.splitext(fname)[0]
-            if not VALID_MEDIA_BASE_RE.fullmatch(base_name):
-                self._send_error_text(400, "Invalid Media Name")
-                return
-
-            disc_id = sanitize_id(qs.get("disc", [""])[0])
-            mp4_path = app.ensure_remuxed_mp4(disc_id, base_name)
-            if not mp4_path:
-                self._send_error_text(404, "Media Stream Not Found")
-                return
-            self._serve_range_file(mp4_path, self.headers.get("Range"))
+        client = self._client_key()
+        if app.auth.locked_out(client):
+            self._send_login_page("Too many attempts. Wait a minute and try again.", 429)
             return
+        if (self.headers.get("Content-Type") or "").startswith("application/json"):
+            attempt = str(self._json_body(body).get("password") or "")
+        else:
+            form = urllib.parse.parse_qs(body.decode("utf-8", errors="replace"))
+            attempt = form.get("password", [""])[0]
+        if not app.auth.check_password(attempt):
+            app.auth.record_failure(client)
+            time.sleep(0.5)
+            self._send_login_page("Wrong password.", 401)
+            return
+        app.auth.record_success(client)
+        cookie = (f"{AUTH_COOKIE}={app.auth.issue_token()}; Path=/; HttpOnly; SameSite=Strict; "
+                  f"Max-Age={AUTH_LIFETIME_SEC}")
+        self._redirect("/", {"Set-Cookie": cookie})
 
-        self._send_error_text(404, "Not Found")
+    def _post_logout(self, app: "TinyDVDWebServer", _body: dict) -> None:
+        app.auth.revoke(self._auth_token())
+        self._send_bytes(200, "OK", "application/json", b'{"status":"logged_out"}', extra_headers={
+            "Cache-Control": "no-store",
+            "Set-Cookie": f"{AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+        })
+
+    # -- API ---------------------------------------------------------------
+
+    def _get_library(self, app: "TinyDVDWebServer") -> None:
+        app.library.check_for_changes()
+        is_dir, items, _ = app.library.get_snapshot()
+        self._send_json(200, "OK", {
+            "is_directory": is_dir,
+            "import_enabled": app.allow_import,
+            "items": [it.to_api_dict() for it in items],
+        })
+
+    def _get_import_status(self, app: "TinyDVDWebServer") -> None:
+        if not app.allow_import:
+            self._send_json(200, "OK", {"enabled": False, "state": "idle", "active": False})
+            return
+        st = app.library.get_import_status()
+        for private in ("state_code", "start_time", "result_disc_path"):
+            st.pop(private, None)
+        st["enabled"] = True
+        self._send_json(200, "OK", st)
+
+    def _post_import_start(self, app: "TinyDVDWebServer", body: dict) -> None:
+        if not app.allow_import:
+            self._send_json(403, "Forbidden", {"status": "error", "error": "Web import is turned off on this server"})
+            return
+        ok, err = app.library.start_import(
+            str(body.get("source") or ""),
+            title=str(body.get("title") or ""),
+            skip_enrichment=bool(body.get("skip_enrichment")),
+        )
+        if ok:
+            self._send_json(200, "OK", {"status": "started"})
+        else:
+            self._send_json(409, "Conflict", {"status": "error", "error": err or "An import job is already in progress"})
+
+    def _post_import_cancel(self, app: "TinyDVDWebServer", _body: dict) -> None:
+        if not app.allow_import:
+            self._send_json(403, "Forbidden", {"status": "error", "error": "Web import is turned off on this server"})
+            return
+        app.library.cancel_import()
+        self._send_json(200, "OK", {"status": "cancelling"})
+
+    def _post_play(self, app: "TinyDVDWebServer", body: dict) -> None:
+        disc_id = sanitize_id(str(body.get("disc") or ""))
+        item = app.library.find_by_id(disc_id)
+        if not item or item.id != disc_id:
+            self._send_error_text(404, "Movie Not Found")
+            return
+        sess = app.get_or_create_session(sanitize_id(str(body.get("session") or "")), item.path, item.id, item.title)
+        if not sess:
+            self._send_error_text(503, "Too Many Sessions")
+            return
+        sess.switch_movie(item.path, item.id, item.title)
+        self._send_json(200, "OK", {"status": "ok", "session_id": sess.session_id})
+
+    def _get_thumbnail(self, app: "TinyDVDWebServer", path: str, qs: dict) -> None:
+        disc_id = qs.get("disc", [""])[0]
+        if not disc_id and path.startswith("/api/thumbnail/"):
+            disc_id = path[len("/api/thumbnail/"):]
+        disc_id = sanitize_id(disc_id)
+        item = app.library.find_by_id(disc_id)
+        if not item and not disc_id:
+            is_dir, items, raw_target = app.library.get_snapshot()
+            disc_path = items[0].path if items else (raw_target if not is_dir else "")
+        else:
+            disc_path = item.path if item else ""
+
+        png_data = app.library.read_thumbnail(disc_path)
+        if png_data:
+            self._send_bytes(200, "OK", "image/png", png_data,
+                             extra_headers={"Cache-Control": "private, max-age=86400"})
+        else:
+            self._send_error_text(404, "Thumbnail Not Found")
+
+    def _get_media(self, app: "TinyDVDWebServer", path: str, qs: dict) -> None:
+        base_name = os.path.splitext(path[len("/api/media/"):])[0]
+        if not VALID_MEDIA_BASE_RE.fullmatch(base_name):
+            self._send_error_text(400, "Invalid Media Name")
+            return
+        mp4_path = app.ensure_remuxed_mp4(sanitize_id(qs.get("disc", [""])[0]), base_name)
+        if not mp4_path:
+            self._send_error_text(404, "Media Stream Not Found")
+            return
+        self._serve_range_file(mp4_path, self.headers.get("Range"))
 
     def _serve_range_file(self, file_path: str, range_header: str | None) -> None:
         try:
@@ -539,11 +749,12 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                         end = total - 1
                     else:
                         start = int(s_part)
-                        end = int(e_part) if e_part else (total - 1)
+                        end = min(int(e_part), total - 1) if e_part else (total - 1)
                 except ValueError:
                     partial = False
+                    start, end = 0, total - 1
 
-        if partial and (start > end or end >= total):
+        if partial and (start > end or start >= total):
             try:
                 self.send_response(416, "Range Not Satisfiable")
                 self.send_header("Content-Range", f"bytes */{total}")
@@ -578,7 +789,7 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                     self.wfile.write(chunk)
                     rem -= len(chunk)
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except OSError:
             pass
         self.close_connection = True
 
@@ -632,27 +843,27 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                 app.sse_clients.discard(sock)
 
     def _handle_websocket(self, app: "TinyDVDWebServer", ws_key: str, session_param: str) -> None:
-        self.close_connection = True
-        sock = self.connection
-        accept = compute_ws_accept_key(ws_key)
-        resp = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
-        ).encode("ascii")
-        try:
-            sock.sendall(resp)
-        except OSError:
-            return
-
         is_dir, items, raw_target = app.library.get_snapshot()
         default_path = items[0].path if items else (raw_target if not is_dir else "")
-        default_id = items[0].id if items else sanitize_id(os.path.basename(default_path))
+        default_id = items[0].id if items else disc_id_for_path(default_path)
         default_title = items[0].title if items else os.path.basename(default_path)
 
         sess = app.get_or_create_session(session_param, default_path, default_id, default_title)
         if not sess:
+            self._send_error_text(503, "Too Many Sessions")
+            return
+
+        self.close_connection = True
+        sock = self.connection
+        resp = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {compute_ws_accept_key(ws_key)}\r\n\r\n"
+        ).encode("ascii")
+        try:
+            sock.sendall(resp)
+        except OSError:
             return
         sess.add_ws_client(sock)
 
@@ -697,10 +908,11 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                     payload_bytes = payload_raw
 
                 if opcode == 0x9:  # Ping -> Pong
-                    try:
-                        sock.sendall(ws_encode_frame(0xA, payload_bytes))
-                    except OSError:
-                        break
+                    with sess.ws_lock:
+                        try:
+                            sock.sendall(ws_encode_frame(0xA, payload_bytes))
+                        except OSError:
+                            break
                     continue
 
                 if opcode in (0x1, 0x2):
@@ -718,21 +930,32 @@ class TinyDVDWebServer:
         self,
         core: TinyDVDCore,
         target_path: str,
-        bind_addr: str = "0.0.0.0",
+        password: str,
+        bind_addr: str = "127.0.0.1",
         port: int = 8080,
         announce: bool = True,
         listen: bool = True,
+        allow_import: bool = False,
+        cache_dir: str | None = None,
+        cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
     ):
         self.core = core
+        self.auth = WebAuth(password)
+        self.allow_import = bool(allow_import)
         self.library = TinyDVDLibrary(target_path)
-        self.bind_addr = bind_addr or "0.0.0.0"
+        self.bind_addr = bind_addr or "127.0.0.1"
         self.port = 8080 if port is None else int(port)
+
+        self.cache_dir = cache_dir or default_cache_dir()
+        self.cache_max_bytes = int(cache_max_bytes)
+        os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
 
         self.sessions_lock = threading.Lock()
         self.sessions: dict[str, WebSession] = {}
 
         self.remux_locks_guard = threading.Lock()
         self.remux_locks: dict[str, threading.Lock] = {}
+        self.remux_slots = threading.BoundedSemaphore(REMUX_CONCURRENCY)
 
         self.sse_lock = threading.Lock()
         self.sse_clients: set[socket.socket] = set()
@@ -760,11 +983,12 @@ class TinyDVDWebServer:
         if announce:
             is_dir, items, _ = self.library.get_snapshot()
             cnt = len(items)
+            host = "localhost" if self.bind_addr in ("127.0.0.1", "::1", "localhost") else self.bind_addr
             print("\n=======================================================")
-            print("  TinyDVD Web Player Running!")
-            print(f"  URL: http://localhost:{self.port}")
-            print(f"  Mode: {'Library Catalog' if is_dir else 'Direct Cinema Player'} ({cnt} movie{'' if cnt == 1 else 's'} available)")
-            print("  Multi-Session Support: Enabled (isolated playback per tab/window)")
+            print("  TinyDVD Web Player")
+            print(f"  URL: http://{host}:{self.port}")
+            print(f"  Mode: {'Library' if is_dir else 'Single disc'} ({cnt} movie{'' if cnt == 1 else 's'})")
+            print(f"  Web import: {'on' if self.allow_import else 'off (start with --allow-web-import to turn on)'}")
             print("=======================================================\n", flush=True)
 
     def handle_client_socket(self, sock: socket.socket) -> threading.Thread:
@@ -785,6 +1009,7 @@ class TinyDVDWebServer:
     def get_or_create_session(
         self, session_id: str | None, disc_path: str, disc_id: str, disc_title: str
     ) -> WebSession | None:
+        """The named session, or a new one. None if there's no disc or too many sessions."""
         sid = sanitize_id(session_id or "")
         if not sid:
             sid = "s_" + uuid.uuid4().hex[:16]
@@ -794,8 +1019,11 @@ class TinyDVDWebServer:
             if existing:
                 existing.last_active_time = time.time()
                 return existing
+            full = len(self.sessions) >= MAX_SESSIONS
 
         if not disc_path:
+            return None
+        if full and not self._evict_idle_session():
             return None
 
         sess = WebSession(self.core, sid, disc_path, disc_id, disc_title)
@@ -805,108 +1033,127 @@ class TinyDVDWebServer:
                 sess.destroy()
                 return again
             self.sessions[sid] = sess
-        print(f"[web_server] Started independent session {sid} for {disc_title or disc_id}", flush=True)
+        print(f"[web_server] Started session {sid} for {disc_title or disc_id}", flush=True)
         return sess
 
+    def _evict_idle_session(self) -> bool:
+        """Free a slot by ending the least recently used session with no clients."""
+        with self.sessions_lock:
+            idle = [s for s in self.sessions.values() if s.client_count() == 0]
+            if not idle:
+                return False
+            victim = min(idle, key=lambda s: s.last_active_time)
+            self.sessions.pop(victim.session_id, None)
+        victim.destroy()
+        return True
+
     def ensure_remuxed_mp4(self, disc_id: str, base_name: str) -> str | None:
+        """
+        An MP4 copy of one of the disc's MKV videos, for browsers. Remuxed
+        once (no re-encoding) into the per-user cache, keyed by the source
+        file's identity, so a re-converted disc never serves a stale copy.
+        """
         if not VALID_MEDIA_BASE_RE.fullmatch(base_name):
             return None
 
         item = self.library.find_by_id(disc_id)
-        if not item:
+        if item:
+            dpath = item.path
+        else:
             is_dir, items, raw_target = self.library.get_snapshot()
             dpath = items[0].path if items else (raw_target if not is_dir else "")
-            did = items[0].id if items else sanitize_id(os.path.basename(dpath))
-        else:
-            dpath = item.path
-            did = item.id
 
-        did = sanitize_id(did) or "default"
-        cache_dir = os.path.join("/tmp/tinydvd_web_cache", did)
-        os.makedirs(cache_dir, exist_ok=True)
-        out_path = os.path.join(cache_dir, f"{base_name}.mp4")
+        loc = self.library.locate_video(dpath, f"{base_name}.mkv")
+        if not loc:
+            return None
+        try:
+            st = os.stat(loc.path)
+        except OSError:
+            return None
+        fingerprint = hashlib.blake2b(
+            f"{os.path.abspath(loc.path)}\0{loc.member}\0{loc.offset}\0{loc.size}\0{st.st_size}\0{st.st_mtime_ns}".encode(
+                "utf-8", errors="surrogateescape"),
+            digest_size=8,
+        ).hexdigest()
+        out_path = os.path.join(self.cache_dir, f"{base_name}-{fingerprint}.mp4")
 
-        key = f"{did}/{base_name}"
         with self.remux_locks_guard:
-            rlock = self.remux_locks.setdefault(key, threading.Lock())
+            rlock = self.remux_locks.setdefault(out_path, threading.Lock())
 
         with rlock:
             try:
-                if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                if os.path.getsize(out_path) > 0:
+                    os.utime(out_path)  # most recently used, for eviction
                     return out_path
             except OSError:
                 pass
 
-            mkv_name = f"{base_name}.mkv"
-            slice_info = self.library.get_mkv_slice(dpath, mkv_name)
-            if not slice_info:
-                return None
+            with self.remux_slots:
+                if not self._remux(loc, out_path):
+                    return None
+            self._evict_cache(keep=out_path)
+            return out_path
 
-            tmp_path = out_path + f".tmp.{threading.get_ident()}"
-            print(f"[web_server] Remuxing {mkv_name} -> {out_path}...", flush=True)
-
-            try:
-                if slice_info[0] == "file":
-                    proc = subprocess.run(
-                        [
-                            "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-                            "-i", slice_info[1],
-                            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_path,
-                        ],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                    )
-                else:
-                    proc = subprocess.Popen(
-                        [
-                            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                            "-i", "pipe:0",
-                            "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_path,
-                        ],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
+    def _remux(self, loc, out_path: str) -> bool:
+        tmp_path = f"{out_path}.tmp.{threading.get_ident()}"
+        print(f"[web_server] Remuxing {os.path.basename(out_path)}...", flush=True)
+        url = loc.ffmpeg_input()
+        cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+               "-i", url or "pipe:0",
+               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_path]
+        try:
+            if url:
+                subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
+            else:
+                # Compressed archive entry: decompress and pipe it in
+                cmd.remove("-nostdin")
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                try:
+                    loc.copy_to(proc.stdin)
+                except OSError:
+                    pass
+                finally:
                     try:
-                        if slice_info[0] == "slice":
-                            _, archive_path, offset, size = slice_info
-                            with open(archive_path, "rb") as fin:
-                                fin.seek(offset)
-                                rem = size
-                                while rem > 0:
-                                    chunk = fin.read(min(CHUNK_SIZE, rem))
-                                    if not chunk:
-                                        break
-                                    proc.stdin.write(chunk)
-                                    rem -= len(chunk)
-                        else:
-                            _, archive_path, member_name, _ = slice_info
-                            with zipfile.ZipFile(archive_path, "r") as zf, zf.open(member_name) as zstream:
-                                shutil.copyfileobj(zstream, proc.stdin, CHUNK_SIZE)
-                    except (BrokenPipeError, OSError):
-                        pass
-                    finally:
-                        try:
-                            if proc.stdin:
-                                proc.stdin.close()
-                        except OSError:
-                            pass
-                    proc.wait()
-
-                if os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
-                    os.replace(tmp_path, out_path)
-                    sz = os.path.getsize(out_path)
-                    print(f"[web_server] Remux complete: {out_path} ({sz} bytes)", flush=True)
-                    return out_path
-            finally:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.unlink(tmp_path)
+                        proc.stdin.close()
                     except OSError:
                         pass
-            return None
+                proc.wait()
+            if os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
+                os.replace(tmp_path, out_path)
+                print(f"[web_server] Remux complete ({os.path.getsize(out_path)} bytes)", flush=True)
+                return True
+            return False
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _evict_cache(self, keep: str) -> None:
+        """Delete the least recently used remuxes until the cache fits its size limit."""
+        entries = []
+        try:
+            with os.scandir(self.cache_dir) as it:
+                for e in it:
+                    if e.name.endswith(".mp4") and e.is_file():
+                        st = e.stat()
+                        entries.append((st.st_mtime, st.st_size, e.path))
+        except OSError:
+            return
+        total = sum(size for _, size, _ in entries)
+        for _, size, path in sorted(entries):
+            if total <= self.cache_max_bytes:
+                break
+            if path == keep:
+                continue
+            try:
+                os.unlink(path)  # open readers keep their copy until they finish
+                total -= size
+            except OSError:
+                pass
 
     def _reaper_loop(self) -> None:
         while self.running:
@@ -921,10 +1168,7 @@ class TinyDVDWebServer:
                     if sess.client_count() == 0 and (now - sess.last_active_time) > SESSION_TIMEOUT_SEC:
                         expired.append(self.sessions.pop(sid))
             for sess in expired:
-                print(
-                    f"[web_server] Pruning expired idle session {sess.session_id} ({sess.disc_title})",
-                    flush=True,
-                )
+                print(f"[web_server] Ending idle session {sess.session_id} ({sess.disc_title})", flush=True)
                 sess.destroy()
 
     def serve_until_interrupted(self) -> None:
@@ -948,11 +1192,8 @@ class TinyDVDWebServer:
                     pass
 
         if self.httpd is not None:
-            try:
-                self.httpd.shutdown()
-                self.httpd.server_close()
-            except Exception:
-                pass
+            self.httpd.shutdown()
+            self.httpd.server_close()
 
         with self.sessions_lock:
             all_sessions = list(self.sessions.values())
