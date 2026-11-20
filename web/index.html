@@ -195,6 +195,11 @@
       z-index: 50;
       overflow: hidden;
     }
+    /* In fullscreen the pointer hides after 2s without mouse activity, like the desktop player */
+    #player-view.cursor-hidden,
+    #player-view.cursor-hidden * {
+      cursor: none !important;
+    }
     #player-view:fullscreen,
     #player-view:-webkit-full-screen {
       width: 100vw !important;
@@ -874,6 +879,29 @@
     document.addEventListener('mousemove', wakeHUD);
     document.addEventListener('pointerdown', wakeHUD);
 
+    // Same rule as the desktop player (CURSOR_IDLE_MS in tinydvd_desktop_ui.py):
+    // hide the pointer after 2s without mouse activity, show it again on any
+    // mouse movement, click or scroll. Keys don't count. Only in fullscreen.
+    const CURSOR_IDLE_MS = 2000;
+    let cursorIdleTimer = null;
+    function isFullscreen() {
+      return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    }
+    function noteMouseActivity() {
+      playerView.classList.remove('cursor-hidden');
+      clearTimeout(cursorIdleTimer);
+      if (isFullscreen()) {
+        cursorIdleTimer = setTimeout(() => {
+          if (isFullscreen()) playerView.classList.add('cursor-hidden');
+        }, CURSOR_IDLE_MS);
+      }
+    }
+    for (const evName of ['mousemove', 'pointerdown', 'pointerup', 'wheel']) {
+      document.addEventListener(evName, noteMouseActivity, { passive: true });
+    }
+    document.addEventListener('fullscreenchange', noteMouseActivity);
+    document.addEventListener('webkitfullscreenchange', noteMouseActivity);
+
     const SVG_PLAY = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M8 5v14l11-7z"/></svg>';
     const SVG_PAUSE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="display:block;"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>';
 
@@ -978,6 +1006,23 @@
       sendWS({ type: 'seek_completed', pts: video.currentTime, seq: currentSeq });
       sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
     });
+    // Report that the current video has finished, once per load
+    let endReportedSeq = -1;
+    function reportEnded() {
+      if (endReportedSeq === currentSeq) return;
+      endReportedSeq = currentSeq;
+      sendWS({ type: 'time_update', pts: video.duration || (video.currentTime + 1.0), seq: currentSeq });
+      sendWS({ type: 'video_ended', seq: currentSeq });
+    }
+
+    // Some discs point a short cell at the very end of a title's video (or a
+    // hair past it). Browsers differ on whether seeking there fires 'ended';
+    // Safari can just sit at the last frame, which would leave the disc
+    // waiting forever. So report the end ourselves.
+    function seekIsPastEnd(pts) {
+      return isFinite(video.duration) && video.duration > 0 && pts >= video.duration - 0.05;
+    }
+
     function seekTo(pts, seq) {
       if (pts === undefined || pts === null) return;
       if (seq !== undefined) currentSeq = seq;
@@ -985,7 +1030,11 @@
         video.pause();
       }
       if (video.readyState >= 1 && isFinite(video.duration)) {
-        if (Math.abs(video.currentTime - pts) > 0.05) {
+        if (seekIsPastEnd(pts)) {
+          video.currentTime = video.duration;
+          sendWS({ type: 'seek_completed', pts: video.duration, seq: currentSeq });
+          reportEnded();
+        } else if (Math.abs(video.currentTime - pts) > 0.05) {
           isSeeking = true;
           video.currentTime = pts;
         } else {
@@ -998,9 +1047,16 @@
     }
     video.addEventListener('loadedmetadata', () => {
       if (pendingSeekPts !== null) {
-        isSeeking = true;
-        video.currentTime = pendingSeekPts;
+        const target = pendingSeekPts;
         pendingSeekPts = null;
+        if (seekIsPastEnd(target)) {
+          video.currentTime = video.duration;
+          sendWS({ type: 'seek_completed', pts: video.duration, seq: currentSeq });
+          reportEnded();
+        } else {
+          isSeeking = true;
+          video.currentTime = target;
+        }
       }
       if (isPaused) {
         video.pause();
@@ -1018,8 +1074,7 @@
       sendWS({ type: 'file_loaded', seq: currentSeq });
     });
     video.addEventListener('ended', () => {
-      sendWS({ type: 'time_update', pts: video.duration || (video.currentTime + 1.0), seq: currentSeq });
-      sendWS({ type: 'video_ended', seq: currentSeq });
+      reportEnded();
       updatePlayPauseBtn();
     });
 

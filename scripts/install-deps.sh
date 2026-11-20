@@ -55,6 +55,22 @@ prompt_opt_in_libdvdcss() {
     fi
 }
 
+# Say why the package manager needs sudo before it asks for a password
+explain_package_sudo() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo ""
+        echo "=== Administrator rights needed ==="
+        echo "The build tools and libraries TinyDVD needs are installed with your system"
+        echo "package manager ($1), which needs administrator rights, so sudo may ask"
+        echo "for your password. It installs a C compiler, CMake, pkg-config, ffmpeg, Python,"
+        echo "the development files for mpv, SDL2, OpenGL, Cairo, Pango and zlib, and"
+        echo "dvdbackup where your distribution has it. Optional DVD decryption (libdvdcss)"
+        echo "is asked about separately. To install packages yourself instead, press Ctrl-C"
+        echo "now (the README lists the exact commands)."
+        echo ""
+    fi
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -110,6 +126,7 @@ main() {
                 if [ "$(id -u)" -ne 0 ]; then
                     SUDO="sudo"
                 fi
+                explain_package_sudo apt-get
                 $SUDO apt-get update
                 $SUDO apt-get install -y \
                     build-essential \
@@ -139,6 +156,7 @@ main() {
                 if [ "$(id -u)" -ne 0 ]; then
                     SUDO="sudo"
                 fi
+                explain_package_sudo dnf
                 $SUDO dnf install -y \
                     gcc \
                     gcc-c++ \
@@ -165,6 +183,7 @@ main() {
                 if [ "$(id -u)" -ne 0 ]; then
                     SUDO="sudo"
                 fi
+                explain_package_sudo pacman
                 $SUDO pacman -S --needed --noconfirm \
                     base-devel \
                     cmake \

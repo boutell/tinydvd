@@ -261,8 +261,43 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
     fi
 fi
 
+# Say what sudo is for before it asks for a password
+explain_sudo() {
+    echo ""
+    if [[ "$UNINSTALL" -eq 0 ]]; then
+        echo "=== Administrator rights needed ==="
+        echo "TinyDVD is built (as you). Copying it into ${PREFIX} needs administrator"
+        echo "rights, so sudo will ask for your password. As root, this script only writes:"
+        echo "  ${BIN_DIR}: tinydvd, convert-to-tinydvd, tinydvd-set-thumbnail, tinydvd-thumbnailer"
+        echo "  ${LIB_DIR}: the player library, its Python scripts and a private Python environment"
+        if [[ "$OS" == "Linux" ]]; then
+            echo "  ${SHARE_DIR}: the app launcher, the .tdvd file type (with tinydvd as its"
+            echo "    default app), icons and the file-manager thumbnailer"
+        fi
+        echo "Nothing else is changed. './install --uninstall' removes it all."
+        echo ""
+        echo "To install without sudo, press Ctrl-C now and run: ./install --prefix ~/.local"
+        if [[ "$OS" == "Linux" ]]; then
+            echo "(GNOME Files won't show .tdvd thumbnails then: its thumbnailer sandbox can't"
+            echo "see your home folder.)"
+        fi
+    else
+        echo "=== Administrator rights needed ==="
+        echo "TinyDVD is installed in ${PREFIX}, so removing it needs administrator rights."
+        echo "sudo will ask for your password, then this script deletes only what"
+        if [[ "$OS" == "Linux" ]]; then
+            echo "'./install' put in ${BIN_DIR}, ${LIB_DIR} and"
+            echo "${SHARE_DIR} (launcher, file type, icons, thumbnailer)."
+        else
+            echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}."
+        fi
+    fi
+    echo ""
+}
+
 # Escalate with sudo only if target prefix is not writable by current user
 if needs_sudo; then
+    explain_sudo
     if [[ "$UNINSTALL" -eq 0 ]]; then
         exec sudo TINYDVD_BASE_PYTHON="${BASE_PYTHON}" TINYDVD_ALREADY_BUILT=1 "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
