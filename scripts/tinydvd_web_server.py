@@ -225,7 +225,11 @@ def _as_int(val, default: int = 0) -> int:
 
 
 class WebSession:
-    """Isolated DVD VM playback session shared by tabs using the same ?session=<id>."""
+    """
+    Isolated DVD VM playback session shared by tabs using the same ?session=<id>.
+    A session can start with no disc (disc_path ""): its VM is created when a
+    movie is picked, so the library page isn't replaced by a movie nobody chose.
+    """
 
     def __init__(self, core: TinyDVDCore, session_id: str, disc_path: str, disc_id: str, disc_title: str):
         self.core = core
@@ -247,14 +251,19 @@ class WebSession:
         self.cached_domain_state: str | None = None
 
         self._cb_ref = TDVD_VM_JSON_CB(self._on_vm_json)
-        self.vm_handle = self.core.lib.tdvd_vm_session_create(
+        self.vm_handle = None
+        if disc_path:
+            self.vm_handle = self._create_vm(disc_path, disc_id)
+            if not self.vm_handle:
+                raise RuntimeError(f"Failed to start DVD VM session for {disc_path}")
+
+    def _create_vm(self, disc_path: str, disc_id: str):
+        return self.core.lib.tdvd_vm_session_create(
             disc_path.encode("utf-8"),
             disc_id.encode("utf-8"),
             self._cb_ref,
             None,
         )
-        if not self.vm_handle:
-            raise RuntimeError(f"Failed to start DVD VM session for {disc_path}")
 
     def _on_vm_json(self, _user_data, json_cstr: bytes) -> None:
         if not json_cstr:
@@ -351,7 +360,9 @@ class WebSession:
                 self.cached_highlight = None
                 self.cached_domain_state = None
             if not self.vm_handle:
-                return False
+                # First movie picked in this session
+                self.vm_handle = self._create_vm(disc_path, disc_id)
+                return bool(self.vm_handle)
             rc = self.core.lib.tdvd_vm_session_load(
                 self.vm_handle,
                 disc_path.encode("utf-8"),
@@ -844,13 +855,19 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_websocket(self, app: "TinyDVDWebServer", ws_key: str, session_param: str) -> None:
         is_dir, items, raw_target = app.library.get_snapshot()
-        default_path = items[0].path if items else (raw_target if not is_dir else "")
-        default_id = items[0].id if items else disc_id_for_path(default_path)
-        default_title = items[0].title if items else os.path.basename(default_path)
+        if is_dir:
+            # Library: a new session waits for the viewer to pick a movie
+            default_path = default_id = default_title = ""
+        else:
+            # A single disc: start playing it straight away
+            default_path = items[0].path if items else raw_target
+            default_id = items[0].id if items else disc_id_for_path(default_path)
+            default_title = items[0].title if items else os.path.basename(default_path)
 
-        sess = app.get_or_create_session(session_param, default_path, default_id, default_title)
+        sess = app.get_or_create_session(session_param, default_path, default_id, default_title,
+                                         allow_no_disc=is_dir)
         if not sess:
-            self._send_error_text(503, "Too Many Sessions")
+            self._send_error_text(503, "Too Many Sessions" if default_path or is_dir else "No Disc Found")
             return
 
         self.close_connection = True
@@ -1007,9 +1024,14 @@ class TinyDVDWebServer:
         return t
 
     def get_or_create_session(
-        self, session_id: str | None, disc_path: str, disc_id: str, disc_title: str
+        self, session_id: str | None, disc_path: str, disc_id: str, disc_title: str,
+        allow_no_disc: bool = False,
     ) -> WebSession | None:
-        """The named session, or a new one. None if there's no disc or too many sessions."""
+        """
+        The named session, or a new one. A new one starts playing disc_path, or
+        with allow_no_disc and no disc_path, waits for switch_movie(). None if
+        there's no disc to play or there are too many sessions.
+        """
         sid = sanitize_id(session_id or "")
         if not sid:
             sid = "s_" + uuid.uuid4().hex[:16]
@@ -1021,7 +1043,7 @@ class TinyDVDWebServer:
                 return existing
             full = len(self.sessions) >= MAX_SESSIONS
 
-        if not disc_path:
+        if not disc_path and not allow_no_disc:
             return None
         if full and not self._evict_idle_session():
             return None
@@ -1033,7 +1055,8 @@ class TinyDVDWebServer:
                 sess.destroy()
                 return again
             self.sessions[sid] = sess
-        print(f"[web_server] Started session {sid} for {disc_title or disc_id}", flush=True)
+        print(f"[web_server] Started session {sid}" + (f" for {disc_title or disc_id}" if disc_path else ""),
+              flush=True)
         return sess
 
     def _evict_idle_session(self) -> bool:

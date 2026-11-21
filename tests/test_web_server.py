@@ -338,6 +338,63 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
         shutil.rmtree(test_dir, ignore_errors=True)
 
 
+def ws_read_messages(sock: socket.socket, wait: float) -> list[dict]:
+    """Unmasked server text frames received within `wait` seconds."""
+    msgs: list[dict] = []
+    buf = b""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        r, _, _ = select.select([sock], [], [], max(0.0, deadline - time.time()))
+        if not r:
+            break
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+        while len(buf) >= 2:
+            plen, off = buf[1] & 0x7F, 2
+            if plen == 126:
+                if len(buf) < 4:
+                    break
+                plen, off = struct.unpack("!H", buf[2:4])[0], 4
+            elif plen == 127:
+                if len(buf) < 10:
+                    break
+                plen, off = struct.unpack("!Q", buf[2:10])[0], 10
+            if len(buf) < off + plen:
+                break
+            msgs.append(json.loads(buf[off:off + plen].decode("utf-8")))
+            buf = buf[off + plen:]
+    return msgs
+
+
+def test_library_waits_for_pick(core: TinyDVDCore, tdvd_path: str) -> None:
+    print("Testing that a new library session waits for the viewer to pick a movie...")
+    lib_dir = tempfile.mkdtemp(prefix="tinydvd_test_pick_")
+    try:
+        os.symlink(os.path.abspath(tdvd_path), os.path.join(lib_dir, "Dune.tdvd"))
+        server = make_server(core, lib_dir)
+        try:
+            sock, tid = ws_connect(server, "/ws?session=fresh_viewer")
+            msgs = ws_read_messages(sock, 1.0)
+            assert not [m for m in msgs if m.get("type") == "video_load"], msgs
+            print("  - No movie starts on connect in library mode: OK")
+
+            st, _, body = http_get(server, "/api/library")
+            disc_id = json.loads(body)["items"][0]["id"]
+            st, _, _ = http_post_json(server, "/api/play", {"session": "fresh_viewer", "disc": disc_id})
+            assert st == 200
+            msgs = ws_read_messages(sock, 3.0)
+            assert [m for m in msgs if m.get("type") == "video_load"], msgs
+            print("  - Picking a movie starts it in that session: OK")
+            sock.close()
+            tid.join(timeout=5.0)
+        finally:
+            server.stop()
+    finally:
+        shutil.rmtree(lib_dir, ignore_errors=True)
+
+
 def create_dummy_converted_dir(directory: str, meta_dict: dict) -> None:
     files = {
         "VIDEO_TS.IFO": b"DVDVIDEO-VMG\x00",
@@ -650,6 +707,7 @@ def main() -> int:
     if os.path.isfile(tdvd):
         test_http_and_websocket_endpoints(core, tdvd)
         test_library_directory_filtering_and_sse(core, tdvd)
+        test_library_waits_for_pick(core, tdvd)
     else:
         print(f"Skipping playback and streaming tests ({tdvd} not found)")
     test_import_dvd_workflow(core)
