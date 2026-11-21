@@ -49,7 +49,8 @@ void tdvd_free(void *ptr) {
  * ========================================================================= */
 
 typedef struct {
-    int type;        /* 0=none, 1=quit, 2=mouse_motion, 3=mouse_down, 4=mouse_up, 5=mouse_wheel, 6=keydown, 7=textinput, 8=other */
+    int type;        /* 0=none, 1=quit, 2=mouse_motion, 3=mouse_down, 4=mouse_up, 5=mouse_wheel, 6=keydown, 7=textinput, 8=other,
+                        9=file dropped or opened (fetch it with tdvd_desktop_take_dropped_file) */
     int x;
     int y;
     int button;
@@ -86,6 +87,10 @@ typedef struct tdvd_desktop_ctx {
 
     tdvd_png_cache_entry_t png_cache[MAX_PNG_CACHE];
     int png_cache_count;
+
+    /* Last file dropped on the window, or opened from Finder (macOS sends
+     * "open document" requests, which SDL reports as drops) */
+    char *dropped_file;
 } tdvd_desktop_ctx_t;
 
 static volatile sig_atomic_t g_quit_requested = 0;
@@ -237,6 +242,8 @@ tdvd_desktop_ctx_t *tdvd_desktop_create(const char *title, int width, int height
 void tdvd_desktop_destroy(tdvd_desktop_ctx_t *ctx) {
     if (!ctx) return;
     printf("[main] Cleaning up...\n");
+    free(ctx->dropped_file);
+    ctx->dropped_file = NULL;
 
     SDL_StopTextInput();
     SDL_EnableScreenSaver();
@@ -343,8 +350,15 @@ int tdvd_desktop_choose_source_dialog(int choose_iso_only, const char *initial_p
 #endif
 }
 
+int tdvd_desktop_take_dropped_file(tdvd_desktop_ctx_t *ctx, char *out_path, int out_len) {
+    if (!ctx || !ctx->dropped_file || !out_path || out_len <= 0) return 0;
+    snprintf(out_path, (size_t)out_len, "%s", ctx->dropped_file);
+    free(ctx->dropped_file);
+    ctx->dropped_file = NULL;
+    return 1;
+}
+
 int tdvd_desktop_poll_event(tdvd_desktop_ctx_t *ctx, tdvd_ui_event_t *out_ev) {
-    (void)ctx;
     if (!out_ev) return 0;
     SDL_Event ev;
     if (!SDL_PollEvent(&ev)) {
@@ -392,6 +406,19 @@ int tdvd_desktop_poll_event(tdvd_desktop_ctx_t *ctx, tdvd_ui_event_t *out_ev) {
             out_ev->type = 7;
             out_ev->keymod = (uint16_t)SDL_GetModState();
             snprintf(out_ev->text, sizeof(out_ev->text), "%s", ev.text.text);
+            break;
+        case SDL_DROPFILE:
+        case SDL_DROPTEXT:
+            out_ev->type = 8;
+            if (ev.type == SDL_DROPFILE && ctx && ev.drop.file) {
+                char *copy = strdup(ev.drop.file);
+                if (copy) {
+                    free(ctx->dropped_file);
+                    ctx->dropped_file = copy;
+                    out_ev->type = 9;
+                }
+            }
+            SDL_free(ev.drop.file);
             break;
         default:
             out_ev->type = 8;

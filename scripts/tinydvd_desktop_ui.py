@@ -21,6 +21,7 @@ import threading
 import time
 
 from tinydvd_core import DesktopUIEvent, TinyDVDCore
+import tinydvd_archive
 from tinydvd_library import (
     IMPORT_DONE,
     IMPORT_ERROR,
@@ -28,6 +29,7 @@ from tinydvd_library import (
     CatalogItem,
     TinyDVDLibrary,
     detect_default_source,
+    is_dvd_dir,
 )
 
 TINYDVD_VERSION = "1.0.0"
@@ -150,6 +152,7 @@ EVT_MOUSE_UP = 4
 EVT_MOUSE_WHEEL = 5
 EVT_KEYDOWN = 6
 EVT_TEXTINPUT = 7
+EVT_FILE_OPENED = 9  # dropped on the window, or opened from Finder
 
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
@@ -1923,6 +1926,16 @@ def run_desktop_app(core: TinyDVDCore, dvd_path: str, start_fullscreen: bool) ->
                 if ev.type == EVT_QUIT:
                     running = False
                     break
+
+                if ev.type == EVT_FILE_OPENED:
+                    path_buf = ctypes.create_string_buffer(4096)
+                    if core.lib.tdvd_desktop_take_dropped_file(ctx, path_buf, len(path_buf)):
+                        opened = path_buf.value.decode("utf-8", errors="surrogateescape")
+                        if (tinydvd_archive.is_tdvd_path(opened) and os.path.isfile(opened)) or is_dvd_dir(opened):
+                            title = str(tinydvd_archive.read_metadata(opened).get("title") or "").strip()
+                            start_movie(opened, title or tinydvd_archive.strip_tdvd_extension(
+                                os.path.basename(opened.rstrip("/"))))
+                    continue
 
                 consumed, play_path, play_title, do_back = ui.handle_event(
                     ev, win_w, win_h, in_player_view

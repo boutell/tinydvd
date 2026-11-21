@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install: build tinydvd, create a dedicated Python virtualenv, and install the
-# self-contained runtime into PREFIX (default: /usr/local) with GNOME/freedesktop
-# desktop integration on Linux.
+# self-contained runtime into PREFIX (default: /usr/local), with desktop
+# integration: GNOME/freedesktop on Linux, TinyDVD.app on macOS.
 #
 # Everything goes under /usr/local by default so macOS/Linux tools run from a
 # single system location and GNOME's thumbnailer sandbox can access it.
@@ -10,6 +10,8 @@
 #   ./install --prefix <dir>       Build and install to a custom prefix
 #   ./install --python <path>      Use a specific compatible Python (>= 3.8)
 #   ./install --no-deps            Do not auto-run scripts/install-deps.sh
+#   ./install --app-dir <dir>      macOS: put TinyDVD.app here (default: /Applications,
+#                                  or ~/Applications if the prefix is in your home folder)
 #   ./install --uninstall          Remove everything this script installed
 
 set -euo pipefail
@@ -19,6 +21,7 @@ PREFIX="/usr/local"
 CUSTOM_PYTHON="${TINYDVD_PYTHON:-}"
 INSTALL_DEPS=1
 UNINSTALL=0
+MAC_APP_DIR="${TINYDVD_MAC_APP_DIR:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,8 +57,20 @@ while [[ $# -gt 0 ]]; do
             CUSTOM_PYTHON="${1#*=}"
             shift
             ;;
+        --app-dir)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --app-dir requires a directory argument" >&2
+                exit 1
+            fi
+            MAC_APP_DIR="$2"
+            shift 2
+            ;;
+        --app-dir=*)
+            MAC_APP_DIR="${1#*=}"
+            shift
+            ;;
         -h|--help)
-            sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -77,6 +92,19 @@ THUMB_DIR="${SHARE_DIR}/thumbnailers"
 ICON_DIR="${SHARE_DIR}/icons/hicolor"
 MIME_TYPES=(video/x-tinydvd application/x-tdvd application/x-tinydvd)
 OS="$(uname -s)"
+
+# macOS: where TinyDVD.app goes
+if [[ -z "$MAC_APP_DIR" ]]; then
+    if [[ -n "${HOME:-}" && "$PREFIX/" == "$HOME/"* ]]; then
+        MAC_APP_DIR="${HOME}/Applications"
+    else
+        MAC_APP_DIR="/Applications"
+    fi
+fi
+MAC_APP_DIR="${MAC_APP_DIR%/}"
+MAC_APP="${MAC_APP_DIR}/TinyDVD.app"
+MAC_BUNDLE_ID="io.github.boutell.tinydvd"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 validate_python() {
     local py="$1"
@@ -209,6 +237,11 @@ needs_sudo() {
     [[ -w "$probe" ]] || return 0
     if [[ -d "$BIN_DIR" && ! -w "$BIN_DIR" ]]; then return 0; fi
     if [[ -d "$LIB_DIR" && ! -w "$LIB_DIR" ]]; then return 0; fi
+    if [[ "$MAC_APP_BUILT" -eq 1 || ( "$UNINSTALL" -eq 1 && -e "$MAC_APP" ) ]]; then
+        if [[ -e "$MAC_APP" && ! -w "$MAC_APP" ]]; then return 0; fi
+        probe="$(nearest_existing_dir "$MAC_APP_DIR")"
+        [[ -w "$probe" ]] || return 0
+    fi
     return 1
 }
 
@@ -256,10 +289,22 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
             -DPython3_EXECUTABLE="${BASE_PYTHON}" \
             -DTINYDVD_INSTALL_LIBDIR="${LIB_DIR}"
         cmake --build "${ROOT_DIR}/build" --target tinydvd
+        if [[ "$OS" == "Darwin" ]]; then
+            # Don't let a launcher left over from another Python stand in
+            rm -f "${ROOT_DIR}/build/tinydvd-macos-app"
+            if grep -q '^TINYDVD_MACOS_APP:INTERNAL=ON$' "${ROOT_DIR}/build/CMakeCache.txt"; then
+                cmake --build "${ROOT_DIR}/build" --target tinydvd_macos_app
+            fi
+        fi
     elif [[ -z "$BASE_PYTHON" ]]; then
         BASE_PYTHON="$(find_compatible_python)"
     fi
 fi
+
+# TinyDVD.app needs a Python that can be embedded; without one, only the app is skipped
+MAC_APP_LAUNCHER="${ROOT_DIR}/build/tinydvd-macos-app"
+MAC_APP_BUILT=0
+if [[ "$OS" == "Darwin" && -x "$MAC_APP_LAUNCHER" ]]; then MAC_APP_BUILT=1; fi
 
 # Say what sudo is for before it asks for a password
 explain_sudo() {
@@ -273,6 +318,8 @@ explain_sudo() {
         if [[ "$OS" == "Linux" ]]; then
             echo "  ${SHARE_DIR}: the app launcher, the .tdvd file type (with tinydvd as its"
             echo "    default app), icons and the file-manager thumbnailer"
+        elif [[ "$MAC_APP_BUILT" -eq 1 ]]; then
+            echo "  ${MAC_APP}: the app, which also tells macOS it opens .tdvd files"
         fi
         echo "Nothing else is changed. './install --uninstall' removes it all."
         echo ""
@@ -289,7 +336,7 @@ explain_sudo() {
             echo "'./install' put in ${BIN_DIR}, ${LIB_DIR} and"
             echo "${SHARE_DIR} (launcher, file type, icons, thumbnailer)."
         else
-            echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}."
+            echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}, and ${MAC_APP}."
         fi
     fi
     echo ""
@@ -350,6 +397,38 @@ elif os.path.exists(path):
 PYEOF
 }
 
+# True if path is a TinyDVD.app this script made (so it's safe to replace or remove)
+is_our_mac_app() {
+    local plist="$1/Contents/Info.plist"
+    [[ -f "$plist" ]] && /usr/bin/defaults read "$plist" CFBundleIdentifier 2>/dev/null | grep -qx "$MAC_BUNDLE_ID"
+}
+
+# Build TinyDVD.app: a launcher that runs the runtime in LIB_DIR, the icon,
+# and an Info.plist that registers TinyDVD as the app for .tdvd files
+install_mac_app() {
+    local launcher="$MAC_APP_LAUNCHER"
+    if [[ -e "$MAC_APP" ]] && ! is_our_mac_app "$MAC_APP"; then
+        echo "Error: ${MAC_APP} exists and isn't one this script installed; not replacing it." >&2
+        echo "Move it aside, or install elsewhere with --app-dir <dir>." >&2
+        exit 1
+    fi
+    local version
+    version="$(sed -n 's/^TINYDVD_VERSION = "\(.*\)"$/\1/p' "${ROOT_DIR}/scripts/tinydvd_app.py")"
+    echo "App -> ${MAC_APP}"
+    rm -rf "$MAC_APP"
+    install -d "${MAC_APP}/Contents/MacOS" "${MAC_APP}/Contents/Resources"
+    install -m 755 "$launcher" "${MAC_APP}/Contents/MacOS/TinyDVD"
+    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.icns" "${MAC_APP}/Contents/Resources/tinydvd.icns"
+    sed -e "s/@VERSION@/${version:-0}/g" "${ROOT_DIR}/data/macos/Info.plist" > "${MAC_APP}/Contents/Info.plist"
+    chmod 644 "${MAC_APP}/Contents/Info.plist"
+    # Sign it ad hoc (no developer account needed), as Apple Silicon requires
+    if ! codesign --force --sign - "$MAC_APP" >/dev/null 2>&1; then
+        echo "Note: couldn't sign ${MAC_APP}; macOS may refuse to open it." >&2
+    fi
+    # Tell Finder about the app and the .tdvd file type now, not at next login
+    "$LSREGISTER" -f "$MAC_APP" >/dev/null 2>&1 || true
+}
+
 if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "=== Uninstalling tinydvd from ${PREFIX} ==="
     rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" \
@@ -368,6 +447,10 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
             set_default_handler "$UNINSTALL_PY" remove
         fi
         refresh_caches
+    fi
+    if [[ "$OS" == "Darwin" ]] && is_our_mac_app "$MAC_APP"; then
+        "$LSREGISTER" -u "$MAC_APP" >/dev/null 2>&1 || true
+        rm -rf "$MAC_APP"
     fi
     rm -rf "${LIB_DIR}"
     echo "tinydvd uninstalled from ${PREFIX}."
@@ -489,7 +572,15 @@ Exec=${BIN_DIR}/tinydvd -f %f|"
     echo "Double-click any .tdvd file in GNOME Files to play it."
     echo "If Nautilus was already open, restart it (nautilus -q) to pick up thumbnails."
 else
+    if [[ "$MAC_APP_BUILT" -eq 1 ]]; then install_mac_app; fi
     echo ""
     echo "Installed cleanly to ${PREFIX} with isolated Python runtime (${VENV_PYTHON})."
-    echo "Try: ${BIN_DIR}/tinydvd ~/Movies   or   ${BIN_DIR}/tinydvd --serve ~/Movies"
+    if [[ "$MAC_APP_BUILT" -eq 1 ]]; then
+        echo "Open TinyDVD from ${MAC_APP_DIR} or Launchpad, or double-click any .tdvd file in Finder."
+    else
+        echo "TinyDVD.app skipped: ${BASE_PYTHON} can't be embedded in an app."
+        echo "Use the tinydvd command, or get the app by reinstalling with Homebrew's Python:"
+        echo "  brew install python@3.12 && ./install --python \"\$(brew --prefix python@3.12)/bin/python3.12\""
+    fi
+    echo "From Terminal: ${BIN_DIR}/tinydvd ~/Movies   or   ${BIN_DIR}/tinydvd --serve ~/Movies"
 fi

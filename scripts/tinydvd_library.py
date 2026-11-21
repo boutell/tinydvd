@@ -74,6 +74,56 @@ def is_dvd_dir(dir_path: str) -> bool:
     )
 
 
+def xdg_videos_dir(home: str, config_home: str | None = None) -> str | None:
+    """
+    The Videos folder the Linux desktop configured, from user-dirs.dirs
+    (it is renamed or translated on some systems, e.g. ~/Vidéos), or None if
+    it isn't set. A value equal to $HOME means "disabled" in the XDG spec.
+    """
+    config_home = config_home or os.path.join(home, ".config")
+    try:
+        with open(os.path.join(config_home, "user-dirs.dirs"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in lines:
+        m = re.match(r'\s*XDG_VIDEOS_DIR\s*=\s*"(.*)"\s*$', line)
+        if not m:
+            continue
+        value = m.group(1).replace('\\"', '"')
+        if value == "$HOME" or value.startswith("$HOME/"):
+            value = home + value[len("$HOME"):]
+        elif not value.startswith("/"):
+            return None
+        value = os.path.normpath(value)
+        return None if value == os.path.normpath(home) else value
+    return None
+
+
+def default_library_path(home: str | None = None, platform: str | None = None,
+                         config_home: str | None = None) -> str:
+    """
+    Where to look for movies when no path is given: ~/Movies on macOS; on
+    Linux the desktop's configured Videos folder, then ~/Videos. Falls back
+    to the other platform's convention if that folder exists instead.
+    """
+    home = home if home is not None else os.path.expanduser("~")
+    if not home or home == "~":
+        return "."
+    platform = platform or sys.platform
+    movies = os.path.join(home, "Movies")
+    videos = os.path.join(home, "Videos")
+    if platform == "darwin":
+        candidates = [movies, videos]
+    else:
+        configured = xdg_videos_dir(home, config_home or os.environ.get("XDG_CONFIG_HOME") or None)
+        candidates = [d for d in (configured, videos, movies) if d]
+    for d in candidates:
+        if os.path.isdir(d):
+            return d
+    return candidates[0]
+
+
 def format_size(size_bytes: int) -> str:
     if size_bytes >= 1024 * 1024 * 1024:
         return f"{size_bytes / (1024.0 * 1024.0 * 1024.0):.1f} GB"

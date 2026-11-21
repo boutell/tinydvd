@@ -34,7 +34,15 @@ if(APPLE AND NOT DEFINED Python3_EXECUTABLE)
         endif()
     endforeach()
 endif()
-find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+if(APPLE)
+    # Development.Embed is for TinyDVD.app's launcher, which runs Python in
+    # its own process. Homebrew's Python includes it; some Pythons (pyenv
+    # without --enable-shared, some conda setups) don't, and then only the
+    # app is skipped, not the player
+    find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter OPTIONAL_COMPONENTS Development.Embed)
+else()
+    find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter)
+endif()
 find_package(OpenGL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -111,6 +119,25 @@ target_compile_definitions(tinydvd PRIVATE
     TINYDVD_INSTALL_LIBDIR="${TINYDVD_INSTALL_LIBDIR}"
 )
 target_compile_options(tinydvd PRIVATE -Wall -Wextra)
+
+# macOS: the executable inside TinyDVD.app (./install builds the bundle)
+if(APPLE AND Python3_Development.Embed_FOUND)
+    set(TINYDVD_MACOS_APP ON CACHE INTERNAL "Building TinyDVD.app's launcher")
+else()
+    set(TINYDVD_MACOS_APP OFF CACHE INTERNAL "Building TinyDVD.app's launcher")
+    if(APPLE)
+        message(STATUS "TinyDVD.app skipped: ${Python3_EXECUTABLE} can't be embedded (no Development.Embed)")
+    endif()
+endif()
+if(TINYDVD_MACOS_APP)
+    add_executable(tinydvd_macos_app src/macos_app_main.c)
+    set_target_properties(tinydvd_macos_app PROPERTIES OUTPUT_NAME tinydvd-macos-app)
+    target_link_libraries(tinydvd_macos_app PRIVATE Python3::Python)
+    target_compile_definitions(tinydvd_macos_app PRIVATE
+        TINYDVD_INSTALL_LIBDIR="${TINYDVD_INSTALL_LIBDIR}"
+    )
+    target_compile_options(tinydvd_macos_app PRIVATE -Wall -Wextra)
+endif()
 
 # Convenience target / symlinks for tinydvd-player and convert-to-tinydvd
 add_custom_command(TARGET tinydvd POST_BUILD

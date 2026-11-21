@@ -17,7 +17,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 import tinydvd_archive  # noqa: E402
-from tinydvd_library import disc_id_for_path  # noqa: E402
+from tinydvd_library import default_library_path, disc_id_for_path, xdg_videos_dir  # noqa: E402
 
 
 def make_archive(path: str, members: dict[str, bytes]) -> None:
@@ -109,6 +109,37 @@ def test_disc_ids() -> None:
     print("  - Distinct, URL-safe disc IDs for similar names: OK")
 
 
+def test_default_library_path(tmp: str) -> None:
+    home = os.path.join(tmp, "home")
+    cfg = os.path.join(home, ".config")
+    os.makedirs(cfg)
+    # Nothing exists: each platform's convention
+    assert default_library_path(home, "darwin") == os.path.join(home, "Movies")
+    assert default_library_path(home, "linux") == os.path.join(home, "Videos")
+    # A translated Videos folder from user-dirs.dirs wins on Linux
+    with open(os.path.join(cfg, "user-dirs.dirs"), "w", encoding="utf-8") as f:
+        f.write('# comment\nXDG_DESKTOP_DIR="$HOME/Bureau"\nXDG_VIDEOS_DIR="$HOME/Vid\u00e9os"\n')
+    vids = os.path.join(home, "Vid\u00e9os")
+    assert xdg_videos_dir(home) == vids
+    assert default_library_path(home, "linux") == vids  # configured, even before it exists
+    os.makedirs(os.path.join(home, "Videos"))
+    assert default_library_path(home, "linux") == os.path.join(home, "Videos")  # configured one missing
+    os.makedirs(vids)
+    assert default_library_path(home, "linux") == vids
+    # macOS ignores the XDG file; Movies falls back to Videos
+    assert default_library_path(home, "darwin") == os.path.join(home, "Videos")
+    # Absolute paths, "disabled" ($HOME itself) and a custom XDG_CONFIG_HOME
+    other = os.path.join(tmp, "other")
+    os.makedirs(other)
+    with open(os.path.join(other, "user-dirs.dirs"), "w", encoding="utf-8") as f:
+        f.write('XDG_VIDEOS_DIR="/srv/media"\n')
+    assert xdg_videos_dir(home, other) == "/srv/media"
+    with open(os.path.join(other, "user-dirs.dirs"), "w", encoding="utf-8") as f:
+        f.write('XDG_VIDEOS_DIR="$HOME/"\n')
+    assert xdg_videos_dir(home, other) is None
+    print("  - Default library folder, including translated XDG Videos: OK")
+
+
 def main() -> int:
     print("=== Running TinyDVD archive helper tests ===")
     tmp = tempfile.mkdtemp(prefix="tinydvd_test_archive_")
@@ -118,6 +149,7 @@ def main() -> int:
         test_sidecar_metadata(tmp)
         test_place_without_overwrite(tmp)
         test_disc_ids()
+        test_default_library_path(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("All archive helper tests passed!")

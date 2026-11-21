@@ -11,14 +11,45 @@ Unlike standard rippers that throw away menus or split a disc into dozens of dis
 
 ---
 
-## 1. How to Build It
+## 1. How to Install It
 
-### Install Dependencies
+### What you need first
 
-Run the automatic dependency installer for macOS or Linux:
+- **macOS:** [Homebrew](https://brew.sh). Its installer also installs Apple's Xcode Command Line Tools (the C compiler) if you don't have them; you can also install those yourself with `xcode-select --install`. Everything else (CMake, mpv, SDL2, Cairo, Pango, FFmpeg, Python 3.12) is installed through Homebrew for you.
+- **Linux:** Debian/Ubuntu, Fedora/RHEL or Arch Linux, and an account that can use `sudo`. The packages are installed for you.
+
+### Install
+
+```bash
+./install
+```
+
+This installs any missing dependencies (with `scripts/install-deps.sh`), builds TinyDVD, then installs it under `/usr/local`. Writing there needs administrator rights, so it asks for your password, after saying exactly what it will write. You get:
+
+- **On macOS:**
+  - **TinyDVD.app** in `/Applications`, which shows up in Launchpad, Spotlight and the Dock with its own icon. Opening it shows your movie library (`~/Movies`).
+  - `.tdvd` and `.tinydvd` files open in TinyDVD when you double-click them in Finder, and show the TinyDVD disc icon. (Finder doesn't show each disc's own thumbnail; that would need a Quick Look extension, which TinyDVD doesn't have yet.)
+  - The `tinydvd`, `convert-to-tinydvd`, `tinydvd-set-thumbnail` and `tinydvd-thumbnailer` commands in `/usr/local/bin`.
+- **On Linux:**
+  - The same commands in `/usr/local/bin`, and a TinyDVD entry in your applications menu.
+  - The `video/x-tinydvd` file type for `*.tdvd` and `*.tinydvd`, with TinyDVD as its default app, so double-clicking one plays it.
+  - The application and file icons, and a thumbnailer, so GNOME Files (Nautilus) shows each disc's embedded thumbnail (see `tinydvd-set-thumbnail` below). If GNOME Files was already open, restart it with `nautilus -q` to see them.
+  - Everything goes under `/usr/local` because GNOME runs thumbnailers in a sandbox that can't see your home folder, so a thumbnailer installed in `~/.local` never runs.
+
+To install somewhere you can write without `sudo`, use `./install --prefix ~/.local` (on macOS the app then goes in `~/Applications`; choose another folder with `--app-dir`). To remove everything again:
+
+```bash
+./install --uninstall
+```
+
+### Building Without Installing
+
+For working on TinyDVD itself, install the dependencies and build in place:
 
 ```bash
 ./scripts/install-deps.sh
+cmake -B build -S .
+cmake --build build
 ```
 
 <details>
@@ -77,14 +108,7 @@ sudo pacman -S --needed cmake base-devel pkgconf dvdbackup mpv sdl2 cairo pango 
   ```
 </details>
 
-### Compile `tinydvd`
-
-```bash
-cmake -B build -S .
-cmake --build build
-```
-
-This builds the player binary at `./build/tinydvd`.
+This builds the player at `./build/tinydvd`, which runs straight from the source tree.
 
 ---
 
@@ -196,7 +220,7 @@ Run [`scripts/convert-to-tinydvd`](scripts/convert-to-tinydvd.py) on your ripped
 
 #### Step 3: Play with `tinydvd`
 
-Launch the player with no arguments to open the native **Library Browser & DVD Importer UI** (defaulting to `~/Movies` or `~/Videos`), point it at a library folder, or pass a `.tdvd` file / converted directory directly to start playback (or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager):
+Launch the player with no arguments to open the native **Library Browser & DVD Importer UI** (defaulting to `~/Movies` on macOS, or your desktop's Videos folder on Linux, usually `~/Videos`), point it at a library folder, or pass a `.tdvd` file / converted directory directly to start playback (or map `.tdvd` / `.tinydvd` to `tinydvd` in your file manager):
 
 ```bash
 # Launch the native Library Browser & DVD Importer UI:
@@ -290,30 +314,6 @@ You can embed or update thumbnails in existing `.tdvd` archives at any time, wit
 
 # Use a frame 10 minutes into the main feature instead:
 ./scripts/tinydvd-set-thumbnail --force --time 00:10:00 ./tinydvds/MY_MOVIE.tdvd
-```
-
-### GNOME / Linux Desktop Integration (`.tdvd` File Association)
-
-To install `tinydvd` so `.tdvd` and `.tinydvd` files show thumbnails and disc icons in GNOME Files (Nautilus) and play when double-clicked:
-
-```bash
-./install
-```
-
-It builds `tinydvd`, then asks for your password (via `sudo`) and installs under `/usr/local`:
-1. The `tinydvd` player, `convert-to-tinydvd`, `tinydvd-set-thumbnail` and `tinydvd-thumbnailer` in `/usr/local/bin`.
-2. The `tinydvd` application launcher.
-3. The `video/x-tinydvd` file type for `*.tdvd` and `*.tinydvd`, with `tinydvd` as its default application.
-4. The application and file icons.
-5. The Nautilus thumbnailer, which shows each disc's embedded thumbnail (see `tinydvd-set-thumbnail` above).
-
-Everything goes under `/usr/local` because GNOME runs thumbnailers in a sandbox that can't see your home folder, so a thumbnailer installed in `~/.local/bin` never runs.
-
-If GNOME Files was already open, restart it with `nautilus -q` to see thumbnails.
-
-To remove it all again:
-```bash
-./install --uninstall
 ```
 
 ### Player Controls

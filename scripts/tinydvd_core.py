@@ -112,6 +112,8 @@ class TinyDVDCore:
 
         lib.tdvd_desktop_poll_event.argtypes = [ctypes.c_void_p, ctypes.POINTER(DesktopUIEvent)]
         lib.tdvd_desktop_poll_event.restype = ctypes.c_int
+        lib.tdvd_desktop_take_dropped_file.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.tdvd_desktop_take_dropped_file.restype = ctypes.c_int
 
         lib.tdvd_desktop_start_movie.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
         lib.tdvd_desktop_start_movie.restype = ctypes.c_int

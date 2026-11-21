@@ -20,23 +20,11 @@ if SCRIPTS_DIR not in sys.path:
 
 from tinydvd_core import TinyDVDCore
 from tinydvd_desktop_ui import PLAYER_KEY_HELP, run_desktop_app
+from tinydvd_library import default_library_path
 from tinydvd_web_server import TinyDVDWebServer
 
 
 TINYDVD_VERSION = "1.0.0"
-
-
-def resolve_default_library_path() -> str:
-    home = os.path.expanduser("~")
-    if not home or home == "~":
-        return "."
-    movies = os.path.join(home, "Movies")
-    videos = os.path.join(home, "Videos")
-    if os.path.isdir(movies):
-        return movies
-    if os.path.isdir(videos):
-        return videos
-    return movies if sys.platform == "darwin" else videos
 
 
 def config_dir() -> str:
@@ -148,7 +136,7 @@ def main(argv: list[str]) -> int:
             print("Error: No DVD path specified.\n", file=sys.stderr)
             print_usage(prog)
             return 1
-        dvd_path = resolve_default_library_path()
+        dvd_path = default_library_path()
 
     core = TinyDVDCore()
 
