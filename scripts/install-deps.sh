@@ -6,51 +6,143 @@
 #   ./scripts/install-deps.sh [options]
 #
 # Options:
-#   --with-libdvdcss     Opt in to installing optional dvdbackup/libdvdcss support
-#   --without-libdvdcss  Skip optional CSS/optical-rip packages without prompting
+#   --with-libdvdcss     Install optional encrypted-DVD support (dvdbackup + libdvdcss)
+#                        without asking
+#   --without-libdvdcss  Skip it without asking
+#   --only-libdvdcss     Only offer/install that optional support (used by ./install)
 #   -h, --help           Show this help text
 
 set -euo pipefail
 
 OPT_IN_LIBDVDCSS="ask"
+ONLY_LIBDVDCSS=0
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+fi
+
+# Which package family this system uses: macos, debian, fedora, arch or unknown
+detect_platform() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo macos
+    elif [ -f /etc/debian_version ]; then
+        echo debian
+    elif [ -f /etc/fedora-release ] || [ -f /etc/redhat-release ]; then
+        echo fedora
+    elif [ -f /etc/arch-release ]; then
+        echo arch
+    else
+        echo unknown
+    fi
+}
+
+have_libdvdcss() {
+    local ldconfig
+    for ldconfig in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+        if command -v "$ldconfig" >/dev/null 2>&1; then
+            "$ldconfig" -p 2>/dev/null | grep -q 'libdvdcss\.so\.2' && return 0
+            break
+        fi
+    done
+    compgen -G '/usr/lib*/libdvdcss.so.2' >/dev/null || compgen -G '/usr/lib*/*/libdvdcss.so.2' >/dev/null
+}
+
+# True if ripping encrypted discs already works: dvdbackup plus libdvdcss
+# (on macOS, Homebrew's dvdbackup always brings libdvdcss)
+have_disc_support() {
+    command -v dvdbackup >/dev/null 2>&1 || return 1
+    [[ "$(detect_platform)" == "macos" ]] && return 0
+    have_libdvdcss
+}
 
 prompt_opt_in_libdvdcss() {
     case "${OPT_IN_LIBDVDCSS}" in
         yes) return 0 ;;
         no)  return 1 ;;
     esac
+    if [[ ! -t 0 ]]; then
+        echo "Note: no terminal to ask in; skipping optional encrypted-DVD support. Pass --with-libdvdcss to include it."
+        return 1
+    fi
+    echo ""
+    echo "=== Optional: rip DVDs straight from a drive, including encrypted ones ==="
+    echo "Most commercial DVDs are CSS-encrypted. Ripping them needs dvdbackup and"
+    echo "libdvdcss, the standard open-source decryption library (VLC uses it too)."
+    echo "Whether you may use it depends on where you live; check your local law."
+    echo "Without it, TinyDVD still plays .tdvd files and imports ripped VIDEO_TS"
+    echo "folders, unencrypted .iso images and unencrypted discs."
+    local reply=""
+    read -r -p "Install dvdbackup and libdvdcss? [y/N]: " reply || true
+    case "$reply" in
+        [yY]|[yY][eE][sS]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-    local cur_os="${OS:-$(uname -s)}"
-    local prompt_msg=""
-    if [[ -t 0 ]]; then
-        echo ""
-        if [[ "$cur_os" == "Darwin" ]]; then
-            echo "Optional: Direct optical-drive ripping via dvdbackup."
-            echo "On macOS, Homebrew's dvdbackup also installs libdvdread and libdvdcss"
-            echo "(for CSS-encrypted discs, where permitted by local law)."
-            echo "If you opt out, tinydvd still plays .tdvd files and imports previously ripped"
-            echo "VIDEO_TS folders, unencrypted .iso images, and unencrypted discs mounted"
-            echo "under /Volumes/<DISC>."
-            prompt_msg="Install optional dvdbackup (includes libdvdread & libdvdcss via Homebrew)? [y/N]: "
-        else
-            echo "Optional: CSS-encrypted DVD decryption (libdvdcss, where permitted by local law)."
-            echo "If you opt out, tinydvd still plays .tdvd files and imports unencrypted discs,"
-            echo "previously ripped VIDEO_TS folders, and unencrypted .iso images (mounted first,"
-            echo "or directly if 7z is installed)."
-            prompt_msg="Install optional libdvdcss support for CSS-encrypted DVDs? [y/N]: "
-        fi
-        local reply=""
-        read -r -p "$prompt_msg" reply || true
-        case "$reply" in
-            [yY]|[yY][eE][sS]) return 0 ;;
-            *) return 1 ;;
-        esac
+# Offer, and if accepted install, dvdbackup + libdvdcss from the platform's
+# usual packages. Returns nonzero only if an accepted install failed.
+install_disc_support() {
+    local platform
+    platform="$(detect_platform)"
+    if have_disc_support; then
+        echo "Encrypted-DVD support (dvdbackup + libdvdcss): already installed."
+        return 0
+    fi
+    if ! prompt_opt_in_libdvdcss; then
+        echo "Skipped encrypted-DVD support. To add it later: ./install --with-libdvdcss"
+        return 0
+    fi
+    case "$platform" in
+        macos)
+            # Homebrew's dvdbackup depends on libdvdread, which brings libdvdcss
+            brew install dvdbackup
+            ;;
+        debian)
+            # libdvd-pkg downloads the libdvdcss source and builds it for you
+            if [ -n "$SUDO" ]; then
+                echo "sudo may ask for your password to install dvdbackup and libdvd-pkg."
+            fi
+            $SUDO apt-get install -y dvdbackup
+            if ! apt-cache show libdvd-pkg >/dev/null 2>&1; then
+                echo "libdvd-pkg isn't available: it's in Debian's 'contrib' section and"
+                echo "Ubuntu's 'multiverse' repository. Enable that, then run ./install --with-libdvdcss"
+                echo "  Ubuntu: sudo add-apt-repository multiverse && sudo apt-get update"
+                echo "  Debian: add 'contrib' to the components in /etc/apt/sources.list(.d), then sudo apt-get update"
+                return 1
+            fi
+            $SUDO apt-get install -y libdvd-pkg
+            # This step fetches and builds libdvdcss
+            $SUDO dpkg-reconfigure -f noninteractive libdvd-pkg
+            ;;
+        fedora)
+            # Fedora can't ship libdvdcss; RPM Fusion's "tainted" repository does
+            if ! rpm -q rpmfusion-free-release >/dev/null 2>&1; then
+                echo "dvdbackup and libdvdcss come from RPM Fusion, which isn't enabled yet."
+                echo "Enable RPM Fusion Free (https://rpmfusion.org/Configuration), then run"
+                echo "./install --with-libdvdcss"
+                return 1
+            fi
+            if [ -n "$SUDO" ]; then
+                echo "sudo may ask for your password to enable RPM Fusion tainted and install the packages."
+            fi
+            $SUDO dnf install -y rpmfusion-free-release-tainted
+            $SUDO dnf install -y dvdbackup libdvdcss
+            ;;
+        arch)
+            if [ -n "$SUDO" ]; then
+                echo "sudo may ask for your password to install dvdbackup and libdvdcss."
+            fi
+            $SUDO pacman -S --needed --noconfirm dvdbackup libdvdcss
+            ;;
+        *)
+            echo "Install dvdbackup and libdvdcss with your distribution's package manager."
+            return 1
+            ;;
+    esac
+    if have_disc_support; then
+        echo "Encrypted-DVD support installed."
     else
-        if [[ "$cur_os" == "Darwin" ]]; then
-            echo "Note: Non-interactive shell; skipping optional dvdbackup (and its Homebrew libdvdread/libdvdcss dependencies). You can still play .tdvd files and import VIDEO_TS folders, unencrypted .iso images, and mounted unencrypted discs under /Volumes/<DISC>. Pass --with-libdvdcss to opt in."
-        else
-            echo "Note: Non-interactive shell; skipping optional libdvdcss. You can still play .tdvd files and import unencrypted discs, previously ripped VIDEO_TS folders, and unencrypted .iso images (mounted or via 7z). Pass --with-libdvdcss to opt in."
-        fi
+        echo "Warning: dvdbackup or libdvdcss still not found after installing." >&2
         return 1
     fi
 }
@@ -82,8 +174,12 @@ main() {
                 OPT_IN_LIBDVDCSS="no"
                 shift
                 ;;
+            --only-libdvdcss)
+                ONLY_LIBDVDCSS=1
+                shift
+                ;;
             -h|--help)
-                sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+                sed -n '2,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
                 exit 0
                 ;;
             *)
@@ -92,6 +188,11 @@ main() {
                 ;;
         esac
     done
+
+    if [[ "$ONLY_LIBDVDCSS" -eq 1 ]]; then
+        install_disc_support
+        return
+    fi
 
     echo "=== tinydvd Dependency Installer ==="
 
@@ -113,19 +214,12 @@ main() {
                 pango \
                 ffmpeg \
                 python@3.12
-            if prompt_opt_in_libdvdcss; then
-                brew install dvdbackup
-            fi
             ;;
         Linux)
             echo "Detected operating system: Linux"
             if [ -f /etc/debian_version ]; then
                 echo "Detected Debian/Ubuntu-based distribution."
                 echo "Refreshing apt package lists and installing packages (may require sudo)..."
-                SUDO=""
-                if [ "$(id -u)" -ne 0 ]; then
-                    SUDO="sudo"
-                fi
                 explain_package_sudo apt-get
                 $SUDO apt-get update
                 $SUDO apt-get install -y \
@@ -142,20 +236,8 @@ main() {
                     ffmpeg \
                     python3 \
                     python3-venv
-                if prompt_opt_in_libdvdcss; then
-                    if $SUDO apt-get install -y libdvd-pkg 2>/dev/null; then
-                        echo "Configuring libdvd-pkg to build and install libdvdcss..."
-                        $SUDO dpkg-reconfigure -f noninteractive libdvd-pkg || true
-                    else
-                        echo "Note: 'libdvd-pkg' not found (requires Debian 'contrib' or Ubuntu 'multiverse' repo); skipping optional CSS package."
-                    fi
-                fi
             elif [ -f /etc/fedora-release ] || [ -f /etc/redhat-release ]; then
                 echo "Detected Fedora/RHEL-based distribution."
-                SUDO=""
-                if [ "$(id -u)" -ne 0 ]; then
-                    SUDO="sudo"
-                fi
                 explain_package_sudo dnf
                 $SUDO dnf install -y \
                     gcc \
@@ -170,19 +252,8 @@ main() {
                     zlib-devel \
                     ffmpeg \
                     python3
-                if prompt_opt_in_libdvdcss; then
-                    echo "Note: Fedora/RHEL ships optical disc ripping tools via RPM Fusion:"
-                    echo "  - Without CSS encryption (unencrypted optical drives via RPM Fusion Free):"
-                    echo "      sudo dnf install -y dvdbackup"
-                    echo "  - With optional CSS decryption (via RPM Fusion Tainted):"
-                    echo "      sudo dnf install -y rpmfusion-free-release-tainted && sudo dnf install -y libdvdcss"
-                fi
             elif [ -f /etc/arch-release ]; then
                 echo "Detected Arch Linux."
-                SUDO=""
-                if [ "$(id -u)" -ne 0 ]; then
-                    SUDO="sudo"
-                fi
                 explain_package_sudo pacman
                 $SUDO pacman -S --needed --noconfirm \
                     base-devel \
@@ -196,9 +267,6 @@ main() {
                     zlib \
                     ffmpeg \
                     python
-                if prompt_opt_in_libdvdcss; then
-                    $SUDO pacman -S --needed --noconfirm libdvdcss
-                fi
             else
                 echo "Unknown Linux distribution. Please manually install:"
                 echo "  - cmake, pkg-config, C11 compiler, zlib dev headers"
@@ -215,6 +283,8 @@ main() {
             exit 1
             ;;
     esac
+
+    install_disc_support || echo "Note: encrypted-DVD support wasn't installed; everything else is unaffected."
 
     echo ""
     echo "=== Verifying Installed Dependencies ==="

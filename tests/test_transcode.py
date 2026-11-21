@@ -161,7 +161,7 @@ def main():
 
         out_mvob = os.path.join(output_dir, "VTS_01_1.mvob")
         assert os.path.exists(out_mvob), "Output .mvob missing"
-        assert os.path.islink(os.path.join(output_dir, "VTS_01_1.VOB")), "VOB symlink missing"
+        assert not os.path.lexists(os.path.join(output_dir, "VTS_01_1.VOB")), "a VOB name must not point at the .mvob"
         orig_size = os.path.getsize(vob_path)
         mvob_size = os.path.getsize(out_mvob)
         # Original had 16 sectors; compact .mvob must have:
@@ -221,6 +221,15 @@ def main():
             for info in zf.infolist():
                 assert info.compress_type == zipfile.ZIP_STORED, f"Expected ZIP_STORED (0), got {info.compress_type}"
         print("Single-file .tdvd (ZIP_STORED) packaging: OK")
+
+        # The importer's temporary rip is deleted before packaging; nothing else is
+        rip = os.path.join(tmpdir, ".tdvd_rip_x", "DISC")
+        os.makedirs(os.path.join(rip, "VIDEO_TS"))
+        transcoder._delete_temporary_rip(rip)
+        assert not os.path.exists(rip), "temporary rip not deleted"
+        transcoder._delete_temporary_rip(input_dir)
+        assert os.path.isdir(input_dir), "deleted a folder that isn't a temporary rip"
+        print("Temporary rip deleted before packaging, other sources never: OK")
 
     print("\nAll Transcoder integration tests passed successfully!")
 

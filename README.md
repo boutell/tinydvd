@@ -36,11 +36,28 @@ This installs any missing dependencies (with `scripts/install-deps.sh`), builds 
   - The application and file icons, and a thumbnailer, so GNOME Files (Nautilus) shows each disc's embedded thumbnail (see `tinydvd-set-thumbnail` below). If GNOME Files was already open, restart it with `nautilus -q` to see them.
   - Everything goes under `/usr/local` because GNOME runs thumbnailers in a sandbox that can't see your home folder, so a thumbnailer installed in `~/.local` never runs.
 
+#### Encrypted DVDs (optional)
+
+Most commercial DVDs are CSS-encrypted. To rip them straight from a drive you need `dvdbackup` and `libdvdcss`, the standard open-source decryption library that VLC also uses. Whether you may use it depends on where you live, so it's your choice. If they aren't already installed, `./install` asks once (y/N, default no) and installs them from your platform's usual packages. You don't have to compile anything yourself:
+
+- **macOS:** Homebrew's `dvdbackup`, which brings `libdvdcss` with it.
+- **Debian / Ubuntu:** `dvdbackup` and `libdvd-pkg`, which downloads and builds `libdvdcss` for you. It's in Debian's `contrib` section or Ubuntu's `multiverse` repository; if that isn't enabled, `./install` tells you how to turn it on.
+- **Fedora:** `dvdbackup` and `libdvdcss` from [RPM Fusion](https://rpmfusion.org/Configuration) (its "tainted" repository, which `./install` enables). If RPM Fusion itself isn't set up yet, `./install` points you to its one-time setup.
+- **Arch:** `dvdbackup` and `libdvdcss` from the official repositories.
+
+`./install --with-libdvdcss` installs them without asking (and adds them later if you said no the first time); `--without-libdvdcss` skips the question. Without them, TinyDVD still plays `.tdvd` files and imports ripped `VIDEO_TS` folders, unencrypted `.iso` images and unencrypted discs.
+
+Importing a disc from a drive needs up to about one and a half times the disc's size free (at most roughly 13 GB) in your library folder while it works. The ripped copy is deleted as soon as it's converted, and when the import is done only the `.tdvd` remains, usually 20–35% of the disc's size. TinyDVD checks the free space before it starts, and it deletes its working files whether the import finishes, fails or is cancelled.
+
+#### Other options
+
 To install somewhere you can write without `sudo`, use `./install --prefix ~/.local` (on macOS the app then goes in `~/Applications`; choose another folder with `--app-dir`). To remove everything again:
 
 ```bash
 ./install --uninstall
 ```
+
+(Add `--prefix` if you installed with one.) This removes TinyDVD's commands, its runtime folder, the app or desktop entries, and the web player's video cache. It checks each command and the app are the ones `./install` put there before deleting them. It leaves your movies, your settings (including the web password) and every package TinyDVD uses, such as FFmpeg, mpv, Python, `dvdbackup` and `libdvdcss`, since other programs may need them.
 
 ### Building Without Installing
 
@@ -86,26 +103,24 @@ sudo dnf install -y \
 sudo pacman -S --needed cmake base-devel pkgconf dvdbackup mpv sdl2 cairo pango zlib ffmpeg python
 ```
 
-#### Optional: Optical Disc Ripping (`dvdbackup`) & CSS (`libdvdcss`)
-`tinydvd` does **not** require `libdvdread`, `libdvdnav`, `dvdbackup`, or `libdvdcss` to build, play `.tdvd` archives, or import previously ripped `VIDEO_TS` folders, unencrypted `.iso` images (automatically mounted via `hdiutil` on macOS; mounted first or extracted via `7z` on Linux), or unencrypted discs mounted under `/Volumes/<DISC>` on macOS.
+#### Optional: encrypted-DVD ripping (`dvdbackup` + `libdvdcss`)
+`./scripts/install-deps.sh` (and `./install`) offers to install these for you; see [Encrypted DVDs](#encrypted-dvds-optional) above. To do it by hand, where permitted by local law:
 
-- **Linux (`dvdbackup` without `libdvdcss`):** `dvdbackup` is included in the Linux commands above and rips unencrypted optical discs without `libdvdcss`. If you also want optional CSS decryption for commercial discs (where permitted by local law), install `libdvdcss` separately:
-  - **Debian / Ubuntu** *(requires `contrib` on Debian or `multiverse` on Ubuntu)*:
-    ```bash
-    sudo apt-get install -y libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg
-    ```
-  - **Fedora / RHEL** *(via RPM Fusion Tainted)*:
-    ```bash
-    sudo dnf install -y rpmfusion-free-release-tainted && sudo dnf install -y libdvdcss
-    ```
-  - **Arch Linux**:
-    ```bash
-    sudo pacman -S --needed libdvdcss
-    ```
-- **macOS (Homebrew: `dvdbackup` pulls `libdvdread` + `libdvdcss`):** If you opt out of `dvdbackup`, you can still play `.tdvd` files and import previously ripped `VIDEO_TS` folders, unencrypted `.iso` images, and unencrypted discs mounted under `/Volumes/<DISC>`. Because Homebrew's `dvdbackup` formula requires `libdvdread`, which in turn pulls in `libdvdcss`, `dvdbackup` is omitted from the default macOS install. Install it only if you explicitly opt in to direct optical-drive ripping and CSS support:
+- **macOS:** `brew install dvdbackup` (Homebrew's `libdvdread`, which it depends on, brings `libdvdcss`).
+- **Debian / Ubuntu** *(needs `contrib` on Debian or `multiverse` on Ubuntu enabled)*: `libdvd-pkg` downloads and builds `libdvdcss` for you:
   ```bash
-  brew install dvdbackup
+  sudo apt-get install -y dvdbackup libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg
   ```
+- **Fedora / RHEL** *(needs [RPM Fusion Free](https://rpmfusion.org/Configuration) enabled)*:
+  ```bash
+  sudo dnf install -y rpmfusion-free-release-tainted && sudo dnf install -y dvdbackup libdvdcss
+  ```
+- **Arch Linux**:
+  ```bash
+  sudo pacman -S --needed dvdbackup libdvdcss
+  ```
+
+None of this is needed to build TinyDVD, play `.tdvd` files, or import ripped `VIDEO_TS` folders, unencrypted `.iso` images (mounted automatically with `hdiutil` on macOS; mounted first or extracted with `7z` on Linux) or unencrypted discs.
 </details>
 
 This builds the player at `./build/tinydvd`, which runs straight from the source tree.
@@ -184,7 +199,7 @@ To stream your collection to a web browser, tablet, phone or smart TV:
 
 #### Step 1: Rip a DVD (If Starting from a Physical Disc)
 
-If you are starting from a commercial encrypted DVD in an optical drive, use `dvdbackup` to rip a decrypted copy to disk first (if you already have a decrypted DVD folder or `.iso`, skip to Step 2):
+If you are starting from a commercial encrypted DVD in an optical drive, use `dvdbackup` to rip a decrypted copy to disk first (if you already have a decrypted DVD folder or `.iso`, skip to Step 2). This needs `dvdbackup` and `libdvdcss`; if you didn't install them with TinyDVD, run `./install --with-libdvdcss` (see [Encrypted DVDs](#encrypted-dvds-optional)):
 
 ```bash
 # macOS (find your DVD drive with `diskutil list`, e.g., /dev/rdisk4):
@@ -400,7 +415,6 @@ tinydvds/MY_MOVIE/
 ├── VTS_01_0.mvob                 # Compact VTSM menu Meta-VOB (NV_PCK + 1 video ref/VOBU + SPU)
 ├── VTS_01_0_VIDEO.mkv            # Companion VTSM menu H.264 + AAC video/audio
 ├── VTS_01_1.mvob                 # Compact title Meta-VOB (~99% smaller than original VOB)
-├── VTS_01_1.VOB -> VTS_01_1.mvob # Compatibility symlink
 ├── VTS_01_VIDEO.mkv              # Companion H.264 video + multi-track AAC audio
 └── vts_01_keyframes.txt          # Generated x264 keyframe table
 ```

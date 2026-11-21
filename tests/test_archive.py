@@ -17,6 +17,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 import tinydvd_archive  # noqa: E402
+import tinydvd_library  # noqa: E402
 from tinydvd_library import default_library_path, disc_id_for_path, xdg_videos_dir  # noqa: E402
 
 
@@ -140,6 +141,53 @@ def test_default_library_path(tmp: str) -> None:
     print("  - Default library folder, including translated XDG Videos: OK")
 
 
+def test_import_housekeeping(tmp: str) -> None:
+    lib = os.path.join(tmp, "lib")
+    os.makedirs(lib)
+    old_stage = os.path.join(lib, ".tdvd_stage_abc")
+    os.makedirs(os.path.join(old_stage, "VIDEO_TS"))
+    with open(os.path.join(old_stage, "VIDEO_TS", "VTS_01_VIDEO.mkv"), "wb") as f:
+        f.write(b"x" * 1000)
+    old_tmp = os.path.join(lib, ".tdvd_tmp_xyz.tdvd")
+    with open(old_tmp, "wb") as f:
+        f.write(b"y" * 10)
+    live_rip = os.path.join(lib, ".tdvd_rip_live")
+    os.makedirs(live_rip)
+    keep = os.path.join(lib, ".hidden_user_file")
+    with open(keep, "wb") as f:
+        f.write(b"z")
+    long_ago = 1_000_000_000
+    for root, dirs, files in os.walk(old_stage):
+        for n in dirs + files:
+            os.utime(os.path.join(root, n), (long_ago, long_ago))
+    for p in (old_stage, old_tmp, keep):
+        os.utime(p, (long_ago, long_ago))
+    freed = tinydvd_library.sweep_stale_work(lib)
+    assert freed == 1010, freed
+    assert not os.path.exists(old_stage) and not os.path.exists(old_tmp)
+    assert os.path.isdir(live_rip)  # recently written: an import in progress
+    assert os.path.exists(keep)  # not ours
+    print("  - Stale import leftovers removed, live ones and others kept: OK")
+
+    # Space check: a 1000-byte source needs its size plus the safety margin
+    src = os.path.join(tmp, "src")
+    os.makedirs(os.path.join(src, "VIDEO_TS"))
+    with open(os.path.join(src, "VIDEO_TS", "VTS_01_1.VOB"), "wb") as f:
+        f.write(b"v" * 1000)
+    assert tinydvd_library.import_space_needed(src, False) == 1000
+    real = tinydvd_library.shutil.disk_usage
+    try:
+        tinydvd_library.shutil.disk_usage = lambda _p: shutil._ntuple_diskusage(10**12, 10**12 - 100, 100)
+        msg = tinydvd_library.check_import_space(src, lib)
+        assert "Not enough disk space" in msg and "free up" in msg.lower(), msg
+        tinydvd_library.shutil.disk_usage = lambda _p: shutil._ntuple_diskusage(10**12, 0, 10**12)
+        assert tinydvd_library.check_import_space(src, lib) == ""
+    finally:
+        tinydvd_library.shutil.disk_usage = real
+    assert tinydvd_library.import_space_needed("/dev/nonexistent-drive", True) == tinydvd_library.DVD9_BYTES * 3 // 2
+    print("  - Import disk-space estimate and warning: OK")
+
+
 def main() -> int:
     print("=== Running TinyDVD archive helper tests ===")
     tmp = tempfile.mkdtemp(prefix="tinydvd_test_archive_")
@@ -150,6 +198,7 @@ def main() -> int:
         test_place_without_overwrite(tmp)
         test_disc_ids()
         test_default_library_path(tmp)
+        test_import_housekeeping(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("All archive helper tests passed!")

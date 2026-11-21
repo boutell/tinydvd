@@ -15,6 +15,7 @@ import struct
 import argparse
 import subprocess
 import shutil
+import signal
 import tempfile
 import contextlib
 import json
@@ -567,13 +568,11 @@ def emit_mvob_files(vob_paths, vts_id, vobus, output_dir, keep_audio=False):
                 fout.write(create_dummy_video_sector(ref_bytes))
                 wrote_video_ref = True
 
-        # Create symlink VTS_xx_x.VOB -> VTS_xx_x.mvob
-        if os.path.exists(out_vob_symlink) or os.path.islink(out_vob_symlink):
+        # Older versions also made a VTS_xx_x.VOB -> .mvob symlink. Nothing
+        # needs it, and it made DVD tools read the .mvob as a real VOB, so
+        # remove one left in a folder being converted again
+        if os.path.islink(out_vob_symlink) and os.readlink(out_vob_symlink) == f"{base_upper}.mvob":
             os.remove(out_vob_symlink)
-        try:
-            os.symlink(f"{base_upper}.mvob", out_vob_symlink)
-        except OSError as e:
-            print(f"[warning] Could not create symlink {out_vob_symlink}: {e}")
 
 
 def copy_ifo_and_bup(input_dir, output_dir):
@@ -682,7 +681,7 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
 
 
 @contextlib.contextmanager
-def resolve_dvd_source(input_path):
+def resolve_dvd_source(input_path, work_dir=None):
     """
     Resolves input_path to a directory containing DVD files:
     - If a directory is provided, yields it directly.
@@ -727,7 +726,8 @@ def resolve_dvd_source(input_path):
                                 break
             elif sys.platform.startswith("linux"):
                 if shutil.which("7z"):
-                    tmp_extract = tempfile.mkdtemp(prefix="tinydvd_iso_")
+                    # Next to the output, not in /tmp, which may be small or in RAM
+                    tmp_extract = tempfile.mkdtemp(prefix=".tdvd_iso_", dir=work_dir)
                     res = subprocess.run(["7z", "x", f"-o{tmp_extract}", input_path],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     if res.returncode == 0:
@@ -826,7 +826,8 @@ def package_tdvd_archive(source_dir, output_archive_path, extra=None):
 
 def run_conversion_to_dir(raw_input, target_dir, args):
     os.makedirs(target_dir, exist_ok=True)
-    with resolve_dvd_source(raw_input) as input_path:
+    work_dir = os.path.dirname(os.path.abspath(target_dir.rstrip("/")))
+    with resolve_dvd_source(raw_input, work_dir) as input_path:
         copy_ifo_and_bup(input_path, target_dir)
 
         if args.vts is not None:
@@ -929,7 +930,29 @@ def build_archive(source_dir, desired_path, meta):
             os.unlink(tmp)
 
 
+def _delete_temporary_rip(path):
+    """
+    The importer rips a disc into a hidden .tdvd_rip_* folder. Once it's
+    converted, the rip isn't needed, so delete it before packaging: packaging
+    briefly holds two copies of the converted files, and the rip on top of
+    that would need far more free space. Refuses anything not in such a folder.
+    """
+    real = os.path.realpath(path)
+    if not any(p.startswith(".tdvd_rip_") for p in real.split(os.sep)):
+        print(f"[warning] Not deleting {path}: it isn't a temporary rip", file=sys.stderr)
+        return
+    print(f"[cleanup] Deleting the ripped disc ({real}); it's converted")
+    shutil.rmtree(real, ignore_errors=True)
+
+
+def _exit_on_sigterm(signum, _frame):
+    # Cancelling an import sends SIGTERM. Exit through SystemExit so the
+    # staging folder, partial archive and ISO mount are cleaned up
+    raise SystemExit(128 + signum)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     parser = argparse.ArgumentParser(
         prog="convert-to-tinydvd",
         description="convert-to-tinydvd: Converts a DVD directory or ISO into a single-file .tdvd archive (or directory)."
@@ -948,6 +971,8 @@ def main():
                              "By default each video keeps its own: discs mix 4:3 and 16:9 video, "
                              "often 4:3 warning screens before a widescreen movie.")
     parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
+    parser.add_argument("--delete-rip-before-packaging", action="store_true",
+                        help=argparse.SUPPRESS)  # for the importer's own temporary rip only
     parser.add_argument("--skip-enrichment", action="store_true",
                         help="Don't look up the movie's details (director, cast, genres, overview, year) online. "
                              "The lookup sends only the title, to Wikidata/Wikipedia and any service you give a key for.")
@@ -988,6 +1013,8 @@ def main():
         else:
             with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
                 run_conversion_to_dir(raw_input, stage_dir, args)
+                if args.delete_rip_before_packaging:
+                    _delete_temporary_rip(raw_input)
                 output_path = build_archive(stage_dir, output_path, lookup_meta(stage_dir))
     else:
         run_conversion_to_dir(raw_input, output_path, args)

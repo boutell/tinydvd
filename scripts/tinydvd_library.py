@@ -124,6 +124,150 @@ def default_library_path(home: str | None = None, platform: str | None = None,
     return candidates[0]
 
 
+# Imports work in hidden folders and files next to the library, with these
+# prefixes: a disc ripped from a drive, the converter's staging folder, the
+# archive being written, an extracted ISO
+WORK_PREFIXES = (".tdvd_rip_", ".tdvd_stage_", ".tdvd_tmp_", ".tdvd_iso_")
+# Leftovers nothing has written to for this long belong to an import that was
+# killed (a crash, a power cut). Live imports write constantly
+STALE_WORK_SECONDS = 3600
+# The largest DVD (dual layer), assumed when a drive's disc size can't be read
+DVD9_BYTES = 8_547_991_552
+# Room to leave after an import, so it doesn't fill the disk to the last byte
+SPACE_MARGIN_BYTES = 512 * 1024 * 1024
+
+
+def _newest_mtime(path: str) -> float:
+    newest = os.lstat(path).st_mtime
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+            except OSError:
+                pass
+    return newest
+
+
+def sweep_stale_work(directory: str, now: float | None = None) -> int:
+    """
+    Delete import leftovers in directory that nothing has touched for
+    STALE_WORK_SECONDS. Returns the bytes freed.
+    """
+    now = time.time() if now is None else now
+    freed = 0
+    try:
+        entries = list(os.scandir(directory))
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(WORK_PREFIXES):
+            continue
+        try:
+            if now - _newest_mtime(entry.path) < STALE_WORK_SECONDS:
+                continue
+            size = _tree_size(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.unlink(entry.path)
+            freed += size
+        except OSError:
+            pass
+    return freed
+
+
+def _tree_size(path: str) -> int:
+    if not os.path.isdir(path) or os.path.islink(path):
+        return os.lstat(path).st_size
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _disc_size(device: str) -> int:
+    """Size of the disc in a drive, or DVD9_BYTES if it can't be read"""
+    try:
+        fd = os.open(device, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            size = os.lseek(fd, 0, os.SEEK_END)
+        finally:
+            os.close(fd)
+        if size > 0:
+            return size
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        # Raw disk devices don't report a size by seeking; ask diskutil
+        try:
+            import plistlib
+            out = subprocess.run(["diskutil", "info", "-plist", device.replace("/dev/rdisk", "/dev/disk")],
+                                 capture_output=True, timeout=10).stdout
+            size = int(plistlib.loads(out).get("TotalSize") or 0)
+            if size > 0:
+                return size
+        except (OSError, ValueError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            pass
+    return DVD9_BYTES
+
+
+def import_space_needed(src: str, is_device: bool) -> int:
+    """
+    Roughly how many bytes an import needs free in the library folder.
+
+    With D the source's size and T the finished archive's: the converter
+    writes the converted files (T) to a staging folder, then copies them into
+    the archive, briefly holding 2T. Archives are usually 20-35% of the DVD;
+    allowing for up to half covers grainy films and many audio tracks.
+
+    - A folder or ISO: peak 2T, at most D.
+    - A drive (or, on Linux, an ISO, which is extracted first): the rip or
+      extraction (D) plus the staged files (T) while converting. The rip is
+      deleted before packaging, so the peak is D + T, at most 1.5 x D.
+    """
+    if is_device:
+        return _disc_size(src) * 3 // 2
+    size = _tree_size(src)
+    if os.path.isfile(src) and sys.platform.startswith("linux"):
+        return size * 3 // 2
+    return size
+
+
+def _nearly_full(directory: str) -> bool:
+    try:
+        return shutil.disk_usage(directory).free < 64 * 1024 * 1024
+    except OSError:
+        return False
+
+
+def is_device_path(src: str) -> bool:
+    if src.startswith("/dev/"):
+        return True
+    try:
+        st = os.stat(src)
+    except OSError:
+        return False
+    return stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)
+
+
+def check_import_space(src: str, out_dir: str) -> str:
+    """An explanation if out_dir lacks room to import src, else an empty string"""
+    try:
+        free = shutil.disk_usage(out_dir).free
+    except OSError:
+        return ""
+    needed = import_space_needed(src, is_device_path(src)) + SPACE_MARGIN_BYTES
+    if free >= needed:
+        return ""
+    return (f"Not enough disk space to import this disc into {out_dir}: it needs about "
+            f"{format_size(needed)} free while importing, and {format_size(free)} is free. "
+            "Free up some space or import into a folder on another disk.")
+
+
 def format_size(size_bytes: int) -> str:
     if size_bytes >= 1024 * 1024 * 1024:
         return f"{size_bytes / (1024.0 * 1024.0 * 1024.0):.1f} GB"
@@ -345,6 +489,11 @@ class TinyDVDLibrary:
         self._detected_at: float = 0.0
 
         self.rescan()
+
+        # Reclaim space from imports a crash or power cut cut short
+        if self.is_library:
+            threading.Thread(target=sweep_stale_work, args=(self.target_path,),
+                             name="tdvd-sweep", daemon=True).start()
 
         self._watch_stop = False
         self._wake_r, self._wake_w = os.pipe()
@@ -752,6 +901,14 @@ class TinyDVDLibrary:
             except OSError as e:
                 return False, f"Cannot create library directory: {e}"
 
+        with self.import_lock:
+            busy = self.imp_active
+        if not busy:
+            sweep_stale_work(out_dir)
+            space_problem = check_import_space(src, out_dir)
+            if space_problem:
+                return False, space_problem
+
         title_clean = (title or "").strip()
         if title_clean:
             stem = _clean_output_stem(title_clean)
@@ -835,10 +992,7 @@ class TinyDVDLibrary:
         final_archive = desired_output
 
         try:
-            is_dev = src.startswith("/dev/")
-            if not is_dev and os.path.exists(src):
-                st = os.stat(src)
-                is_dev = stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)
+            is_dev = is_device_path(src)
 
             if is_dev:
                 dvdbackup_bin = shutil.which("dvdbackup")
@@ -849,7 +1003,9 @@ class TinyDVDLibrary:
                         "or mounted unencrypted disc folders without it; to enable direct drive ripping, "
                         "install dvdbackup or run ./scripts/install-deps.sh --with-libdvdcss)."
                     )
-                rip_tmp_dir = tempfile.mkdtemp(prefix="tdvd_rip_")
+                # Rip next to the library, not into the system temp folder,
+                # which can be small (on many Linux systems it's in RAM)
+                rip_tmp_dir = tempfile.mkdtemp(prefix=".tdvd_rip_", dir=os.path.dirname(desired_output) or ".")
                 with self.import_lock:
                     self.imp_state = IMPORT_RIPPING
                     self.imp_stage_msg = "Ripping DVD disc..."
@@ -879,6 +1035,8 @@ class TinyDVDLibrary:
             self._notify_import_change()
 
             cmd = [sys.executable, "-u", convert_script, conv_input, desired_output]
+            if rip_tmp_dir:
+                cmd.append("--delete-rip-before-packaging")
             if skip_enrichment:
                 cmd.append("--skip-enrichment")
 
@@ -921,7 +1079,10 @@ class TinyDVDLibrary:
                 self.imp_state = IMPORT_ERROR
                 self.imp_active = False
                 self.imp_stage_msg = "Import cancelled" if self.imp_cancel_requested else "Import failed"
-                self.imp_error_msg = str(exc)[:511]
+                msg = str(exc)
+                if not self.imp_cancel_requested and _nearly_full(os.path.dirname(desired_output) or "."):
+                    msg += " The disk is full, which is the likely cause: free up some space and try again."
+                self.imp_error_msg = msg[:511]
             self._notify_import_change()
         finally:
             if rip_tmp_dir and os.path.isdir(rip_tmp_dir):

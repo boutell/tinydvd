@@ -10,6 +10,10 @@
 #   ./install --prefix <dir>       Build and install to a custom prefix
 #   ./install --python <path>      Use a specific compatible Python (>= 3.8)
 #   ./install --no-deps            Do not auto-run scripts/install-deps.sh
+#   ./install --with-libdvdcss     Also install encrypted-DVD ripping support
+#                                  (dvdbackup + libdvdcss) without asking
+#   ./install --without-libdvdcss  Don't offer it (by default you're asked once
+#                                  if it isn't installed yet)
 #   ./install --app-dir <dir>      macOS: put TinyDVD.app here (default: /Applications,
 #                                  or ~/Applications if the prefix is in your home folder)
 #   ./install --uninstall          Remove everything this script installed
@@ -20,8 +24,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="/usr/local"
 CUSTOM_PYTHON="${TINYDVD_PYTHON:-}"
 INSTALL_DEPS=1
+DVDCSS_FLAG=""
 UNINSTALL=0
 MAC_APP_DIR="${TINYDVD_MAC_APP_DIR:-}"
+APP_DIR_GIVEN="${TINYDVD_MAC_APP_DIR:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -31,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-deps)
             INSTALL_DEPS=0
+            shift
+            ;;
+        --with-libdvdcss|--without-libdvdcss)
+            DVDCSS_FLAG="$1"
             shift
             ;;
         --prefix)
@@ -63,10 +73,12 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             MAC_APP_DIR="$2"
+            APP_DIR_GIVEN=1
             shift 2
             ;;
         --app-dir=*)
             MAC_APP_DIR="${1#*=}"
+            APP_DIR_GIVEN=1
             shift
             ;;
         -h|--help)
@@ -103,6 +115,32 @@ if [[ -z "$MAC_APP_DIR" ]]; then
 fi
 MAC_APP_DIR="${MAC_APP_DIR%/}"
 MAC_APP="${MAC_APP_DIR}/TinyDVD.app"
+# Where the last install put TinyDVD.app, so --uninstall finds it without
+# being given the same --app-dir again
+MAC_APP_RECORD="${LIB_DIR}/installed-app-path"
+if [[ "$UNINSTALL" -eq 1 && -z "$APP_DIR_GIVEN" && -f "$MAC_APP_RECORD" ]]; then
+    MAC_APP="$(head -n 1 "$MAC_APP_RECORD")"
+    MAC_APP_DIR="$(dirname "$MAC_APP")"
+fi
+
+# The per-user cache of web-player videos (rebuilt on demand, so --uninstall
+# deletes it). Worked out before any sudo, which may change HOME
+if [[ -n "${TINYDVD_USER_CACHE:-}" ]]; then
+    USER_CACHE="$TINYDVD_USER_CACHE"
+else
+    USER_HOME="${HOME:-}"
+    if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
+        USER_HOME="$(eval echo "~${SUDO_USER}")"
+    fi
+    if [[ "$OS" == "Darwin" ]]; then
+        USER_CACHE="${USER_HOME}/Library/Caches/tinydvd"
+        USER_CONFIG="${USER_HOME}/Library/Application Support/tinydvd"
+    else
+        USER_CACHE="${XDG_CACHE_HOME:-${USER_HOME}/.cache}/tinydvd"
+        USER_CONFIG="${XDG_CONFIG_HOME:-${USER_HOME}/.config}/tinydvd"
+    fi
+fi
+USER_CONFIG="${TINYDVD_USER_CONFIG:-${USER_CONFIG:-}}"
 MAC_BUNDLE_ID="io.github.boutell.tinydvd"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
@@ -230,8 +268,38 @@ nearest_existing_dir() {
     printf '%s\n' "$p"
 }
 
+# True if path is one of the commands this script installs into BIN_DIR: the
+# player (which has LIB_DIR built in), a wrapper script that runs LIB_DIR, or
+# one of the two compatibility symlinks
+is_our_command() {
+    local f="$1"
+    if [[ -L "$f" ]]; then
+        case "$(readlink "$f")" in
+            tinydvd|tinydvd-set-thumbnail) return 0 ;;
+        esac
+        return 1
+    fi
+    [[ -f "$f" ]] && grep -qaF "${LIB_DIR}" "$f"
+}
+
+# True if path is a TinyDVD.app this script made for this PREFIX (its
+# launcher has LIB_DIR built in), so uninstalling one prefix leaves another's app
+is_this_prefix_mac_app() {
+    is_our_mac_app "$1" && grep -qaF "${LIB_DIR}" "$1/Contents/MacOS/TinyDVD" 2>/dev/null
+}
+
+# True if path is a TinyDVD.app this script made (so it's safe to replace or remove)
+is_our_mac_app() {
+    local plist="$1/Contents/Info.plist"
+    [[ -f "$plist" ]] && /usr/bin/defaults read "$plist" CFBundleIdentifier 2>/dev/null | grep -qx "$MAC_BUNDLE_ID"
+}
+
 needs_sudo() {
     [[ "$(id -u)" -ne 0 ]] || return 1
+    if [[ "$UNINSTALL" -eq 1 && ! -e "$LIB_DIR" && ! -e "${BIN_DIR}/tinydvd" ]] \
+        && ! is_this_prefix_mac_app "$MAC_APP"; then
+        return 1  # nothing here to remove; the uninstall step says so
+    fi
     local probe
     probe="$(nearest_existing_dir "$PREFIX")"
     [[ -w "$probe" ]] || return 0
@@ -254,6 +322,7 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
         if [[ -n "$CUSTOM_PYTHON" && -z "$BASE_PYTHON" ]]; then
             BASE_PYTHON="$(find_compatible_python)"
         fi
+        DISC_SUPPORT_OFFERED=0
         collect_missing_build_deps
         if [[ -z "$BASE_PYTHON" ]]; then
             BASE_PYTHON="$(find_compatible_python 2>/dev/null || true)"
@@ -270,13 +339,21 @@ if [[ "$UNINSTALL" -eq 0 ]]; then
                 exit 1
             fi
             echo "=== Installing missing dependencies (${missing_desc}) ==="
-            "${ROOT_DIR}/scripts/install-deps.sh"
+            # This also offers the optional encrypted-DVD support
+            "${ROOT_DIR}/scripts/install-deps.sh" ${DVDCSS_FLAG:+"$DVDCSS_FLAG"}
+            DISC_SUPPORT_OFFERED=1
 
             collect_missing_build_deps
             if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
                 echo "Error: still missing build dependencies after running install-deps.sh: ${MISSING_DEPS[*]}" >&2
                 exit 1
             fi
+        fi
+
+        # Optional encrypted-DVD ripping support: offered once if it's missing
+        if [[ "$DISC_SUPPORT_OFFERED" -eq 0 && "$INSTALL_DEPS" -eq 1 ]]; then
+            "${ROOT_DIR}/scripts/install-deps.sh" --only-libdvdcss ${DVDCSS_FLAG:+"$DVDCSS_FLAG"} \
+                || echo "Note: encrypted-DVD support wasn't installed; continuing with everything else."
         fi
 
         if [[ -z "$BASE_PYTHON" ]]; then
@@ -336,7 +413,11 @@ explain_sudo() {
             echo "'./install' put in ${BIN_DIR}, ${LIB_DIR} and"
             echo "${SHARE_DIR} (launcher, file type, icons, thumbnailer)."
         else
-            echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}, and ${MAC_APP}."
+            if is_this_prefix_mac_app "$MAC_APP"; then
+                echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}, and ${MAC_APP}."
+            else
+                echo "'./install' put in ${BIN_DIR} and ${LIB_DIR}."
+            fi
         fi
     fi
     echo ""
@@ -348,7 +429,8 @@ if needs_sudo; then
     if [[ "$UNINSTALL" -eq 0 ]]; then
         exec sudo TINYDVD_BASE_PYTHON="${BASE_PYTHON}" TINYDVD_ALREADY_BUILT=1 "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
-        exec sudo "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+        exec sudo TINYDVD_USER_CACHE="${USER_CACHE}" TINYDVD_USER_CONFIG="${USER_CONFIG}" \
+            "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     fi
 fi
 
@@ -397,12 +479,6 @@ elif os.path.exists(path):
 PYEOF
 }
 
-# True if path is a TinyDVD.app this script made (so it's safe to replace or remove)
-is_our_mac_app() {
-    local plist="$1/Contents/Info.plist"
-    [[ -f "$plist" ]] && /usr/bin/defaults read "$plist" CFBundleIdentifier 2>/dev/null | grep -qx "$MAC_BUNDLE_ID"
-}
-
 # Build TinyDVD.app: a launcher that runs the runtime in LIB_DIR, the icon,
 # and an Info.plist that registers TinyDVD as the app for .tdvd files
 install_mac_app() {
@@ -427,13 +503,24 @@ install_mac_app() {
     fi
     # Tell Finder about the app and the .tdvd file type now, not at next login
     "$LSREGISTER" -f "$MAC_APP" >/dev/null 2>&1 || true
+    printf '%s\n' "$MAC_APP" > "$MAC_APP_RECORD"
 }
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "=== Uninstalling tinydvd from ${PREFIX} ==="
-    rm -f "${BIN_DIR}/tinydvd" "${BIN_DIR}/tinydvd-player" \
-          "${BIN_DIR}/convert-to-tinydvd" "${BIN_DIR}/tinydvd-thumbnailer" \
-          "${BIN_DIR}/tinydvd-set-thumbnail" "${BIN_DIR}/tinydvd-add-thumbnail"
+    FOUND=0
+    [[ -d "$LIB_DIR" ]] && FOUND=1
+    for name in tinydvd tinydvd-player convert-to-tinydvd tinydvd-thumbnailer \
+                tinydvd-set-thumbnail tinydvd-add-thumbnail; do
+        f="${BIN_DIR}/${name}"
+        [[ -e "$f" || -L "$f" ]] || continue
+        if is_our_command "$f"; then
+            rm -f "$f"
+            FOUND=1
+        else
+            echo "Left ${f} alone: it isn't one './install' put there."
+        fi
+    done
     if [[ "$OS" == "Linux" ]]; then
         UNINSTALL_PY="${LIB_DIR}/venv/bin/python3"
         if [[ ! -x "$UNINSTALL_PY" ]]; then
@@ -448,12 +535,32 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
         fi
         refresh_caches
     fi
-    if [[ "$OS" == "Darwin" ]] && is_our_mac_app "$MAC_APP"; then
+    if [[ "$OS" == "Darwin" ]] && is_this_prefix_mac_app "$MAC_APP"; then
         "$LSREGISTER" -u "$MAC_APP" >/dev/null 2>&1 || true
         rm -rf "$MAC_APP"
+        echo "Removed ${MAC_APP}"
+        FOUND=1
     fi
     rm -rf "${LIB_DIR}"
+    if [[ -n "$USER_CACHE" && -d "$USER_CACHE" ]]; then
+        rm -rf "$USER_CACHE"
+        echo "Removed the web player's video cache (${USER_CACHE})"
+    fi
+    if [[ "$FOUND" -eq 0 ]]; then
+        echo "Nothing from TinyDVD was found in ${PREFIX}."
+        echo "If you installed it with --prefix (or --app-dir), uninstall with the same option."
+        for other in /usr/local "${HOME:-}/.local"; do
+            if [[ "$other" != "$PREFIX" && -d "${other}/lib/tinydvd" ]]; then
+                echo "It is installed in ${other}: ./install --uninstall --prefix ${other}"
+            fi
+        done
+        exit 1
+    fi
     echo "tinydvd uninstalled from ${PREFIX}."
+    if [[ -n "$USER_CONFIG" && -d "$USER_CONFIG" ]]; then
+        echo "Your settings (including the web password) are still in ${USER_CONFIG};"
+        echo "delete that folder too if you won't be reinstalling."
+    fi
     exit 0
 fi
 
