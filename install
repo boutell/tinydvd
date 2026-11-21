@@ -102,6 +102,7 @@ APP_DIR="${SHARE_DIR}/applications"
 MIME_DIR="${SHARE_DIR}/mime/packages"
 THUMB_DIR="${SHARE_DIR}/thumbnailers"
 ICON_DIR="${SHARE_DIR}/icons/hicolor"
+ICON_SIZES=(16 24 32 48 64 128 256 512)
 MIME_TYPES=(video/x-tinydvd application/x-tdvd application/x-tinydvd)
 OS="$(uname -s)"
 
@@ -494,8 +495,14 @@ install_mac_app() {
     rm -rf "$MAC_APP"
     install -d "${MAC_APP}/Contents/MacOS" "${MAC_APP}/Contents/Resources"
     install -m 755 "$launcher" "${MAC_APP}/Contents/MacOS/TinyDVD"
-    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.icns" "${MAC_APP}/Contents/Resources/tinydvd.icns"
-    sed -e "s/@VERSION@/${version:-0}/g" "${ROOT_DIR}/data/macos/Info.plist" > "${MAC_APP}/Contents/Info.plist"
+    # The icon's file name includes a hash of its contents. macOS caches app
+    # icons and doesn't notice when the same file name gets new contents,
+    # so a changed icon needs a new name to show up
+    local icon_name
+    icon_name="tinydvd-$(shasum "${ROOT_DIR}/data/icons/tinydvd.icns" | cut -c1-8)"
+    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.icns" "${MAC_APP}/Contents/Resources/${icon_name}.icns"
+    sed -e "s/@VERSION@/${version:-0}/g" -e "s/@ICON@/${icon_name}/g" \
+        "${ROOT_DIR}/data/macos/Info.plist" > "${MAC_APP}/Contents/Info.plist"
     chmod 644 "${MAC_APP}/Contents/Info.plist"
     # Sign it ad hoc (no developer account needed), as Apple Silicon requires
     if ! codesign --force --sign - "$MAC_APP" >/dev/null 2>&1; then
@@ -503,6 +510,9 @@ install_mac_app() {
     fi
     # Tell Finder about the app and the .tdvd file type now, not at next login
     "$LSREGISTER" -f "$MAC_APP" >/dev/null 2>&1 || true
+    # Have the Dock and Finder pick up the new icon now
+    touch "$MAC_APP"
+    killall Dock Finder >/dev/null 2>&1 || true
     printf '%s\n' "$MAC_APP" > "$MAC_APP_RECORD"
 }
 
@@ -530,6 +540,10 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
               "${THUMB_DIR}/tinydvd.thumbnailer" \
               "${ICON_DIR}/scalable/apps/tinydvd.svg" \
               "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+        for size in "${ICON_SIZES[@]}"; do
+            rm -f "${ICON_DIR}/${size}x${size}/apps/tinydvd.png" \
+                  "${ICON_DIR}/${size}x${size}/mimetypes/video-x-tinydvd.png"
+        done
         if [[ -f "${APP_DIR}/mimeapps.list" && -n "$UNINSTALL_PY" && -x "$UNINSTALL_PY" ]]; then
             set_default_handler "$UNINSTALL_PY" remove
         fi
@@ -645,8 +659,7 @@ write_wrapper "tinydvd-set-thumbnail" "tinydvd-set-thumbnail.py"
 ln -sf tinydvd-set-thumbnail "${BIN_DIR}/tinydvd-add-thumbnail"
 
 if [[ "$OS" == "Linux" ]]; then
-    install -d "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}" \
-               "${ICON_DIR}/scalable/apps" "${ICON_DIR}/scalable/mimetypes"
+    install -d "${APP_DIR}" "${MIME_DIR}" "${THUMB_DIR}"
 
     # Absolute paths in Exec / TryExec, so neither the launcher nor the
     # thumbnailer sandbox depends on PATH
@@ -668,8 +681,13 @@ Exec=${BIN_DIR}/tinydvd -f %f|"
     chmod 644 "${THUMB_DIR}/tinydvd.thumbnailer"
 
     echo "Icons -> ${ICON_DIR}"
-    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/apps/tinydvd.svg"
-    install -m 644 "${ROOT_DIR}/data/icons/tinydvd.svg" "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+    # Earlier versions installed an SVG icon, which would win over these
+    rm -f "${ICON_DIR}/scalable/apps/tinydvd.svg" "${ICON_DIR}/scalable/mimetypes/video-x-tinydvd.svg"
+    for size in "${ICON_SIZES[@]}"; do
+        install -d "${ICON_DIR}/${size}x${size}/apps" "${ICON_DIR}/${size}x${size}/mimetypes"
+        install -m 644 "${ROOT_DIR}/data/icons/png/tinydvd-${size}.png" "${ICON_DIR}/${size}x${size}/apps/tinydvd.png"
+        install -m 644 "${ROOT_DIR}/data/icons/png/tinydvd-${size}.png" "${ICON_DIR}/${size}x${size}/mimetypes/video-x-tinydvd.png"
+    done
 
     set_default_handler "${VENV_PYTHON}" add
     refresh_caches

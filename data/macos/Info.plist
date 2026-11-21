@@ -12,7 +12,7 @@
     <key>CFBundleExecutable</key>
     <string>TinyDVD</string>
     <key>CFBundleIconFile</key>
-    <string>tinydvd</string>
+    <string>@ICON@</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -35,7 +35,7 @@
             <key>UTTypeDescription</key>
             <string>TinyDVD Disc</string>
             <key>UTTypeIconFile</key>
-            <string>tinydvd</string>
+            <string>@ICON@</string>
             <key>UTTypeConformsTo</key>
             <array>
                 <string>public.data</string>
@@ -63,7 +63,7 @@
             <key>CFBundleTypeRole</key>
             <string>Viewer</string>
             <key>CFBundleTypeIconFile</key>
-            <string>tinydvd</string>
+            <string>@ICON@</string>
             <key>LSHandlerRank</key>
             <string>Owner</string>
             <key>LSItemContentTypes</key>
