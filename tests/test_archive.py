@@ -111,6 +111,17 @@ def test_disc_ids() -> None:
 
 
 def test_default_library_path(tmp: str) -> None:
+    # The tests below give each config folder explicitly; a real
+    # XDG_CONFIG_HOME (GitHub's Ubuntu runners set one) would override them
+    saved = os.environ.pop("XDG_CONFIG_HOME", None)
+    try:
+        _test_default_library_path(tmp)
+    finally:
+        if saved is not None:
+            os.environ["XDG_CONFIG_HOME"] = saved
+
+
+def _test_default_library_path(tmp: str) -> None:
     home = os.path.join(tmp, "home")
     cfg = os.path.join(home, ".config")
     os.makedirs(cfg)
