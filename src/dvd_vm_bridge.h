@@ -112,7 +112,7 @@ void dvd_vm_bridge_set_event_callback(dvd_vm_bridge_t *bridge, dvd_vm_event_call
 spu_compositor_t *dvd_vm_bridge_get_spu(dvd_vm_bridge_t *bridge);
 
 /**
- * Get current loaded companion video filename (e.g. "VTS_01_VIDEO.mkv").
+ * Get current loaded companion video filename (e.g. "VTS_01_VIDEO.mp4").
  */
 const char *dvd_vm_bridge_get_loaded_video(dvd_vm_bridge_t *bridge);
 

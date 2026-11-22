@@ -2,8 +2,9 @@
 """
 convert-to-tinydvd: tinydvd Converter & Packager CLI
 Decomposes DVD title sets and menus into compact Meta-VOB (.mvob) sector
-containers (1 video reference sector per VOBU + NV_PCK + SPU) and
-companion H.264 + AAC Matroska (.mkv) streams.
+containers (1 video reference sector per VOBU + NV_PCK + SPU) and companion
+H.264 video and AAC audio, as fragmented MP4s that both the desktop and web
+players read in place (see tinydvd_mp4.py).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from fractions import Fraction
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import tinydvd_archive  # noqa: E402
 import tinydvd_metadata  # noqa: E402
+import tinydvd_mp4  # noqa: E402
 
 SECTOR_SIZE = 2048
 MVOB_MAGIC = 0x4D564F42  # "MVOB" in little-endian uint32
@@ -331,6 +333,91 @@ def ifo_video_standard(input_dir, ifo_name, attr_offset):
     return None
 
 
+# The MPEG stream ID of DVD audio stream n, by coding mode (bits 7-5 of the
+# stream's first attribute byte): AC-3, MPEG-1, MPEG-2 extended, LPCM, DTS
+AUDIO_STREAM_ID_BASE = {0: 0x80, 2: 0x1C0, 3: 0x1C0, 4: 0xA0, 6: 0x88}
+
+
+def dvd_audio_stream_ids(input_dir, ifo_name, count_offset):
+    """
+    The MPEG stream IDs of a menu's or title's declared audio streams, in DVD
+    stream number order, from its IFO: the stream count is at 0x102 for
+    menus (VMGM in VIDEO_TS.IFO, VTSM in VTS_NN_0.IFO) and 0x202 for titles,
+    followed by 8 bytes of attributes per stream. None if unreadable.
+    The player picks audio track N for DVD audio stream N, so the encoded
+    tracks must follow this order, not the order streams turn up in the VOB.
+    """
+    for path in find_dvd_files(input_dir, ifo_name):
+        try:
+            with open(path, "rb") as f:
+                f.seek(count_offset)
+                raw = f.read(2 + 8 * 8)
+        except OSError:
+            return None
+        if len(raw) < 2:
+            return None
+        count = min(struct.unpack(">H", raw[:2])[0], 8)
+        ids = []
+        for n in range(count):
+            attr = raw[2 + 8 * n:3 + 8 * n]
+            base = AUDIO_STREAM_ID_BASE.get(attr[0] >> 5) if attr else None
+            if base is None:
+                return None
+            ids.append(base + n)
+        return ids
+    return None
+
+
+def present_audio_ids(input_spec, fmt=None):
+    """The MPEG stream IDs of the audio streams ffmpeg finds in a VOB (or concat: of VOBs)."""
+    cmd = ["ffprobe", "-v", "error", "-probesize", "50M", "-analyzeduration", "50M"]
+    if fmt:
+        cmd += ["-f", fmt]
+    cmd += ["-select_streams", "a", "-show_entries", "stream=id", "-of", "csv=p=0", input_spec]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+    except OSError:
+        return []
+    ids = []
+    for line in out.split():
+        try:
+            ids.append(int(line.strip().strip(","), 16))
+        except ValueError:
+            pass
+    return ids
+
+
+def video_start_offset(vob_path):
+    """
+    How far a VOB's first video frame comes after the file's start (its
+    earliest stream), in seconds: where ffmpeg puts the video when it reads
+    the file, since it starts the file's timeline at 0.
+    """
+    def start(args):
+        try:
+            out = subprocess.run(["ffprobe", "-v", "error", "-f", "mpeg", *args, "-of", "csv=p=0", vob_path],
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.split()
+            return float(out[0].strip(","))
+        except (OSError, ValueError, IndexError):
+            return None
+    file_start = start(["-show_entries", "format=start_time"])
+    video_start = start(["-select_streams", "v:0", "-show_entries", "stream=start_time"])
+    if file_start is None or video_start is None:
+        return 0.0
+    return max(0.0, video_start - file_start)
+
+
+def audio_track_ids(declared, present):
+    """
+    The stream IDs to encode as audio tracks 1..N: the declared streams
+    (missing ones become silence, so track numbers stay aligned), or, when
+    the IFO can't be read, whatever the VOB has, in stream number order.
+    """
+    if declared is not None:
+        return list(declared)
+    return sorted(present)
+
+
 def video_rate(input_dir, ifo_name, attr_offset, fps_override=None):
     """(frames per second, ffmpeg rate string) for one menu or title video."""
     if fps_override:
@@ -359,12 +446,39 @@ def field_time_base(rate):
     return f"{field.numerator}/{field.denominator}"
 
 
-def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=None, rate="30000/1001"):
+def work_path(output_dir, video_name):
+    """Where to encode a video before splitting it (see finish_video)."""
+    return os.path.join(output_dir, f".work_{os.path.splitext(video_name)[0]}.mkv")
+
+
+def finish_video(work_mkv, output_dir, video_name):
+    """Split an encoded MKV into the package's MP4 video and audio files, then delete it."""
+    try:
+        names = tinydvd_mp4.split_video(work_mkv, output_dir, video_name)
+        print(f"[mp4] Wrote {', '.join(names)}")
+    finally:
+        if os.path.exists(work_mkv):
+            os.remove(work_mkv)
+
+
+def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=None, rate="30000/1001",
+                             audio_ids=None):
     """
     Transcodes a menu or multi-segment VOB where individual VOB_IDs may be
     still-frame menus (1 I-frame held for N seconds) or have discontinuous PTS.
     Each VOB_ID segment is stretched/trimmed to its exact NV_PCK duration using tpad,
-    with either its native audio stream or silent stereo AAC, then concatenated.
+    then they're concatenated. Every segment gets the same audio tracks, one
+    per entry of audio_ids (MPEG stream IDs, in DVD stream order): the
+    segment's own stream padded to length, or silence where it has none.
+    With no audio_ids, one track: the segment's first stream, or silence.
+
+    Segments keep their audio uncompressed (32-bit float PCM, cut to the
+    exact length; 16-bit would add dither, turning silence into noise the
+    AAC encoder then spends bits on) and it's encoded to AAC once, after
+    joining. Encoded segment by segment,
+    every segment would start with the AAC encoder's priming samples, which
+    nothing skips in the middle of a track: each later segment's sound would
+    come out late.
     """
     with tempfile.TemporaryDirectory(prefix="tinydvd_seg_") as tmpdir:
         seg_mkvs = []
@@ -386,14 +500,26 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
             vf = f"{DEINTERLACE_MENU},tpad=stop_mode=clone:stop_duration={dur:.6f},fps={rate},trim=duration={dur:.6f},setpts=PTS-STARTPTS"
             if sar:
                 vf += f",setsar={sar.replace(':', '/')}"
-            if seg["audio_sectors"] > 0:
-                # The segment's own audio, padded out to its full duration
-                audio_args = ["-af", f"apad=whole_dur={dur:.6f}", "-map", "0:v:0", "-map", "0:a:0"]
-                extra_input = []
-            else:
-                # No audio: add silence, so every segment has an audio track to concatenate
-                extra_input = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
-                audio_args = ["-map", "0:v:0", "-map", "1:a:0", "-t", f"{dur:.6f}"]
+            seg_ids = present_audio_ids(seg_vob, "mpeg") if seg["audio_sectors"] > 0 else []
+            wanted = list(audio_ids) if audio_ids else [seg_ids[0] if seg_ids else None]
+            # The video filter (setpts=PTS-STARTPTS) starts the video at 0. Move
+            # the audio back by the same amount, so the two stay in sync, then
+            # pad or trim it to start at 0 too
+            shift = video_start_offset(seg_vob)
+            audio_filter = (f"asetpts=PTS-{shift:.6f}/TB,aresample=async=1:first_pts=0,"
+                            f"apad=whole_dur={dur:.6f}")
+            extra_input = []
+            audio_args = ["-map", "0:v:0"]
+            for k, sid in enumerate(wanted):
+                if sid is not None and sid in seg_ids:
+                    # The segment's own stream, padded out to its full duration
+                    audio_args += ["-map", f"0:i:{sid:#x}", f"-filter:a:{k}", audio_filter]
+                else:
+                    # Not in this segment: silence, so every segment has the
+                    # same tracks to concatenate
+                    extra_input += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+                    audio_args += ["-map", f"{len(extra_input) // 4}:a:0"]
+            audio_args += ["-t", f"{dur:.6f}"]
             cmd = [
                 "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                 "-probesize", "50M", "-analyzeduration", "50M",
@@ -403,35 +529,50 @@ def _transcode_segmented_vob(segments, output_mkv, crf=18, preset="slow", sar=No
                 *audio_args,
                 "-c:v", "libx264", "-crf", str(crf), "-preset", preset,
                 "-x264-params", "keyint=15:min-keyint=1:open-gop=0:scenecut=0",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+                "-c:a", "pcm_f32le", "-ac", "2", "-ar", "48000",
                 seg_mkv
             ]
 
             res = subprocess.run(cmd)
             if res.returncode != 0:
                 raise RuntimeError(f"FFmpeg segment transcode failed for segment {idx} (VOB_ID {seg['vob_id']})")
-            seg_mkvs.append(seg_mkv)
+            seg_mkvs.append((seg_mkv, dur))
 
+        joined = os.path.join(tmpdir, "joined.mkv")
         if len(seg_mkvs) == 1:
-            shutil.move(seg_mkvs[0], output_mkv)
+            shutil.move(seg_mkvs[0][0], joined)
         else:
             concat_txt = os.path.join(tmpdir, "concat.txt")
+            # Each segment's exact length, from the disc's navigation data: the
+            # concat demuxer otherwise measures it, and the AAC encoder's extra
+            # start-up samples make every segment look a little long, pushing
+            # each later segment further from where the disc expects it
             with open(concat_txt, "w") as f:
-                for m in seg_mkvs:
-                    f.write(f"file '{m}'\n")
+                for m, seg_dur in seg_mkvs:
+                    f.write(f"file '{m}'\nduration {seg_dur:.6f}\n")
             cmd_concat = [
                 "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
                 "-f", "concat", "-safe", "0", "-i", concat_txt,
-                "-c", "copy", output_mkv
+                "-c", "copy", joined
             ]
             res = subprocess.run(cmd_concat)
             if res.returncode != 0:
                 raise RuntimeError("FFmpeg segment concatenation failed")
 
+        # The audio, encoded once for the whole video
+        res = subprocess.run([
+            "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", joined, "-map", "0", "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
+            output_mkv
+        ])
+        if res.returncode != 0:
+            raise RuntimeError("FFmpeg audio encode failed")
+
     print(f"[transcode] Output generated (segmented): {output_mkv}")
 
 
-def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf=18, preset="slow", tune="film", sar=None, segments=None, is_menu=False, rate="30000/1001"):
+def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf=18, preset="slow", tune="film", sar=None, segments=None, is_menu=False, rate="30000/1001", audio_ids=None):
     """
     Run ffmpeg to encode companion video + audio into an MKV container.
     - Uses per-segment tpad encoding for menus or still-frame VOBs so every VOB_ID
@@ -442,8 +583,11 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
     if segments and len(vob_paths) == 1 and (
         is_menu or os.path.getsize(vob_paths[0]) < 5 * 1024 * 1024
     ):
+        if audio_ids is None:
+            audio_ids = sorted(present_audio_ids(vob_paths[0]))
         print(f"[ffmpeg] Encoding {len(segments)} VOB_ID segment(s) with still-frame/menu timeline preservation -> {os.path.basename(output_mkv)}")
-        _transcode_segmented_vob(segments, output_mkv, crf=crf, preset=preset, sar=sar, rate=rate)
+        _transcode_segmented_vob(segments, output_mkv, crf=crf, preset=preset, sar=sar, rate=rate,
+                                 audio_ids=audio_ids)
         return
 
     if len(vob_paths) == 1:
@@ -461,20 +605,45 @@ def transcode_video(vob_paths, qpfile_path, output_mkv, keyframe_times=None, crf
                 seg_times = [f"{s['base_time_sec']:.3f}" for s in segments]
                 keyframe_args = ["-force_key_frames", ",".join(seg_times)]
 
+    # Audio tracks in DVD stream order; silence for a declared stream the
+    # VOBs don't actually have, so track numbers stay aligned
+    present = present_audio_ids(input_spec)
+    ids = audio_ids if audio_ids is not None else sorted(present)
+    filler_inputs, audio_maps = [], []
+    for sid in ids:
+        if sid in present:
+            audio_maps += ["-map", f"0:i:{sid:#x}"]
+        else:
+            print(f"[transcode] Audio stream {sid:#x} is declared but missing; using silence")
+            filler_inputs += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+            audio_maps += ["-map", f"{len(filler_inputs) // 4}:a:0"]
+    if filler_inputs:
+        audio_maps.append("-shortest")
+
+    # The disc's navigation times count from the first video frame, so the
+    # video starts at exactly 0 (setpts below). ffmpeg starts the file's
+    # timeline at its earliest stream, often audio a few ms before the
+    # video, so move the audio back by the same amount the video moves,
+    # keeping the two in sync, then pad or trim it to start at 0 too
+    shift = video_start_offset(input_spec)
+    audio_filter = ["-af", f"asetpts=PTS-{shift:.6f}/TB,aresample=async=1:first_pts=0"] if ids else []
+
     cmd = [
         "ffmpeg", "-nostdin", "-y",
         "-probesize", "50M", "-analyzeduration", "50M",
         "-i", input_spec,
+        *filler_inputs,
         "-map", "0:v:0",
-        "-map", "0:a?",
+        *audio_maps,
         "-c:v", "libx264",
         "-crf", str(crf),
         "-preset", preset,
         "-tune", tune,
         *keyframe_args,
         "-x264-params", "keyint=30:min-keyint=1:open-gop=0:scenecut=0",
-        "-vf", DEINTERLACE_TITLE + (f",setsar={sar.replace(':', '/')}" if sar else ""),
+        "-vf", "setpts=PTS-STARTPTS," + DEINTERLACE_TITLE + (f",setsar={sar.replace(':', '/')}" if sar else ""),
         "-enc_time_base:v", field_time_base(rate),
+        *audio_filter,
         "-c:a", "aac",
         "-b:a", "192k",
         "-ac", "2",
@@ -511,7 +680,7 @@ def emit_mvob_files(vob_paths, vts_id, vobus, output_dir, keep_audio=False):
       the VOBU had 0 raw video sectors, e.g. held menu still frames).
     - SPU (subtitle / menu button highlight bitmap) sectors copied verbatim.
     - Audio sectors are stripped by default (keep_audio=False) since audio is
-      muxed into the companion .mkv file, shrinking .mvob files by ~98.8%.
+      stored in the companion audio files, shrinking .mvob files by ~98.8%.
     """
     vobu_idx = 0
     current_vobu = None
@@ -595,7 +764,9 @@ def process_vmgm(input_dir, output_dir, fps=None, crf=18, preset="slow", sar=Non
     fps, rate = video_rate(input_dir, "VIDEO_TS.IFO", 0x100, fps)
     vobus, _, segments = scan_vts_vobus(vmgm_vobs, fps, return_segments=True)
     if vobus:
-        output_mkv = os.path.join(output_dir, "VIDEO_TS_VIDEO.mkv")
+        output_mkv = work_path(output_dir, "VIDEO_TS_VIDEO.mp4")
+        audio_ids = audio_track_ids(dvd_audio_stream_ids(input_dir, "VIDEO_TS.IFO", 0x102),
+                                    present_audio_ids(vmgm_vobs[0]))
         transcode_video(
             vob_paths=vmgm_vobs,
             qpfile_path=None,
@@ -605,8 +776,10 @@ def process_vmgm(input_dir, output_dir, fps=None, crf=18, preset="slow", sar=Non
             sar=sar,
             segments=segments,
             is_menu=True,
-            rate=rate
+            rate=rate,
+            audio_ids=audio_ids
         )
+        finish_video(output_mkv, output_dir, "VIDEO_TS_VIDEO.mp4")
         emit_mvob_files(vmgm_vobs, 0, vobus, output_dir, keep_audio=keep_audio)
 
 
@@ -620,13 +793,15 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
         print(f"Notice: No VOB files found for VTS_{vts_id:02d}")
         return
 
-    # If menu VOB exists, transcode VTS_xx_0_VIDEO.mkv and emit compact VTS_xx_0.mvob
+    # If menu VOB exists, encode VTS_xx_0_VIDEO.mp4 (+ audio) and emit compact VTS_xx_0.mvob
     if menu_vobs:
         print(f"[transcode] Processing menu VOB: {menu_vobs[0]}")
         menu_fps, menu_rate = video_rate(input_dir, f"VTS_{vts_id:02d}_0.IFO", 0x100, fps)
         menu_vobus, _, menu_segments = scan_vts_vobus(menu_vobs, menu_fps, return_segments=True)
         if menu_vobus:
-            menu_mkv = os.path.join(output_dir, f"VTS_{vts_id:02d}_0_VIDEO.mkv")
+            menu_mkv = work_path(output_dir, f"VTS_{vts_id:02d}_0_VIDEO.mp4")
+            menu_audio = audio_track_ids(dvd_audio_stream_ids(input_dir, f"VTS_{vts_id:02d}_0.IFO", 0x102),
+                                         present_audio_ids(menu_vobs[0]))
             transcode_video(
                 vob_paths=menu_vobs,
                 qpfile_path=None,
@@ -636,8 +811,10 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
                 sar=sar,
                 segments=menu_segments,
                 is_menu=True,
-                rate=menu_rate
+                rate=menu_rate,
+                audio_ids=menu_audio
             )
+            finish_video(menu_mkv, output_dir, f"VTS_{vts_id:02d}_0_VIDEO.mp4")
             emit_mvob_files(menu_vobs, vts_id, menu_vobus, output_dir, keep_audio=keep_audio)
 
     if not vob_files:
@@ -652,7 +829,7 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
     qpfile_path = os.path.join(output_dir, f"vts_{vts_id:02d}_keyframes.txt")
     generate_qpfile(keyframes, qpfile_path)
 
-    # Encode MKV
+    # Encode, then split into the package's MP4s
     keyframe_times = [f"{v['time_sec']:.3f}" for v in vobus]
     seen_times = set()
     unique_times = []
@@ -661,7 +838,8 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
             seen_times.add(t)
             unique_times.append(t)
 
-    output_mkv = os.path.join(output_dir, f"VTS_{vts_id:02d}_VIDEO.mkv")
+    output_mkv = work_path(output_dir, f"VTS_{vts_id:02d}_VIDEO.mp4")
+    title_audio = dvd_audio_stream_ids(input_dir, f"VTS_{vts_id:02d}_0.IFO", 0x202)
     transcode_video(
         vob_paths=vob_files,
         qpfile_path=qpfile_path,
@@ -673,8 +851,10 @@ def process_vts(input_dir, output_dir, vts_id, fps=None, crf=18, preset="slow", 
         sar=sar,
         segments=segments,
         is_menu=False,
-        rate=title_rate
+        rate=title_rate,
+        audio_ids=title_audio
     )
+    finish_video(output_mkv, output_dir, f"VTS_{vts_id:02d}_VIDEO.mp4")
 
     # Emit compact MVOB files
     emit_mvob_files(vob_files, vts_id, vobus, output_dir, keep_audio=keep_audio)
@@ -758,13 +938,13 @@ def resolve_dvd_source(input_path, work_dir=None):
 
 
 def is_already_converted_dir(path):
-    """Returns True if path is a directory that already contains .mvob and _VIDEO.mkv files."""
+    """Returns True if path is a directory that already contains .mvob files and their videos."""
     if not os.path.isdir(path):
         return False
     entries = os.listdir(path)
     has_mvob = any(f.lower().endswith(".mvob") for f in entries)
-    has_mkv  = any(f.lower().endswith("_video.mkv") for f in entries)
-    return has_mvob and has_mkv
+    has_video = any(tinydvd_mp4.VIDEO_MEMBER_RE.match(f) for f in entries)
+    return has_mvob and has_video
 
 
 def pick_thumbnail(source_dir):
@@ -798,7 +978,7 @@ def pick_thumbnail(source_dir):
 # Archive member order: navigation data first, then the small files, then
 # the large videos, so the player finds what it needs near the start
 PACKAGE_ORDER = {".ifo": 0, ".bup": 0, ".json": 1, ".png": 1, ".jpg": 1, ".jpeg": 1,
-                 ".mvob": 2, ".mkv": 3, ".txt": 4}
+                 ".mvob": 2, ".mp4": 3, ".txt": 4}
 
 
 def package_tdvd_archive(source_dir, output_archive_path, extra=None):
@@ -813,7 +993,8 @@ def package_tdvd_archive(source_dir, output_archive_path, extra=None):
     for fname in sorted(os.listdir(source_dir)):
         fpath = os.path.join(source_dir, fname)
         prio = PACKAGE_ORDER.get(os.path.splitext(fname)[1].lower())
-        if prio is None or fname.lower() in extra_lower or os.path.islink(fpath) or not os.path.isfile(fpath):
+        if (prio is None or fname.startswith(".") or fname.lower() in extra_lower
+                or os.path.islink(fpath) or not os.path.isfile(fpath)):
             continue
         files.append((prio, fname, fpath))
     files.sort()

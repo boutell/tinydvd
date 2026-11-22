@@ -2,8 +2,17 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>TinyDVD Web Player</title>
+  <!-- "Add to Home Screen" opens the player as an app with no browser controls:
+       the only full screen an iPhone offers a web page -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TinyDVD">
+  <meta name="theme-color" content="#0b0c10">
   <style>
     :root {
       --bg: #0b0c10;
@@ -188,6 +197,7 @@
       position: fixed;
       top: 0; left: 0;
       width: 100vw; height: 100vh;
+      height: 100dvh;  /* the visible screen, not counting mobile browser toolbars */
       background: #000;
       display: flex;
       justify-content: center;
@@ -199,6 +209,10 @@
     #player-view.cursor-hidden,
     #player-view.cursor-hidden * {
       cursor: none !important;
+    }
+    /* Keep the controls clear of a phone's notch and home bar */
+    #hud-layer {
+      padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
     }
     #player-view:fullscreen,
     #player-view:-webkit-full-screen {
@@ -476,6 +490,24 @@
       cursor: pointer;
     }
     .play-overlay.visible { display: flex; }
+    .load-spinner {
+      position: absolute;
+      top: 50%; left: 50%;
+      width: 56px; height: 56px;
+      margin: -28px 0 0 -28px;
+      border-radius: 50%;
+      border: 5px solid rgba(255, 255, 255, 0.2);
+      border-top-color: var(--accent);
+      animation: load-spin 0.9s linear infinite;
+      z-index: 55;
+      pointer-events: none;
+      display: none;
+    }
+    .load-spinner.visible { display: block; }
+    @keyframes load-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .load-spinner { animation-duration: 2.5s; }
+    }
     .play-overlay-card {
       display: flex;
       flex-direction: column;
@@ -686,6 +718,7 @@
       <div id="video-stage" class="video-stage">
         <video id="video" playsinline preload="auto"></video>
         <canvas id="overlay-canvas"></canvas>
+        <div id="load-spinner" class="load-spinner" role="status" aria-label="Loading"></div>
         <div id="play-overlay" class="play-overlay">
           <div class="play-overlay-card">
             <div class="play-overlay-icon">&#9654;</div>
@@ -818,6 +851,7 @@
     </div>
   </div>
 
+  <script src="/vendor/hls.min.js?v=1.7.4"></script>
   <script>
     const video = document.getElementById('video');
     const stage = document.getElementById('video-stage');
@@ -835,6 +869,7 @@
     const timeDisplay = document.getElementById('time-display');
     const movieLabel = document.getElementById('movie-label');
     const playOverlay = document.getElementById('play-overlay');
+    const loadSpinner = document.getElementById('load-spinner');
 
     let ws = null;
     let isLibraryMode = false;
@@ -861,12 +896,12 @@
       return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
     }
 
-    function showOSD(msg) {
+    function showOSD(msg, ms = 2000) {
       if (!msg) return;
       osd.textContent = msg;
       osd.classList.add('visible');
       clearTimeout(osd._timer);
-      osd._timer = setTimeout(() => osd.classList.remove('visible'), 2000);
+      osd._timer = setTimeout(() => osd.classList.remove('visible'), ms);
     }
 
     function wakeHUD() {
@@ -932,8 +967,17 @@
       if (playOverlay) playOverlay.classList.remove('visible');
     }
 
+    // Tell the server about problems it can't see, so they show up in its
+    // output (a phone's own console is hard to get at)
+    function reportProblem(text) {
+      console.warn(text);
+      sendWS({ type: 'client_log', text: String(text).slice(0, 200) });
+    }
+
     function attemptPlay() {
-      if (!video.src || isPaused) return;
+      // Not video.src: hls.js attaches the stream a moment after loading
+      // starts (on iOS, after this runs), and the video must still start
+      if (!currentVideoSrc || isPaused) return;
       const p = video.play();
       if (p !== undefined && p.catch) {
         p.then(() => {
@@ -941,7 +985,9 @@
           updatePlayPauseBtn();
           sendWS({ type: 'client_playback', state: 'playing', pts: video.currentTime });
         }).catch(err => {
-          console.warn('Autoplay prevented by browser:', err.name);
+          // AbortError just means a newer load or seek took over
+          if (err.name === 'AbortError') return;
+          reportProblem(`Playback didn't start (${err.name}); asking the viewer to tap`);
           showPlayOverlay();
           updatePlayPauseBtn();
           sendWS({ type: 'client_playback', state: 'paused', pts: video.currentTime });
@@ -966,6 +1012,58 @@
     let currentSeq = 0;
     let isSeeking = false;
 
+    // Whether the picture for the latest load or seek is on screen. Until it
+    // is, show a spinner (after a moment, so quick seeks don't flash one) and
+    // hide the menu buttons, which belong on top of that picture. Over a
+    // slow connection a load can take a while; the server waits for us.
+    let videoSettled = true;
+    let spinnerTimer = null;
+    let bufferingReported = false;
+    let lastProgressSent = 0;
+    function setSettled(settled) {
+      videoSettled = settled;
+      canvas.style.visibility = settled ? 'visible' : 'hidden';
+      clearTimeout(spinnerTimer);
+      if (settled) {
+        loadSpinner.classList.remove('visible');
+      } else {
+        spinnerTimer = setTimeout(() => loadSpinner.classList.add('visible'), 300);
+      }
+    }
+    function settleIfReady() {
+      if (!isSeeking && pendingSeekPts === null && video.readyState >= 2) setSettled(true);
+      if (bufferingReported && video.readyState >= 3) {
+        bufferingReported = false;
+        sendWS({ type: 'buffering', buffering: false, seq: currentSeq });
+      }
+    }
+    // While loading, tell the server data is still arriving, so it keeps
+    // waiting for us instead of deciding the player is stuck
+    function noteLoadProgress() {
+      if (videoSettled) return;
+      const now = performance.now();
+      if (now - lastProgressSent < 1000) return;
+      lastProgressSent = now;
+      sendWS({ type: 'loading', seq: currentSeq });
+    }
+    video.addEventListener('progress', noteLoadProgress);
+    // Ran out of data mid-playback: the server holds the disc's clock until
+    // we catch up
+    video.addEventListener('waiting', () => {
+      if (!videoSettled || isSeeking || video.readyState < 1) return;
+      setSettled(false);
+      bufferingReported = true;
+      sendWS({ type: 'buffering', buffering: true, seq: currentSeq });
+    });
+    video.addEventListener('loadeddata', settleIfReady);
+    video.addEventListener('error', () => {
+      if (!video.getAttribute('src')) return;
+      setSettled(true);
+      showOSD("Couldn't load this part of the disc");
+      reportProblem(`Video error ${video.error ? video.error.code : '?'}${video.error && video.error.message ? ': ' + video.error.message : ''}`);
+      sendWS({ type: 'video_error', seq: currentSeq });
+    });
+
     video.addEventListener('play', () => {
       if (isPaused) {
         video.pause();
@@ -977,6 +1075,7 @@
       sendWS({ type: 'client_playback', state: 'playing', pts: video.currentTime, seq: currentSeq });
     });
     video.addEventListener('playing', () => {
+      settleIfReady();
       if (isPaused) {
         video.pause();
         return;
@@ -1000,12 +1099,76 @@
     });
     video.addEventListener('seeked', () => {
       isSeeking = false;
+      settleIfReady();
       if (isPaused) {
         video.pause();
       }
       sendWS({ type: 'seek_completed', pts: video.currentTime, seq: currentSeq });
       sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
     });
+    // Every video comes as HLS (msg.src is its playlist): short segments
+    // read straight from the disc's package, so starting or seeking anywhere
+    // downloads only a few seconds of video, and only the audio track being
+    // heard. Safari plays HLS itself; elsewhere hls.js feeds the same <video>.
+    let hls = null;
+    let wantedAudioTrack = 1;  // the disc's audio stream, 1-based
+    // On iPhone and iPad every browser is Safari underneath, and its own HLS
+    // player is the most dependable there (hls.js elsewhere)
+    const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    const useNativeHls = isIOS && Boolean(video.canPlayType('application/vnd.apple.mpegurl'));
+    function applyAudioTrack() {
+      const i = wantedAudioTrack - 1;
+      if (hls) {
+        if (hls.audioTracks && i >= 0 && i < hls.audioTracks.length && hls.audioTrack !== i) {
+          hls.audioTrack = i;
+        }
+      } else if (video.audioTracks && i >= 0 && i < video.audioTracks.length) {
+        for (let t = 0; t < video.audioTracks.length; t++) video.audioTracks[t].enabled = (t === i);
+      }
+    }
+    function loadSource(msg) {
+      if (hls) {
+        hls.destroy();
+        hls = null;
+      }
+      if (useNativeHls) {
+        // iPhone and iPad: the system's own HLS player
+        video.src = msg.src;
+        video.addEventListener('loadedmetadata', applyAudioTrack, { once: true });
+      } else if (window.Hls && Hls.isSupported()) {
+        hls = new Hls({ maxBufferLength: 30, backBufferLength: 30 });
+        let recovered = false;
+        hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, applyAudioTrack);
+        hls.on(Hls.Events.FRAG_LOAD_PROGRESS, noteLoadProgress);
+        hls.on(Hls.Events.FRAG_LOADED, noteLoadProgress);
+        hls.on(Hls.Events.ERROR, (_e, data) => {
+          if (!data.fatal) return;
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
+            recovered = true;
+            hls.recoverMediaError();
+            return;
+          }
+          reportProblem(`Playback failed (hls.js): ${data.type} ${data.details}`);
+          if (currentVideoSrc === msg.src) {
+            setSettled(true);
+            showOSD("Couldn't load this part of the disc");
+            sendWS({ type: 'video_error', seq: currentSeq });
+          }
+        });
+        hls.loadSource(msg.src);
+        hls.attachMedia(video);
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Safari without Media Source Extensions (older iPhones)
+        video.src = msg.src;
+        video.addEventListener('loadedmetadata', applyAudioTrack, { once: true });
+      } else {
+        setSettled(true);
+        showOSD("This browser can't play TinyDVD videos");
+        sendWS({ type: 'video_error', seq: currentSeq });
+      }
+    }
+
     // Report that the current video has finished, once per load
     let endReportedSeq = -1;
     function reportEnded() {
@@ -1036,6 +1199,7 @@
           reportEnded();
         } else if (Math.abs(video.currentTime - pts) > 0.05) {
           isSeeking = true;
+          setSettled(false);
           video.currentTime = pts;
         } else {
           sendWS({ type: 'seek_completed', pts: video.currentTime, seq: currentSeq });
@@ -1072,6 +1236,10 @@
         video.pause();
       }
       sendWS({ type: 'file_loaded', seq: currentSeq });
+      settleIfReady();
+      // Start it if it should be playing (a play() before it had data may
+      // not have taken)
+      if (!isPaused && video.paused) attemptPlay();
     });
     video.addEventListener('ended', () => {
       reportEnded();
@@ -1176,7 +1344,9 @@
           }
           if (msg.src && msg.src !== currentVideoSrc) {
             currentVideoSrc = msg.src;
-            video.src = msg.src;
+            bufferingReported = false;
+            setSettled(false);
+            loadSource(msg);
             pendingSeekPts = (msg.pts !== undefined && msg.pts > 0) ? msg.pts : null;
             if (!isPaused) {
               attemptPlay();
@@ -1244,6 +1414,12 @@
           break;
         case 'osd':
           showOSD(msg.text);
+          break;
+        case 'audio_track':
+          if (msg.track > 0) {
+            wantedAudioTrack = msg.track;
+            applyAudioTrack();
+          }
           break;
         case 'state':
           if (msg.session_id) {
@@ -1377,11 +1553,40 @@
       toggleRemoteBtn.classList.toggle('active', dpad.classList.contains('visible'));
     };
 
+    // Fullscreen: Android, iPads and desktop browsers can make the player
+    // fullscreen, and on phones and tablets it turns to landscape too. An
+    // iPhone can't, except when opened from the Home Screen, where there's
+    // no browser around it at all; so in Safari the button says how.
+    const canFullscreen = Boolean(document.fullscreenEnabled || document.webkitFullscreenEnabled);
+    const fromHomeScreen = Boolean(navigator.standalone) ||
+      window.matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches;
+    const isTouch = window.matchMedia('(pointer: coarse)').matches;
+    if (!canFullscreen && fromHomeScreen) {
+      document.getElementById('btn-fullscreen').style.display = 'none';
+    }
+    function lockLandscape() {
+      if (isTouch && screen.orientation && screen.orientation.lock) {
+        screen.orientation.lock('landscape').catch(() => {});
+      }
+    }
+    function onFullscreenChange() {
+      if (!document.fullscreenElement && !document.webkitFullscreenElement &&
+          screen.orientation && screen.orientation.unlock) {
+        try { screen.orientation.unlock(); } catch (e) { /* not locked */ }
+      }
+    }
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullscreenChange);
+
     function toggleFullscreen() {
       const pv = document.getElementById('player-view');
+      if (!canFullscreen) {
+        if (!fromHomeScreen) showOSD('For full screen, add TinyDVD to your Home Screen (Share \u2192 Add to Home Screen)', 5000);
+        return;
+      }
       if (!document.fullscreenElement && !document.webkitFullscreenElement) {
-        if (pv.requestFullscreen) pv.requestFullscreen().catch(() => {});
-        else if (pv.webkitRequestFullscreen) pv.webkitRequestFullscreen();
+        if (pv.requestFullscreen) pv.requestFullscreen().then(lockLandscape).catch(() => {});
+        else if (pv.webkitRequestFullscreen) { pv.webkitRequestFullscreen(); lockLandscape(); }
       } else {
         if (document.exitFullscreen) document.exitFullscreen().catch(() => {});
         else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
@@ -1556,6 +1761,12 @@
     }
 
     function startMovie(item) {
+      // Runs in the viewer's tap: iOS lets a video play with sound only if
+      // a tap started it, and the movie itself arrives a moment later, so
+      // claim the permission now
+      if (!video.getAttribute('src')) {
+        try { video.load(); } catch (e) { /* nothing to load yet */ }
+      }
       if (item && item.title) {
         movieLabel.textContent = item.year ? `${item.title} (${item.year})` : item.title;
       }

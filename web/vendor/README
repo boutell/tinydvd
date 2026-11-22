@@ -1,0 +1,7 @@
+Third-party files used by the web player, served at /vendor/.
+
+hls.min.js: hls.js 1.7.4 (https://github.com/video-dev/hls.js), Apache-2.0,
+  see hls.js-LICENSE. From the npm package hls.js@1.7.4, dist/hls.min.js,
+  checked against the registry's sha512 integrity hash:
+  sha512-3GlxGdPvT2YHvQYOt+yOzT/DEior/qJVNIylHA77kgeoBTdQQqi70GwefNEUmHQeNGyjC8U62+bruqW/Tpm+tg==
+  It plays long videos as HLS in browsers without native HLS (most besides Safari).

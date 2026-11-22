@@ -1128,8 +1128,10 @@ static void emit_session_json(tdvd_vm_session_t *s, const char *json) {
 }
 
 static int sess_adapter_load_file(void *ctx, const char *video_path, const char *subfile_name,
-                                  const char *audio_path, uint64_t seq) {
-    (void)audio_path;
+                                  const char *const *audio_paths, int audio_count, uint64_t seq) {
+    /* The browser finds a video's audio files through its HLS playlist */
+    (void)audio_paths;
+    (void)audio_count;
     tdvd_vm_session_t *s = (tdvd_vm_session_t *)ctx;
     if (!s) return -1;
 
@@ -1158,7 +1160,7 @@ static int sess_adapter_load_file(void *ctx, const char *video_path, const char 
 
     char buf[1024];
     snprintf(buf, sizeof(buf),
-             "{\"type\":\"video_load\",\"src\":\"/api/media/%s.mp4?disc=%s\",\"pts\":0.000,\"paused\":false,\"seq\":%llu}",
+             "{\"type\":\"video_load\",\"src\":\"/api/media/%s.m3u8?disc=%s\",\"pts\":0.000,\"paused\":false,\"seq\":%llu}",
              e_base, e_disc, (unsigned long long)seq);
     emit_session_json(s, buf);
     emit_session_json(s, "{\"type\":\"highlight\",\"data_url\":null,\"w\":720,\"h\":480,\"active_btn\":0,\"buttons\":[]}");
@@ -1184,8 +1186,11 @@ static void sess_adapter_set_paused(void *ctx, bool paused) {
 }
 
 static void sess_adapter_set_audio_track(void *ctx, int aid) {
-    (void)ctx;
-    (void)aid;
+    tdvd_vm_session_t *s = (tdvd_vm_session_t *)ctx;
+    if (!s) return;
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"type\":\"audio_track\",\"track\":%d}", aid);
+    emit_session_json(s, buf);
 }
 
 static void sess_adapter_set_subtitle_track(void *ctx, int sid) {
@@ -1428,5 +1433,12 @@ void tdvd_vm_session_notify_playback(tdvd_vm_session_t *s, const char *event_typ
         }
     } else if (strcmp(event_type, "video_ended") == 0) {
         player_adapter_notify_ended(a, seq);
+    } else if (strcmp(event_type, "loading") == 0) {
+        player_adapter_notify_progress(a, seq);
+    } else if (strcmp(event_type, "buffering") == 0) {
+        /* "paused" carries the buffering flag for this event */
+        if (paused >= 0) player_adapter_notify_buffering(a, seq, paused != 0);
+    } else if (strcmp(event_type, "video_error") == 0) {
+        player_adapter_notify_failed(a, seq);
     }
 }

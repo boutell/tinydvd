@@ -17,7 +17,7 @@ typedef struct {
     uint16_t version;         /* 0x0001 */
     uint16_t vts_id;          /* Video Title Set index (e.g., 1 for VTS_01) */
     uint32_t vobu_index;      /* VOBU index within cell */
-    uint64_t pts_nanos;       /* Target presentation timestamp in MKV */
+    uint64_t pts_nanos;       /* Target presentation timestamp in the companion video */
     uint32_t duration_nanos;  /* VOBU duration in nanoseconds */
     uint8_t  is_idr;          /* 1 if VOBU start boundary (IDR frame) */
     uint8_t  reserved[15];    /* Zero padding */

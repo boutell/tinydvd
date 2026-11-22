@@ -63,6 +63,7 @@ def print_usage(prog: str) -> None:
     print(f"tinydvd Player v{TINYDVD_VERSION}")
     print("Interactive DVD-Video Hybrid Player (.tdvd / H.264 + Meta-VOB)\n")
     print(f"Usage: {prog} [options] [movie.tdvd | library_directory]\n")
+    print(f"With no path, it uses your videos folder ({default_library_path()}).\n")
     print("Options:")
     print("  -s, --serve               Start the web player server")
     print("  -p, --port <port>         Web server port (default: 8080)")
@@ -132,10 +133,6 @@ def main(argv: list[str]) -> int:
         i += 1
 
     if not dvd_path:
-        if serve_mode:
-            print("Error: No DVD path specified.\n", file=sys.stderr)
-            print_usage(prog)
-            return 1
         dvd_path = default_library_path()
 
     core = TinyDVDCore()

@@ -27,7 +27,7 @@ tdvd_archive_t *tdvd_archive_open(const char *archive_path);
 void tdvd_archive_close(tdvd_archive_t *ar);
 
 /**
- * Look up a constituent file (case-insensitive basename, e.g. "VTS_04_1.mvob" or "VTS_04_VIDEO.mkv").
+ * Look up a constituent file (case-insensitive basename, e.g. "VTS_04_1.mvob" or "VTS_04_VIDEO.mp4").
  * Returns true and populates out_offset and out_size if found.
  */
 bool tdvd_archive_find(const tdvd_archive_t *ar, const char *filename, uint64_t *out_offset, uint64_t *out_size);

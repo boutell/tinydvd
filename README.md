@@ -1,10 +1,10 @@
 # tinydvd
 
-**tinydvd** shrinks full DVDs down to a fraction of their original size (~75–80% smaller, e.g., **7.8 GB → 1.8 GB**) using modern H.264/AAC `.mkv` compression **without losing the interactive DVD experience**.
+**tinydvd** shrinks full DVDs down to a fraction of their original size (~75–80% smaller, e.g., **7.8 GB → 1.8 GB**) using modern H.264/AAC compression **without losing the interactive DVD experience**.
 
 Unlike standard rippers that throw away menus or split a disc into dozens of disconnected files, **tinydvd** keeps everything that makes a DVD a DVD:
 - **Full Interactive DVD Menus:** Root menus, animated transitions, scene selection, language/audio setup, and bonus feature navigation work just like a real DVD player.
-- **Massive Space Savings:** Replaces bulky 1990s MPEG-2 video streams with modern H.264 video in `.mkv` containers, while collapsing the DVD navigation/subtitle stream into tiny `.mvob` ("Meta-VOB") files (~99% smaller than original `.VOB`s).
+- **Massive Space Savings:** Replaces bulky 1990s MPEG-2 video streams with modern H.264 video and AAC audio, while collapsing the DVD navigation/subtitle stream into tiny `.mvob` ("Meta-VOB") files (~99% smaller than original `.VOB`s).
 - **Single-File `.tdvd` Format:** Packages the entire converted disc into a single `.tdvd` (or `.tinydvd`) file that the player reads in place, with no unpacking, so you can double-click it in a file manager.
 - **Closed Captions, Subtitles & Multi-Track Audio:** Preserves original DVD Closed Captions (SDH), multi-language subtitles, and multiple audio tracks with instant toggling during playback.
 - **Modern Player Controls:** Navigate menus with keyboard or mouse, jump around the clip timeline (`-10s`/`+10s`, `-60s`/`+60s`, `0%`–`90%`), and step through chapters with On-Screen Display (OSD) feedback.
@@ -57,7 +57,7 @@ To install somewhere you can write without `sudo`, use `./install --prefix ~/.lo
 ./install --uninstall
 ```
 
-(Add `--prefix` if you installed with one.) This removes TinyDVD's commands, its runtime folder, the app or desktop entries, and the web player's video cache. It checks each command and the app are the ones `./install` put there before deleting them. It leaves your movies, your settings (including the web password) and every package TinyDVD uses, such as FFmpeg, mpv, Python, `dvdbackup` and `libdvdcss`, since other programs may need them.
+(Add `--prefix` if you installed with one.) This removes TinyDVD's commands, its runtime folder, and the app or desktop entries. It checks each command and the app are the ones `./install` put there before deleting them. It leaves your movies, your settings (including the web password) and every package TinyDVD uses, such as FFmpeg, mpv, Python, `dvdbackup` and `libdvdcss`, since other programs may need them.
 
 ### Building Without Installing
 
@@ -171,14 +171,18 @@ Two common ways to go from a physical disc to watching it:
 
 To stream your collection to a web browser, tablet, phone or smart TV:
 
-1. **Point the server at `~/Videos`:**
+1. **Start the server:**
    ```bash
-   # Serve ~/Videos to this computer only (http://localhost:8080):
-   tinydvd --serve ~/Videos
+   # Serve your videos folder to this computer only (http://localhost:8080):
+   tinydvd --serve
 
    # Let other devices on your network connect too:
-   tinydvd --serve ~/Videos --bind 0.0.0.0
+   tinydvd --serve --bind 0.0.0.0
+
+   # Serve a different folder:
+   tinydvd --serve /path/to/movies
    ```
+   Like the desktop player, it uses your videos folder by default (`~/Movies` on macOS, `~/Videos` or your desktop's configured Videos folder on Linux), and prints which folder it's serving.
    The web player asks for a password. On first run `tinydvd` makes a random one, saves it in your config folder (`~/.config/tinydvd/web-password` on Linux, `~/Library/Application Support/tinydvd/web-password` on macOS) and prints it when the server starts. To choose your own, put it in that file, or set `TINYDVD_WEB_PASSWORD`, or pass `--web-password-file`.
 
    The server speaks plain HTTP. That's fine at home; don't expose it to the internet without a TLS reverse proxy in front.
@@ -273,7 +277,7 @@ You can stream any `.tdvd` movie or an entire folder of movies to modern web bro
 * **Login**: one shared password (see [Recipe 2](#recipe-2-how-do-i-just-serve-my-tinydvds-with-the-web-player)). Logins last 30 days; changing the password signs everyone out.
 * **Built-in DVD Importer** (with `--allow-web-import`): Click **"+ Import DVD"** in the library header to rip an optical disc (`dvdbackup`), convert it to `.tdvd`, and refresh the catalog without leaving the browser.
 * **Multi-Session Isolation**: Every browser tab and device gets its own independent DVD VM and playback timeline—different family members can watch or browse different movies at the same time without interfering with each other.
-* **Remuxing & Caching**: Browsers can't play MKV, so each video is copied into an MP4 (no re-encoding) the first time it's played. The copies are kept in your cache folder (`~/.cache/tinydvd` or `~/Library/Caches/tinydvd`), up to 20 GB, oldest removed first. The first play of a long title waits for its copy to finish.
+* **Streaming straight from your files**: the web player reads the same video and audio files as the desktop player, in place inside each `.tdvd`, with no copies, conversion or cache. Videos stream as HLS in segments of a few seconds, so starting, seeking and skipping chapters download only what's needed, which keeps things quick over slower connections too. Only the audio track you're listening to is downloaded. Safari plays HLS itself; other browsers use the bundled [hls.js](https://github.com/video-dev/hls.js). While a video loads, the player shows a spinner and the disc waits for it.
 * **Live Catalog Search**: Search your collection instantly by **actor, director, genre, title, year**, or plot summary.
 
 ### Movie Metadata (`tinydvd_metadata.py`)
@@ -368,8 +372,10 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Preserves Subpicture (`SPU`) 2-bit RLE overlay sectors (`0x20..0x3F`) for interactive menu buttons, Closed Captions (SDH), and subtitles.
    - Reduces `.mvob` container size by **~98.8%** compared to original `.VOB` files (e.g., ~96 MB total across a 7.8 GB dual-layer DVD).
 
-2. **Companion Matroska Video + Audio (`VIDEO_TS_VIDEO.mkv`, `VTS_xx_0_VIDEO.mkv`, `VTS_xx_VIDEO.mkv`):**
-   - Encodes video with `libx264` (`-crf 18 -preset slow -tune film`) and all audio tracks with stereo AAC (`-c:a aac -b:a 192k`).
+2. **Companion Video and Audio (`VIDEO_TS_VIDEO.mp4`, `VTS_xx_0_VIDEO.mp4`, `VTS_xx_VIDEO.mp4`, plus `…_AUDIO_1.mp4`, `…_AUDIO_2.mp4`, … per audio track):**
+   - Encodes video with `libx264` (`-crf 18 -preset slow -tune film`) and every audio track with stereo AAC (`-c:a aac -b:a 192k`), in the disc's own audio stream order, so the DVD's audio choices pick the right track.
+   - Stores each as a fragmented MP4 with an index of its fragments at the start ([`scripts/tinydvd_mp4.py`](scripts/tinydvd_mp4.py)). The desktop player (mpv) plays the video file with its audio files as tracks; the web player streams the very same files as HLS. Nothing is stored twice.
+   - An edit list hides the encoder's frame reordering delay, so both players see every frame at its exact original time.
    - Preserves still-frame menu timelines (`tpad`) so every menu `VOB_ID` maps 1:1 to its `NV_PCK` presentation timestamps.
    - Uses byte-level `concat:` protocol on multi-file title VOBs (`VTS_xx_1..N.VOB`) to preserve continuous MPEG-PS timestamps across 1 GB VOB splits.
    - Keeps each video's frame size (720x480 NTSC or 720x576 PAL), frame rate (29.97 or 25, read from the disc's IFO files) and aspect ratio (4:3 or 16:9), so menu button and subtitle coordinates match the video 1:1.
@@ -381,8 +387,8 @@ Each DVD title set and menu domain is decomposed into two paired assets:
    - Composites 2-bit RLE DVD subpictures and menu button highlights over the `libmpv` OpenGL video frame via [`src/spu_compositor.c`](src/spu_compositor.c), including timed DCSQ `STP_DSP` expiration for movie Closed Captions and subtitles.
 
 4. **Single-File `.tdvd` / `.tinydvd` Container ([`src/tdvd_archive.c`](src/tdvd_archive.c)):**
-   - Uses a standard uncompressed ZIP (`ZIP_STORED`, with `ZIP64` for files over 4 GB). The ZIP index at the end of the file gives the byte range of every `.IFO`, `.mvob` and `.mkv` inside it.
-   - Because `.mkv` video/audio is already compressed, `ZIP_STORED` adds zero CPU overhead and allows `.IFO`/`.BUP` tables to be loaded directly into memory while `.mvob` navigation sectors (`fseeko`) and `.mkv` video streams (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](src/mpv_controller.c) using `pread`) are streamed and seeked **directly in-place from the `.tdvd` file without unpacking to `/tmp`**.
+   - Uses a standard uncompressed ZIP (`ZIP_STORED`, with `ZIP64` for files over 4 GB). The ZIP index at the end of the file gives the byte range of every `.IFO`, `.mvob` and `.mp4` inside it.
+   - Because the video and audio are already compressed, `ZIP_STORED` adds zero CPU overhead and allows `.IFO`/`.BUP` tables to be loaded directly into memory while `.mvob` navigation sectors (`fseeko`), the desktop player's video and audio (`mpv_stream_cb_add_ro` custom `tdvd://` protocol in [`src/mpv_controller.c`](src/mpv_controller.c) using `pread`) and the web player's HLS segments (byte ranges) are all read **directly in place from the `.tdvd` file without unpacking**.
    - Any `.tdvd` file can also be inspected with standard tools (`unzip -l MY_MOVIE.tdvd`).
 
 ### Binary Descriptor (`mvob_video_ref_t`)
@@ -394,7 +400,7 @@ typedef struct {
     uint16_t version;         // 0x0001
     uint16_t vts_id;          // Video Title Set index (e.g., 1 for VTS_01)
     uint32_t vobu_index;      // VOBU index within cell
-    uint64_t pts_nanos;       // Target presentation timestamp in MKV
+    uint64_t pts_nanos;       // Target presentation timestamp in the companion video
     uint32_t duration_nanos;  // VOBU duration in nanoseconds
     uint8_t  is_idr;          // 1 if VOBU start boundary (IDR frame)
     uint8_t  reserved[15];    // Zero padding
@@ -409,13 +415,17 @@ tinydvds/MY_MOVIE/
 ├── VIDEO_TS.IFO                  # Original Video Manager navigation metadata
 ├── VIDEO_TS.BUP                  # VMG backup
 ├── VIDEO_TS.mvob                 # Compact VMGM menu Meta-VOB (NV_PCK + 1 video ref/VOBU + SPU)
-├── VIDEO_TS_VIDEO.mkv            # Companion VMGM menu H.264 + AAC video/audio
+├── VIDEO_TS_VIDEO.mp4            # Companion VMGM menu H.264 video
+├── VIDEO_TS_AUDIO_1.mp4          # ...and its AAC audio
 ├── VTS_01_0.IFO                  # Title set 1 navigation metadata
 ├── VTS_01_0.BUP                  # Title set 1 backup
 ├── VTS_01_0.mvob                 # Compact VTSM menu Meta-VOB (NV_PCK + 1 video ref/VOBU + SPU)
-├── VTS_01_0_VIDEO.mkv            # Companion VTSM menu H.264 + AAC video/audio
+├── VTS_01_0_VIDEO.mp4            # Companion VTSM menu H.264 video
+├── VTS_01_0_AUDIO_1.mp4          # ...and its AAC audio
 ├── VTS_01_1.mvob                 # Compact title Meta-VOB (~99% smaller than original VOB)
-├── VTS_01_VIDEO.mkv              # Companion H.264 video + multi-track AAC audio
+├── VTS_01_VIDEO.mp4              # Companion title H.264 video
+├── VTS_01_AUDIO_1.mp4            # AAC audio, one file per DVD audio stream
+├── VTS_01_AUDIO_2.mp4
 └── vts_01_keyframes.txt          # Generated x264 keyframe table
 ```
 
@@ -432,7 +442,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This runs the C tests (MVOB parser, subtitle compositor, DVD VM) and the Python tests (web server, archive helpers, converter). The DVD VM and playback tests play `tests/fixtures/TestDisc.tdvd`, a half-megabyte synthetic disc (test patterns, a two-button menu, chapters and a subtitle track). `tests/fixtures/make-test-disc.sh` rebuilds it; that needs `dvdauthor`, which the tests themselves don't.
+This runs the C tests (MVOB parser, subtitle compositor, DVD VM, desktop playback through mpv) and the Python tests (web server and HLS streaming, archive helpers, converter). The playback tests use `tests/fixtures/TestDisc.tdvd`, a half-megabyte synthetic disc (test patterns, a two-button menu, chapters, two audio tracks and a subtitle track). `tests/fixtures/make-test-disc.sh` rebuilds it; that needs `dvdauthor`, which the tests themselves don't.
 
 ---
 
@@ -447,6 +457,8 @@ When built and linked into binaries (`libtinydvd_core` / `tinydvd`), TinyDVD rel
 - **`pango` / `pangocairo`**: **LGPL-2.0-or-later** / **LGPL-2.1-or-later**
 - **`SDL2`** & **`zlib`**: **zlib License**
 - **Python 3**: **PSF-2.0 License**
+
+The web player bundles **hls.js** (**Apache-2.0**) in `web/vendor/`, with its license; see `web/vendor/README`.
 
 When compiled against a typical distribution or Homebrew GPL-enabled build of `libmpv`, **any distributed compiled binary packages are combined works subject to the GPL** (requiring corresponding source availability and GPL license notices if you redistribute binaries). If built against an LGPL-only `libmpv` (e.g., `-Dgpl=false`), no GPL-licensed library is linked into `libtinydvd_core`.
 

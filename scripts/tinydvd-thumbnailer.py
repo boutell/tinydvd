@@ -6,9 +6,9 @@ Uses the package's embedded thumbnail.png when there is one.
 Otherwise it picks a frame from the disc's videos:
 
 1. The menu video of the title set that holds the main feature
-   (VTS_NN_0_VIDEO.mkv, where VTS_NN_VIDEO.mkv is the largest title video).
+   (VTS_NN_0_VIDEO.mp4, where VTS_NN_VIDEO.mp4 is the largest title video).
    That is usually the disc's main menu, which makes the best thumbnail.
-   The disc-level menu video (VIDEO_TS_VIDEO.mkv) is skipped: it usually
+   The disc-level menu video (VIDEO_TS_VIDEO.mp4) is skipped: it usually
    holds the copyright and region warnings that play before the menu.
 2. Otherwise, 30 seconds into the largest video, past any fade-in.
 
@@ -27,17 +27,17 @@ import tempfile
 
 import tinydvd_archive
 
-TITLE_VIDEO_RE = re.compile(r"^VTS_(\d\d)_VIDEO\.mkv$", re.IGNORECASE)
+TITLE_VIDEO_RE = re.compile(r"^VTS_(\d\d)_VIDEO\.mp4$", re.IGNORECASE)
 MIN_MENU_BYTES = 100 * 1024
 MENU_OFFSET = 5          # seconds into the menu video, once any fade-in is over
 FEATURE_OFFSET = 30      # seconds into the largest video, past any fade-in
 
 
 def list_videos(path):
-    """{basename: (size, MemberLocation)} for the package's .mkv videos."""
+    """{basename: (size, MemberLocation)} for the package's videos (NAME_VIDEO.mp4)."""
     videos = {}
     for name, size in tinydvd_archive.list_members(path).items():
-        if name.lower().endswith(".mkv"):
+        if name.lower().endswith("_video.mp4"):
             loc = tinydvd_archive.locate_member(path, name)
             if loc:
                 videos[name] = (size, loc)
@@ -55,7 +55,7 @@ def frame_candidates(videos, time_offset=None):
     candidates = []
     m = TITLE_VIDEO_RE.match(largest)
     if m:
-        menu = next((n for n in videos if n.lower() == f"vts_{m.group(1)}_0_video.mkv"), None)
+        menu = next((n for n in videos if n.lower() == f"vts_{m.group(1)}_0_video.mp4"), None)
         if menu and videos[menu][0] >= MIN_MENU_BYTES:
             candidates += [(menu, MENU_OFFSET), (menu, 0)]
     candidates += [(largest, FEATURE_OFFSET), (largest, 0)]

@@ -9,10 +9,12 @@ Validates:
 5. Verbatim preservation of NV_PCK and SPU sectors (and optional audio preservation).
 """
 
+import importlib
 import os
 import sys
 import tempfile
 import struct
+import subprocess
 
 SECTOR_SIZE = 2048
 
@@ -90,6 +92,10 @@ def build_spu_sector(substream=0x20):
     return bytes(buf)
 
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+transcoder = importlib.import_module("convert-to-tinydvd")
+
+
 def main():
     print("=== Running convert-to-tinydvd Integration Test ===")
 
@@ -134,10 +140,6 @@ def main():
             f.write(nv3)
             f.write(s1)
 
-        # Import convert-to-tinydvd functions
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
-        import importlib
-        transcoder = importlib.import_module("convert-to-tinydvd")
 
         # Test scan
         vobus, keyframes, segments = transcoder.scan_vts_vobus([vob_path], fps=29.97, return_segments=True)
@@ -209,15 +211,20 @@ def main():
 
         # Test single-file .tdvd archive packaging (ZIP_STORED)
         transcoder.copy_ifo_and_bup(input_dir, output_dir)
-        with open(os.path.join(output_dir, "VTS_01_VIDEO.mkv"), "wb") as f:
-            f.write(b"\x1a\x45\xdf\xa3" + b"\x00" * 4096)
+        for name in ("VTS_01_VIDEO.mp4", "VTS_01_AUDIO_1.mp4"):
+            with open(os.path.join(output_dir, name), "wb") as f:
+                f.write(b"\x00\x00\x00\x08ftyp" + b"\x00" * 4096)
+        # A leftover encode from a failed run must never be packaged
+        with open(os.path.join(output_dir, ".work_VTS_01_VIDEO.mkv"), "wb") as f:
+            f.write(b"\x1a\x45\xdf\xa3")
         tdvd_file = os.path.join(tmpdir, "test_movie.tdvd")
         transcoder.package_tdvd_archive(output_dir, tdvd_file)
         assert os.path.exists(tdvd_file), ".tdvd archive not created"
         import zipfile
         with zipfile.ZipFile(tdvd_file, "r") as zf:
             names = zf.namelist()
-            assert "VIDEO_TS.IFO" in names and "VTS_01_1.mvob" in names and "VTS_01_VIDEO.mkv" in names
+            assert "VIDEO_TS.IFO" in names and "VTS_01_1.mvob" in names and "VTS_01_VIDEO.mp4" in names
+            assert "VTS_01_AUDIO_1.mp4" in names and not any(n.startswith(".") for n in names), names
             for info in zf.infolist():
                 assert info.compress_type == zipfile.ZIP_STORED, f"Expected ZIP_STORED (0), got {info.compress_type}"
         print("Single-file .tdvd (ZIP_STORED) packaging: OK")
@@ -231,7 +238,31 @@ def main():
         assert os.path.isdir(input_dir), "deleted a folder that isn't a temporary rip"
         print("Temporary rip deleted before packaging, other sources never: OK")
 
+    test_audio_streams()
+
     print("\nAll Transcoder integration tests passed successfully!")
+
+
+def test_audio_streams():
+    """Audio tracks follow the DVD's stream numbers, as the IFO declares them."""
+    with tempfile.TemporaryDirectory() as d:
+        ifo = os.path.join(d, "VTS_01_0.IFO")
+        data = bytearray(0x300)
+        # Title: 3 streams, AC-3, MPEG-1, LPCM; menu: 1 stream, AC-3
+        struct.pack_into(">H", data, 0x202, 3)
+        data[0x204] = 0 << 5
+        data[0x20C] = 2 << 5
+        data[0x214] = 4 << 5
+        struct.pack_into(">H", data, 0x102, 1)
+        with open(ifo, "wb") as f:
+            f.write(data)
+        assert transcoder.dvd_audio_stream_ids(d, "VTS_01_0.IFO", 0x202) == [0x80, 0x1C1, 0xA2]
+        assert transcoder.dvd_audio_stream_ids(d, "VTS_01_0.IFO", 0x102) == [0x80]
+        assert transcoder.dvd_audio_stream_ids(d, "VTS_09_0.IFO", 0x202) is None
+    # Declared order wins over the order found in the VOB; unreadable IFO: stream number order
+    assert transcoder.audio_track_ids([0x80, 0x81], [0x81, 0x80]) == [0x80, 0x81]
+    assert transcoder.audio_track_ids(None, [0x82, 0x80]) == [0x80, 0x82]
+    print("Audio tracks in DVD stream order: OK")
 
 
 if __name__ == "__main__":

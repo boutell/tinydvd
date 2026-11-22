@@ -17,8 +17,8 @@
 #include "dvd_vm_bridge.h"
 #include "spu_compositor.h"
 
-#define MENU_VIDEO "VTS_01_0_VIDEO.mkv"
-#define TITLE_VIDEO "VTS_01_VIDEO.mkv"
+#define MENU_VIDEO "VTS_01_0_VIDEO.mp4"
+#define TITLE_VIDEO "VTS_01_VIDEO.mp4"
 #define SEC 1000000000LL
 
 typedef struct {

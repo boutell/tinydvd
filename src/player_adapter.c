@@ -1,5 +1,12 @@
 #include "player_adapter.h"
 #include <string.h>
+#include <time.h>
+
+static uint64_t now_nanos(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 #define OP(a, name) ((a)->ops && (a)->ops->name)
 
@@ -15,6 +22,9 @@ static void reset_locked(player_adapter_t *a) {
     a->paused = false;
     a->ended = false;
     a->pts_nanos = 0;
+    a->buffering = false;
+    a->failed = false;
+    a->progress_nanos = 0;
 }
 
 void player_adapter_init(player_adapter_t *a, const player_adapter_ops_t *ops, void *ctx) {
@@ -46,7 +56,8 @@ static bool is_stale(uint64_t seq, uint64_t newest) {
  * Commands
  * ========================================================================= */
 
-int player_adapter_load_file(player_adapter_t *a, const char *video_path, const char *subfile_name, const char *audio_path) {
+int player_adapter_load_file(player_adapter_t *a, const char *video_path, const char *subfile_name,
+                             const char *const *audio_paths, int audio_count) {
     if (!a) return -1;
     int rc = 0;
     pthread_mutex_lock(&a->lock);
@@ -57,8 +68,11 @@ int player_adapter_load_file(player_adapter_t *a, const char *video_path, const 
     a->seek_pending = false;
     a->ended = false;
     a->pts_nanos = 0;
+    a->buffering = false;
+    a->failed = false;
+    a->progress_nanos = now_nanos();
     if (OP(a, load_file)) {
-        rc = a->ops->load_file(a->ctx, video_path, subfile_name, audio_path, seq);
+        rc = a->ops->load_file(a->ctx, video_path, subfile_name, audio_paths, audio_count, seq);
     }
     pthread_mutex_unlock(&a->lock);
     return rc;
@@ -72,6 +86,7 @@ void player_adapter_seek_exact(player_adapter_t *a, uint64_t pts_nanos, bool pau
     a->pts_nanos = pts_nanos;
     a->paused = paused;
     a->ended = false;
+    a->progress_nanos = now_nanos();
     if (a->file_loaded) {
         a->seek_pending = false;
         a->seek_in_flight = true;
@@ -146,8 +161,10 @@ bool     player_adapter_is_ended(player_adapter_t *a)       { LOCKED_GET(bool, a
 bool     player_adapter_is_file_loaded(player_adapter_t *a) { LOCKED_GET(bool, a->file_loaded) }
 bool     player_adapter_is_seek_in_flight(player_adapter_t *a) { LOCKED_GET(bool, a->seek_in_flight) }
 bool     player_adapter_is_ready(player_adapter_t *a) {
-    LOCKED_GET(bool, a->file_loaded && !a->seek_in_flight && !a->seek_pending)
+    LOCKED_GET(bool, a->file_loaded && !a->seek_in_flight && !a->seek_pending && !a->buffering)
 }
+bool     player_adapter_has_failed(player_adapter_t *a)     { LOCKED_GET(bool, a->failed) }
+uint64_t player_adapter_last_progress_nanos(player_adapter_t *a) { LOCKED_GET(uint64_t, a->progress_nanos) }
 uint64_t player_adapter_get_seq(player_adapter_t *a)        { LOCKED_GET(uint64_t, a->cmd_seq) }
 
 /* =========================================================================
@@ -159,6 +176,7 @@ void player_adapter_notify_file_loaded(player_adapter_t *a, uint64_t seq) {
     pthread_mutex_lock(&a->lock);
     if (!is_stale(seq, a->load_seq)) {
         a->file_loaded = true;
+        a->progress_nanos = now_nanos();
         if (a->seek_pending) {
             a->seek_pending = false;
             a->seek_in_flight = true;
@@ -175,6 +193,7 @@ void player_adapter_notify_seek_completed(player_adapter_t *a, uint64_t seq, int
     pthread_mutex_lock(&a->lock);
     if (!is_stale(seq, a->seek_seq) && a->file_loaded && !a->seek_pending) {
         a->seek_in_flight = false;
+        a->progress_nanos = now_nanos();
         if (pts_nanos >= 0) a->pts_nanos = (uint64_t)pts_nanos;
     }
     pthread_mutex_unlock(&a->lock);
@@ -204,5 +223,34 @@ void player_adapter_notify_ended(player_adapter_t *a, uint64_t seq) {
     if (!a) return;
     pthread_mutex_lock(&a->lock);
     if (settled_locked(a, seq)) a->ended = true;
+    pthread_mutex_unlock(&a->lock);
+}
+
+/* Reports about the file currently loading (not one replaced since) */
+static bool current_load_locked(player_adapter_t *a, uint64_t seq) {
+    return !is_stale(seq, a->load_seq);
+}
+
+void player_adapter_notify_progress(player_adapter_t *a, uint64_t seq) {
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    if (current_load_locked(a, seq)) a->progress_nanos = now_nanos();
+    pthread_mutex_unlock(&a->lock);
+}
+
+void player_adapter_notify_buffering(player_adapter_t *a, uint64_t seq, bool buffering) {
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    if (current_load_locked(a, seq)) {
+        if (buffering && !a->buffering) a->progress_nanos = now_nanos();
+        a->buffering = buffering;
+    }
+    pthread_mutex_unlock(&a->lock);
+}
+
+void player_adapter_notify_failed(player_adapter_t *a, uint64_t seq) {
+    if (!a) return;
+    pthread_mutex_lock(&a->lock);
+    if (current_load_locked(a, seq)) a->failed = true;
     pthread_mutex_unlock(&a->lock);
 }

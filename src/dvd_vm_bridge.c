@@ -100,7 +100,7 @@ struct dvd_vm_bridge {
     int          cell_nr;     /* 1-based index into current_pgc->cell_playback */
     int          enter_depth; /* Guard against recursive Pre-command loops */
 
-    /* Active domain compact .mvob index & companion MKV state */
+    /* Active domain compact .mvob index & companion video state */
     dvd_domain_t indexed_domain;
     int          indexed_vts;
     FILE        *domain_files[10];
@@ -111,7 +111,7 @@ struct dvd_vm_bridge {
     size_t       vobu_count;
     size_t       vobu_capacity;
 
-    char         loaded_mkv_path[1024];
+    char         loaded_video_path[1024];
     char         current_video_name[64];
     int64_t      expected_next_pts_nanos;
     _Atomic int64_t current_pts_nanos; /* read by other threads */
@@ -169,7 +169,9 @@ static bool fast_test_mode(void) {
 #define VM_TRACE(...) do { if (trace_enabled()) fprintf(stderr, "[trace] " __VA_ARGS__); } while (0)
 
 /* VOBU clock vs. player backend synchronization */
-#define PLAYER_NOT_READY_HOLD_LIMIT_NANOS 10000000000ULL /* max wait for a load/seek to complete */
+#define MAX_AUDIO_FILES 8 /* DVDs have at most 8 audio streams */
+#define PLAYER_NOT_READY_HOLD_LIMIT_NANOS 10000000000ULL /* max wait without any progress
+                                                          * for a load/seek/buffer to complete */
 #define PLAYER_LAG_TOLERANCE_NANOS         1000000000ULL /* player may trail the VOBU end by this much */
 #define PLAYER_LAG_GRACE_NANOS             5000000000ULL /* extra wait for a lagging player */
 
@@ -759,7 +761,7 @@ static vm_link_result_t vm_run_cmd_list(dvd_vm_bridge_t *b, const dvd_vm_cmd_t *
 }
 
 /* =========================================================================
- * Compact .mvob Domain Indexer & Companion MKV Loader
+ * Compact .mvob Domain Indexer & Companion Video Loader
  * ========================================================================= */
 
 static void close_domain_files(dvd_vm_bridge_t *b) {
@@ -807,13 +809,15 @@ static bool open_domain_subfile(dvd_vm_bridge_t *b, const char *filename) {
     return true;
 }
 
-static bool resolve_mkv_subfile(dvd_vm_bridge_t *b, const char *filename, char *out_buf, size_t out_len) {
+/* A video or audio file of the disc, as something the player can open: a
+ * path, or tdvd://offset:size:archive for a member of a .tdvd */
+static bool resolve_video_subfile(dvd_vm_bridge_t *b, const char *filename, char *out_buf, size_t out_len) {
     if (b && b->archive) {
-        uint64_t mkv_off = 0, mkv_sz = 0;
-        if (tdvd_archive_find(b->archive, filename, &mkv_off, &mkv_sz)) {
+        uint64_t off = 0, sz = 0;
+        if (tdvd_archive_find(b->archive, filename, &off, &sz)) {
             snprintf(out_buf, out_len, "tdvd://%llu:%llu:%s",
-                     (unsigned long long)mkv_off,
-                     (unsigned long long)mkv_sz,
+                     (unsigned long long)off,
+                     (unsigned long long)sz,
                      tdvd_archive_path(b->archive));
             return true;
         }
@@ -918,39 +922,54 @@ static void ensure_domain_indexed(dvd_vm_bridge_t *b) {
         }
     }
 
-    /* 3. Load the companion MKV into mpv if it differs from currently loaded MKV */
-    char mkv_name[64] = {0};
+    /* 3. Load the domain's video (NAME_VIDEO.mp4) and its audio files
+     * (NAME_AUDIO_1.mp4, ...) if they aren't the ones already loaded */
+    char base[48] = {0};
     if (b->domain == DVD_DOMAIN_VMGM) {
-        snprintf(mkv_name, sizeof(mkv_name), "VIDEO_TS_VIDEO.mkv");
+        snprintf(base, sizeof(base), "VIDEO_TS");
     } else if (b->domain == DVD_DOMAIN_VTSM) {
-        snprintf(mkv_name, sizeof(mkv_name), "VTS_%02d_0_VIDEO.mkv", b->vts_nr);
+        snprintf(base, sizeof(base), "VTS_%02d_0", b->vts_nr);
     } else if (b->domain == DVD_DOMAIN_VTSTT) {
-        snprintf(mkv_name, sizeof(mkv_name), "VTS_%02d_VIDEO.mkv", b->vts_nr);
+        snprintf(base, sizeof(base), "VTS_%02d", b->vts_nr);
+    }
+    if (!base[0]) return;
+
+    char video_name[64];
+    snprintf(video_name, sizeof(video_name), "%s_VIDEO.mp4", base);
+    char video_full[1024] = {0};
+    if (!resolve_video_subfile(b, video_name, video_full, sizeof(video_full))) return;
+    if (strcmp(b->loaded_video_path, video_full) == 0) return;
+
+    char audio_store[MAX_AUDIO_FILES][1024];
+    const char *audio_paths[MAX_AUDIO_FILES];
+    int audio_count = 0;
+    while (audio_count < MAX_AUDIO_FILES) {
+        char audio_name[64];
+        snprintf(audio_name, sizeof(audio_name), "%s_AUDIO_%d.mp4", base, audio_count + 1);
+        if (!resolve_video_subfile(b, audio_name, audio_store[audio_count], sizeof(audio_store[0]))) break;
+        audio_paths[audio_count] = audio_store[audio_count];
+        audio_count++;
     }
 
-    char mkv_full[1024] = {0};
-    if (mkv_name[0] && resolve_mkv_subfile(b, mkv_name, mkv_full, sizeof(mkv_full))) {
-        if (strcmp(b->loaded_mkv_path, mkv_full) != 0) {
-            strncpy(b->loaded_mkv_path, mkv_full, sizeof(b->loaded_mkv_path) - 1);
-            strncpy(b->current_video_name, mkv_name, sizeof(b->current_video_name) - 1);
-            b->expected_next_pts_nanos = -1;
-            if (b->player) {
-                fprintf(stderr, "[dvd_vm] Loading companion video: %s\n", mkv_full);
-                player_adapter_load_file(b->player, mkv_full, mkv_name, NULL);
-                if (b->domain == DVD_DOMAIN_VTSTT) {
-                    player_adapter_set_audio_track(b->player, (int)(b->sprm[1] & 0x0F) + 1);
-                }
-            }
-            if (b->event_cb) {
-                dvd_vm_event_t ev;
-                memset(&ev, 0, sizeof(ev));
-                ev.type = DVD_VM_EVENT_LOAD_VIDEO;
-                ev.video_name = b->current_video_name;
-                ev.pts_nanos = 0;
-                ev.paused = b->user_paused;
-                b->event_cb(b->event_user_data, &ev);
-            }
+    snprintf(b->loaded_video_path, sizeof(b->loaded_video_path), "%s", video_full);
+    snprintf(b->current_video_name, sizeof(b->current_video_name), "%s", video_name);
+    b->expected_next_pts_nanos = -1;
+    if (b->player) {
+        fprintf(stderr, "[dvd_vm] Loading %s (%d audio track%s)\n", video_name, audio_count,
+                audio_count == 1 ? "" : "s");
+        player_adapter_load_file(b->player, video_full, video_name, audio_paths, audio_count);
+        if (b->domain == DVD_DOMAIN_VTSTT) {
+            player_adapter_set_audio_track(b->player, (int)(b->sprm[1] & 0x0F) + 1);
         }
+    }
+    if (b->event_cb) {
+        dvd_vm_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type = DVD_VM_EVENT_LOAD_VIDEO;
+        ev.video_name = b->current_video_name;
+        ev.pts_nanos = 0;
+        ev.paused = b->user_paused;
+        b->event_cb(b->event_user_data, &ev);
     }
 }
 
@@ -1007,7 +1026,7 @@ static bool vm_enter_pgc_impl(dvd_vm_bridge_t *b, dvd_domain_t dom, int vts_nr, 
         player_adapter_on_state(b->player, b->domain, b->vts_nr, b->pgc_nr, b->cell_nr, b->sprm[7]);
     }
 
-    /* Execute PGC Pre-commands on PGC entry before indexing/loading MKV */
+    /* Execute PGC Pre-commands on PGC entry before indexing/loading the video */
     if (pgc->command_tbl && pgc->command_tbl->nr_of_pre > 0) {
         vm_link_result_t res = vm_run_cmd_list(b, pgc->command_tbl->pre_cmds, pgc->command_tbl->nr_of_pre);
         if (res == VM_LINK_PGC_CHANGED || res == VM_LINK_EXIT) {
@@ -1359,7 +1378,7 @@ static void vm_cycle_subtitles(dvd_vm_bridge_t *b) {
     int nr_subp = (vtsi && vtsi->vtsi_mat) ? vtsi->vtsi_mat->nr_of_vts_subp_streams : 0;
 
     if (nr_subp <= 0) {
-        /* Fallback for embedded EIA-608 / MKV closed captions when no DVD SPU streams exist */
+        /* Fallback for embedded EIA-608 closed captions when no DVD SPU streams exist */
         bool on = (b->sprm[2] & 0x0040) == 0;
         b->sprm[2] = on ? 0x0040 : 0x0000;
         if (b->player) {
@@ -1817,15 +1836,21 @@ static bool play_vobu_entry(dvd_vm_bridge_t *b, const mvob_vobu_entry_t *entry, 
             }
             /* Hold the VM clock while the backend is loading, seeking, buffering
              * or paused (e.g. browser autoplay blocked), so the navigation timeline
-             * does not run ahead of the picture. A load/seek that never completes
-             * only holds for a bounded time. Menus with buttons keep their own
+             * does not run ahead of the picture. On a slow connection loading can
+             * take a long time, so the hold lasts as long as the backend reports
+             * progress, and gives up only after a stretch with none, or at once if
+             * the backend can't load the file. Menus with buttons keep their own
              * timing because they are driven by user input. */
             if (!b->has_active_hli) {
                 bool not_ready = !player_adapter_is_ready(b->player);
                 bool paused = player_adapter_is_paused(b->player);
                 if (not_ready && hold_start == 0) hold_start = now;
                 if (!not_ready) hold_start = 0;
-                bool hold_expired = hold_start != 0 && (now - hold_start) >= PLAYER_NOT_READY_HOLD_LIMIT_NANOS;
+                uint64_t last_progress = player_adapter_last_progress_nanos(b->player);
+                uint64_t quiet_since = (last_progress > hold_start) ? last_progress : hold_start;
+                bool hold_expired = hold_start != 0 &&
+                    (player_adapter_has_failed(b->player) ||
+                     (now > quiet_since && now - quiet_since >= PLAYER_NOT_READY_HOLD_LIMIT_NANOS));
                 if ((not_ready && !hold_expired) || (paused && !not_ready)) {
                     if (wait_since == 0) wait_since = now;
                     if (!wait_logged && now - wait_since >= 3000000000ULL) {

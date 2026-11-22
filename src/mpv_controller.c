@@ -116,21 +116,35 @@ static void send_pause_internal(mpv_handle *mpv, bool paused) {
 
 /* ---- player_adapter ops (called with the adapter lock held) ---- */
 
-static int mpv_op_load_file(void *ctx, const char *video_path, const char *subfile_name, const char *audio_path, uint64_t seq) {
+static int mpv_op_load_file(void *ctx, const char *video_path, const char *subfile_name,
+                            const char *const *audio_paths, int audio_count, uint64_t seq) {
     (void)subfile_name;
     (void)seq;
     mpv_controller_t *ctrl = (mpv_controller_t *)ctx;
     if (!ctrl || !ctrl->mpv || !video_path) return -1;
 
+    /* Separate audio files (one per DVD audio stream) become audio tracks
+     * 1..N of the next file. Set (or cleared) before every load: the option
+     * applies to whichever file loads next, and requests run in order */
+    if (audio_count < 0) audio_count = 0;
+    if (audio_count > 32) audio_count = 32;
+    mpv_node items[32];
+    for (int i = 0; i < audio_count; i++) {
+        items[i].format = MPV_FORMAT_STRING;
+        items[i].u.string = (char *)audio_paths[i];
+    }
+    mpv_node_list list = { .num = audio_count, .values = items, .keys = NULL };
+    mpv_node node = { .format = MPV_FORMAT_NODE_ARRAY, .u.list = &list };
+    int err = mpv_set_property_async(ctrl->mpv, 0, "options/audio-files", MPV_FORMAT_NODE, &node);
+    if (err < 0) {
+        fprintf(stderr, "[mpv_controller] Couldn't set the audio files: %s\n", mpv_error_string(err));
+    }
+
     const char *args[] = {"loadfile", video_path, "replace", NULL};
-    int err = mpv_command_async(ctrl->mpv, 0, args);
+    err = mpv_command_async(ctrl->mpv, 0, args);
     if (err < 0) {
         fprintf(stderr, "[mpv_controller] Failed to queue loadfile %s: %s\n", video_path, mpv_error_string(err));
         return err;
-    }
-    if (audio_path && audio_path[0]) {
-        const char *audio_args[] = {"audio-add", audio_path, "cached", NULL};
-        mpv_command_async(ctrl->mpv, 0, audio_args);
     }
     return 0;
 }

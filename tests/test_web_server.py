@@ -48,16 +48,16 @@ from tinydvd_desktop_ui import (
     parse_png_sar,
 )
 from tinydvd_library import TinyDVDLibrary, disc_id_for_path
+import tinydvd_mp4
 from tinydvd_web_server import TinyDVDWebServer, compute_ws_accept_key
 
 TEST_PASSWORD = "correct horse battery staple"
-_TEST_CACHE_DIR = tempfile.mkdtemp(prefix="tinydvd_test_cache_")
 _login_cookies: dict[int, str] = {}
 
 
 def make_server(core: TinyDVDCore, target: str, **kwargs) -> TinyDVDWebServer:
     return TinyDVDWebServer(core, target, TEST_PASSWORD, bind_addr="127.0.0.1", listen=False,
-                            announce=False, cache_dir=_TEST_CACHE_DIR, **kwargs)
+                            announce=False, **kwargs)
 
 
 def login_cookie(server: TinyDVDWebServer) -> str:
@@ -236,7 +236,7 @@ def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None
 
         st416, _, _ = http_get(server, "/api/media/VTS_01_VIDEO.mp4", headers={"Range": "bytes=999999999-1000000999"})
         assert st416 == 416
-        print("  - HTTP 206 Range Streaming: OK (On-demand fast MP4 remux + byte range seek)")
+        print("  - HTTP 206 Range Streaming: OK (byte ranges served straight from the package)")
 
         # 6. Security: command injection & traversal rejection on /api/media/
         for bad_path in (
@@ -396,11 +396,115 @@ def test_library_waits_for_pick(core: TinyDVDCore, tdvd_path: str) -> None:
         shutil.rmtree(lib_dir, ignore_errors=True)
 
 
+def _playlist_lines(server, path):
+    st, hdrs, body = http_get(server, path)
+    assert st == 200, (path, st)
+    assert hdrs.get("content-type") == "application/vnd.apple.mpegurl"
+    lines = body.decode("ascii").splitlines()
+    assert lines[0] == "#EXTM3U"
+    return hdrs, lines
+
+
+def _check_segments(server, lines, expect_seconds):
+    """A media playlist's segments: back-to-back byte ranges of one packaged MP4, starting with moof."""
+    assert lines[-1] == "#EXT-X-ENDLIST" and "#EXT-X-PLAYLIST-TYPE:VOD" in lines
+    durations = [float(l[len("#EXTINF:"):].rstrip(",")) for l in lines if l.startswith("#EXTINF:")]
+    assert abs(sum(durations) - expect_seconds) < 0.5, sum(durations)
+    target = int(next(l for l in lines if l.startswith("#EXT-X-TARGETDURATION:")).split(":")[1])
+    assert all(d <= target + 0.5 for d in durations)
+    uri = next(l for l in lines if l and not l.startswith("#"))
+    ranges = [tuple(int(x) for x in l[len("#EXT-X-BYTERANGE:"):].split("@"))
+              for l in lines if l.startswith("#EXT-X-BYTERANGE:")]
+    for (len_a, start_a), (_, start_b) in zip(ranges, ranges[1:]):
+        assert start_a + len_a == start_b, (start_a, len_a, start_b)
+    length, start = ranges[0]
+    st, _, seg = http_get(server, f"/api/media/{uri}", headers={"Range": f"bytes={start}-{start + length - 1}"})
+    assert st == 206 and len(seg) == length and seg[4:8] == b"moof", (st, seg[:8])
+    init = next(l for l in lines if l.startswith("#EXT-X-MAP:"))
+    init_len = int(init.split('BYTERANGE="')[1].split("@")[0])
+    st, _, head = http_get(server, f"/api/media/{uri}", headers={"Range": f"bytes=0-{init_len - 1}"})
+    assert st == 206 and head[4:8] == b"ftyp" and b"moov" in head
+    return len(durations)
+
+
+def test_hls_streaming(core: TinyDVDCore, tdvd_path: str) -> None:
+    print("Testing HLS streaming straight from the package...")
+    server = make_server(core, tdvd_path)
+    try:
+        st, _, body = http_get(server, "/api/library")
+        disc = json.loads(body)["items"][0]["id"]
+
+        # video_load messages point the browser at a playlist
+        sock, tid = ws_connect(server, "/ws?session=hls_viewer")
+        loads = [m for m in ws_read_messages(sock, 1.5) if m.get("type") == "video_load"]
+        sock.close()
+        tid.join(timeout=5.0)
+        assert loads and all(m["src"].startswith("/api/media/") and ".m3u8?disc=" in m["src"]
+                             for m in loads), loads
+        print("  - video_load points at an HLS playlist: OK")
+
+        # The title's master playlist: the video, and both audio tracks
+        _, lines = _playlist_lines(server, f"/api/media/VTS_01_VIDEO.m3u8?disc={disc}")
+        media = [l for l in lines if l.startswith("#EXT-X-MEDIA:TYPE=AUDIO")]
+        assert len(media) == 2, media
+        assert 'NAME="Audio 1",DEFAULT=YES' in media[0] and 'NAME="Audio 2",DEFAULT=NO' in media[1]
+        assert 'URI="VTS_01_AUDIO_1.m3u8?disc=' in media[0] and 'URI="VTS_01_AUDIO_2.m3u8?disc=' in media[1]
+        stream = next(l for l in lines if l.startswith("#EXT-X-STREAM-INF:"))
+        assert 'CODECS="avc1.' in stream and "mp4a.40.2" in stream and 'AUDIO="audio"' in stream
+        video_uri = lines[lines.index(stream) + 1]
+        assert video_uri.startswith("VTS_01_VIDEO.m3u8?disc=") and video_uri.endswith("&part=video")
+        print("  - Master playlist: OK (video + 2 audio tracks)")
+
+        _, lines = _playlist_lines(server, f"/api/media/{video_uri}")
+        n = _check_segments(server, lines, 20.0)
+        for track in (1, 2):
+            _, lines = _playlist_lines(server, f"/api/media/VTS_01_AUDIO_{track}.m3u8?disc={disc}")
+            _check_segments(server, lines, 20.0)
+        print(f"  - Video and audio segments are byte ranges of the packaged MP4s: OK ({n} video segments)")
+
+        # A menu: one audio track
+        _, lines = _playlist_lines(server, f"/api/media/VTS_01_0_VIDEO.m3u8?disc={disc}")
+        assert len([l for l in lines if l.startswith("#EXT-X-MEDIA:TYPE=AUDIO")]) == 1
+
+        for bad in ("VTS_01_VIDEO.txt", "VTS_01_EXTRA.mp4", "VTS_09_VIDEO.m3u8", "..%2FVTS_01_VIDEO.mp4"):
+            st, _, _ = http_get(server, f"/api/media/{bad}?disc={disc}")
+            assert st in (400, 404), (bad, st)
+        print("  - Menus, missing videos and bad names: OK")
+    finally:
+        server.stop()
+
+
+def test_mp4_reader_errors() -> None:
+    print("Testing the MP4 reader on files it can't stream...")
+    d = tempfile.mkdtemp(prefix="tinydvd_test_mp4_")
+    try:
+        path = os.path.join(d, "plain.mp4")
+        with open(path, "wb") as f:
+            f.write(struct.pack(">I4s", 16, b"ftyp") + b"isom\0\0\0\0")
+            f.write(struct.pack(">I4s", 8, b"moov"))
+            f.write(struct.pack(">I4s", 12, b"mdat") + b"data")
+        for content in (None, struct.pack(">I4s", 4, b"junk")):
+            if content is not None:
+                with open(path, "wb") as f:
+                    f.write(content)
+            try:
+                tinydvd_mp4.read_mp4(path)
+                raise AssertionError("expected an error for an MP4 without a usable index")
+            except ValueError:
+                pass
+        assert tinydvd_mp4.audio_member_name("VTS_04_VIDEO.mp4", 2) == "VTS_04_AUDIO_2.mp4"
+        assert tinydvd_mp4.audio_member_names("VIDEO_TS_VIDEO.mp4",
+                                              ["video_ts_audio_1.mp4", "VIDEO_TS_AUDIO_3.mp4"]) == ["video_ts_audio_1.mp4"]
+        print("  - Refuses MP4s without a usable index; audio file names: OK")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def create_dummy_converted_dir(directory: str, meta_dict: dict) -> None:
     files = {
         "VIDEO_TS.IFO": b"DVDVIDEO-VMG\x00",
         "VIDEO_TS.mvob": b"MVOB0001\x00",
-        "VIDEO_TS_VIDEO.mkv": b"\x1A\x45\xDF\xA3",
+        "VIDEO_TS_VIDEO.mp4": b"\x00\x00\x00\x08ftyp",
         "thumbnail.png": b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00",
         "metadata.json": json.dumps(meta_dict).encode("utf-8"),
     }
@@ -665,6 +769,15 @@ def test_auth_and_request_rules(core: TinyDVDCore, tdvd_path: str) -> None:
         assert st == 303 and hdrs.get("location") == "/login"
         st, _, body = http_get(server, "/login", auth=False)
         assert st == 200 and b'type="password"' in body
+        # "Add to Home Screen" files come without the login cookie
+        st, hdrs, body = http_get(server, "/manifest.webmanifest", auth=False)
+        assert st == 200 and hdrs.get("content-type") == "application/manifest+json"
+        assert json.loads(body)["display"] == "fullscreen"
+        for icon in ("/apple-touch-icon.png", "/icon-192.png", "/icon-512.png"):
+            st, hdrs, body = http_get(server, icon, auth=False)
+            assert st == 200 and body[:4] == b"\x89PNG", icon
+        st, _, _ = http_get(server, "/vendor/hls.min.js", auth=False)
+        assert st == 401  # everything else still needs the login
         st, _, _ = http_get(server, "/api/library", auth=False, headers={"Cookie": "tinydvd_auth=1.2.3"})
         assert st == 401
         st, _, _ = http_get(server, "/login", method="POST", auth=False, body=b"password=wrong",
@@ -709,9 +822,10 @@ def main() -> int:
     test_http_and_websocket_endpoints(core, tdvd)
     test_library_directory_filtering_and_sse(core, tdvd)
     test_library_waits_for_pick(core, tdvd)
+    test_hls_streaming(core, tdvd)
+    test_mp4_reader_errors()
     test_import_dvd_workflow(core)
     test_duplicate_dvd_import_disambiguation(core)
-    shutil.rmtree(_TEST_CACHE_DIR, ignore_errors=True)
     print("All Web Server tests completed successfully!")
     return 0
 

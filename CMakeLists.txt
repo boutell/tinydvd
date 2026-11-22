@@ -171,6 +171,11 @@ target_include_directories(test_dvd_vm PRIVATE src ${MPV_INCLUDE_DIRS} ${OPENGL_
 target_link_libraries(test_dvd_vm PRIVATE ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
 target_link_directories(test_dvd_vm PRIVATE ${MPV_LIBRARY_DIRS})
 
+add_executable(test_mpv tests/test_mpv_playback.c src/player_adapter.c src/dvd_ifo.c src/dvd_vm_bridge.c src/tdvd_archive.c src/mvob_parser.c src/spu_compositor.c src/spu_png.c src/mpv_controller.c)
+target_include_directories(test_mpv PRIVATE src ${MPV_INCLUDE_DIRS} ${OPENGL_INCLUDE_DIRS})
+target_link_libraries(test_mpv PRIVATE ${MPV_LIBRARIES} ${OPENGL_LIBRARIES} Threads::Threads ZLIB::ZLIB)
+target_link_directories(test_mpv PRIVATE ${MPV_LIBRARY_DIRS})
+
 add_executable(test_web tests/test_web_server.c)
 add_dependencies(test_web tinydvd_core)
 target_compile_definitions(test_web PRIVATE
@@ -182,7 +187,7 @@ target_compile_definitions(test_web PRIVATE
 target_compile_options(test_web PRIVATE -Wall -Wextra)
 
 # The C tests check with assert(), which a Release build would compile out
-foreach(_test test_mvob test_spu test_dvd_vm test_web)
+foreach(_test test_mvob test_spu test_dvd_vm test_mpv test_web)
     target_compile_options(${_test} PRIVATE -UNDEBUG)
 endforeach()
 
@@ -193,10 +198,12 @@ enable_testing()
 add_test(NAME mvob_parser COMMAND test_mvob)
 add_test(NAME spu_compositor COMMAND test_spu)
 add_test(NAME dvd_vm COMMAND test_dvd_vm WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+add_test(NAME mpv_playback COMMAND test_mpv WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME web_server COMMAND test_web WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME archive_helpers COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_archive.py)
 add_test(NAME transcoder COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_transcode.py)
-set_tests_properties(mvob_parser spu_compositor dvd_vm web_server archive_helpers transcoder
+add_test(NAME av_sync COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_av_sync.py)
+set_tests_properties(mvob_parser spu_compositor dvd_vm mpv_playback web_server archive_helpers transcoder av_sync
                      PROPERTIES TIMEOUT 300)
 
 # Installing is done by ./install, which also sets up the Python runtime and

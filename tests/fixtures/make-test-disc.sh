@@ -8,8 +8,11 @@
 #   First play  -> jumps to title 1
 #   Root menu   -> two buttons side by side: "Play" (title 1) and
 #                  "Chapter 2" (title 1, chapter 2)
-#   Title 1     -> 20 s test pattern (silent), chapters at 0, 7 and 14 s,
-#                  one subtitle track, returns to the root menu at the end
+#   Title 1     -> 20 s test pattern, chapters at 0, 7 and 14 s, two audio
+#                  tracks, one subtitle track, returns to the root menu at
+#                  the end. For checking audio/video sync, at 3.003 s (frame
+#                  90) the picture flashes white for 3 frames while track 1
+#                  beeps at 1 kHz and track 2 at 500 Hz; otherwise silent
 #
 # Needs ffmpeg and dvdauthor (which includes spumux):
 #   macOS: brew install ffmpeg dvdauthor
@@ -66,10 +69,16 @@ cat > menu.xml <<'EOF'
 EOF
 spumux -m dvd menu.xml < menu_bg.mpg > menu.mpg 2>/dev/null
 
-# --- Title 1: 30 s test pattern and tone, with a subtitle track
-ff -f lavfi -i "testsrc=s=720x480:r=30000/1001:d=20" \
-   -f lavfi -i "anullsrc=r=48000:cl=stereo" -t 20 \
+# --- Title 1: 20 s test pattern, two audio tracks, a subtitle track, and
+# a flash with beeps at the same moment
+FLASH="between(t,3.003,3.103)"
+ff -f lavfi -i "testsrc=s=720x480:r=30000/1001:d=20,drawbox=c=white:t=fill:enable='${FLASH}'" \
+   -f lavfi -i "aevalsrc='if(${FLASH},0.5*sin(2*PI*1000*t),0)':s=48000:c=stereo:d=20" \
+   -f lavfi -i "aevalsrc='if(${FLASH},0.5*sin(2*PI*500*t),0)':s=48000:c=stereo:d=20" \
+   -map 0:v -map 1:a -map 2:a -t 20 \
    -target ntsc-dvd -b:v 1500k -aspect 4:3 -ac 2 title_av.mpg
+# (Being under 5 MB, the converter encodes this title segment by segment, as
+# it does menus; the two audio tracks check that path keeps every stream)
 overlay_png sub1.png "x=200:y=400:w=320:h=40:c=white:t=fill"
 overlay_png sub2.png "x=200:y=400:w=320:h=40:c=white:t=fill" "x=210:y=410:w=300:h=20:c=black:t=fill"
 cat > subs.xml <<'EOF'
@@ -105,6 +114,8 @@ cat > dvd.xml <<'EOF'
     </menus>
     <titles>
       <video format="ntsc" aspect="4:3"/>
+      <audio lang="en"/>
+      <audio lang="fr"/>
       <subpicture lang="en"/>
       <pgc>
         <vob file="title.mpg" chapters="0,0:07,0:14"/>

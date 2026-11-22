@@ -46,7 +46,10 @@ typedef struct dvd_vm_highlight_info {
 } dvd_vm_highlight_info_t;
 
 typedef struct player_adapter_ops {
-    int  (*load_file)(void *ctx, const char *video_path, const char *subfile_name, const char *audio_path, uint64_t seq);
+    /* audio_paths: audio_count separate audio files to play with the video
+     * (tracks 1..audio_count), or none when the video file has its own */
+    int  (*load_file)(void *ctx, const char *video_path, const char *subfile_name,
+                      const char *const *audio_paths, int audio_count, uint64_t seq);
     void (*seek_exact)(void *ctx, uint64_t pts_nanos, bool paused, uint64_t seq);
     void (*set_paused)(void *ctx, bool paused);
     void (*set_audio_track)(void *ctx, int aid);
@@ -72,6 +75,10 @@ typedef struct player_adapter {
     bool     paused;           /* last pause state requested or reported */
     bool     ended;            /* backend reached end of the current file */
     uint64_t pts_nanos;        /* best-known playback position */
+    bool     buffering;        /* backend ran out of data mid-playback */
+    bool     failed;           /* backend couldn't load the current file */
+    uint64_t progress_nanos;   /* monotonic time of the last sign of progress
+                                * (command, load/seek report, data arriving) */
 } player_adapter_t;
 
 void player_adapter_init(player_adapter_t *adapter, const player_adapter_ops_t *ops, void *ctx);
@@ -81,7 +88,8 @@ void player_adapter_destroy(player_adapter_t *adapter);
 void player_adapter_reset(player_adapter_t *adapter);
 
 /* Commands (invoked by dvd_vm_bridge) */
-int  player_adapter_load_file(player_adapter_t *adapter, const char *video_path, const char *subfile_name, const char *audio_path);
+int  player_adapter_load_file(player_adapter_t *adapter, const char *video_path, const char *subfile_name,
+                              const char *const *audio_paths, int audio_count);
 void player_adapter_seek_exact(player_adapter_t *adapter, uint64_t pts_nanos, bool paused);
 void player_adapter_set_paused(player_adapter_t *adapter, bool paused);
 void player_adapter_set_audio_track(player_adapter_t *adapter, int aid);
@@ -96,8 +104,13 @@ bool     player_adapter_is_paused(player_adapter_t *adapter);
 bool     player_adapter_is_ended(player_adapter_t *adapter);
 bool     player_adapter_is_file_loaded(player_adapter_t *adapter);
 bool     player_adapter_is_seek_in_flight(player_adapter_t *adapter);
-/* File loaded and no seek pending or in flight */
+/* File loaded, no seek pending or in flight, and not buffering */
 bool     player_adapter_is_ready(player_adapter_t *adapter);
+/* The backend reported it can't load the current file */
+bool     player_adapter_has_failed(player_adapter_t *adapter);
+/* Monotonic (CLOCK_MONOTONIC) time of the last sign of progress. While the
+ * player isn't ready, a recent value means it's still loading, not stuck */
+uint64_t player_adapter_last_progress_nanos(player_adapter_t *adapter);
 uint64_t player_adapter_get_seq(player_adapter_t *adapter);
 
 /* Backend notifications (seq 0 = backend cannot track seq; always accepted) */
@@ -106,6 +119,12 @@ void player_adapter_notify_seek_completed(player_adapter_t *adapter, uint64_t se
 void player_adapter_notify_time_pos(player_adapter_t *adapter, uint64_t seq, int64_t pts_nanos);
 void player_adapter_notify_paused(player_adapter_t *adapter, bool paused);
 void player_adapter_notify_ended(player_adapter_t *adapter, uint64_t seq);
+/* Data for the current file is still arriving (web: download progress) */
+void player_adapter_notify_progress(player_adapter_t *adapter, uint64_t seq);
+/* Playback stalled waiting for data, or resumed */
+void player_adapter_notify_buffering(player_adapter_t *adapter, uint64_t seq, bool buffering);
+/* The current file can't be played */
+void player_adapter_notify_failed(player_adapter_t *adapter, uint64_t seq);
 
 #ifdef __cplusplus
 }

@@ -28,14 +28,14 @@ import secrets
 import select
 import socket
 import struct
-import subprocess
-import sys
 import threading
 import time
 import urllib.parse
 import uuid
 
 from tinydvd_core import TDVD_VM_JSON_CB, TinyDVDCore
+import tinydvd_archive
+import tinydvd_mp4
 from tinydvd_library import TinyDVDLibrary, disc_id_for_path, sanitize_id
 
 
@@ -45,17 +45,21 @@ SESSION_TIMEOUT_SEC = 180
 MAX_SESSIONS = 32
 MAX_REQUEST_BODY = 64 * 1024
 WS_SEND_TIMEOUT_SEC = 2
-VALID_MEDIA_BASE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# A disc's video and audio files: NAME_VIDEO.mp4, NAME_AUDIO_1.mp4, ...
+MEDIA_NAME_RE = re.compile(r"^[A-Za-z0-9_]+_(?:VIDEO|AUDIO_[0-9]+)\.mp4$")
 
 AUTH_COOKIE = "tinydvd_auth"
 AUTH_LIFETIME_SEC = 30 * 24 * 3600
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SEC = 60
 
-REMUX_CONCURRENCY = 2
-DEFAULT_CACHE_MAX_BYTES = 20 * 1024 * 1024 * 1024
-
 HTML_ROUTES = ("/", "/index.html")
+
+CLIENT_LOG_LIMIT = 50
+
+# Every video streams as HLS, in segments of about this long: see
+# TinyDVDWebServer.playlist
+HLS_SEGMENT_SECONDS = 4.0
 
 
 def load_web_index_html() -> bytes:
@@ -66,6 +70,39 @@ def load_web_index_html() -> bytes:
 
 
 INDEX_HTML_BYTES = load_web_index_html()
+
+
+def load_vendor_file(name: str) -> bytes:
+    """A third-party file the web player uses, from web/vendor/ (b"" if missing)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", "vendor", name)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+HLS_JS_BYTES = load_vendor_file("hls.min.js")
+
+
+def load_web_file(name: str) -> bytes:
+    """A file from web/ (b"" if missing)."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "web", name)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return b""
+
+
+# For "Add to Home Screen". Phones fetch these without the login cookie, so
+# they're served without a login; they hold nothing private
+PUBLIC_FILES = {
+    "/manifest.webmanifest": ("application/manifest+json", load_web_file("manifest.webmanifest")),
+    "/apple-touch-icon.png": ("image/png", load_web_file("apple-touch-icon.png")),
+    "/icon-192.png": ("image/png", load_web_file("icon-192.png")),
+    "/icon-512.png": ("image/png", load_web_file("icon-512.png")),
+}
 
 LOGIN_PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -99,15 +136,6 @@ LOGIN_PAGE_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>
 """
-
-
-def default_cache_dir() -> str:
-    """Per-user cache folder for remuxed MP4s."""
-    if sys.platform == "darwin":
-        base = os.path.expanduser("~/Library/Caches")
-    else:
-        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(base, "tinydvd", "web-remux")
 
 
 class WebAuth:
@@ -249,6 +277,8 @@ class WebSession:
         self.cached_pause: str | None = None
         self.cached_highlight: str | None = None
         self.cached_domain_state: str | None = None
+        self.cached_audio_track: str | None = None
+        self.client_log_count = 0
 
         self._cb_ref = TDVD_VM_JSON_CB(self._on_vm_json)
         self.vm_handle = None
@@ -288,6 +318,8 @@ class WebSession:
                 self.cached_highlight = msg
             elif mtype == "domain_state":
                 self.cached_domain_state = msg
+            elif mtype == "audio_track":
+                self.cached_audio_track = msg
 
         self.broadcast(msg)
 
@@ -320,6 +352,7 @@ class WebSession:
                 self.cached_pause,
                 self.cached_highlight,
                 self.cached_domain_state,
+                self.cached_audio_track,
             ):
                 if m:
                     replay.append(m)
@@ -359,6 +392,7 @@ class WebSession:
                 self.cached_pause = None
                 self.cached_highlight = None
                 self.cached_domain_state = None
+                self.cached_audio_track = None
             if not self.vm_handle:
                 # First movie picked in this session
                 self.vm_handle = self._create_vm(disc_path, disc_id)
@@ -379,19 +413,29 @@ class WebSession:
         if not isinstance(obj, dict):
             return
 
+        mtype = obj.get("type")
+        if mtype == "client_log" and isinstance(obj.get("text"), str):
+            # A problem the browser reports: printable characters only, and at
+            # most CLIENT_LOG_LIMIT lines per session
+            self.client_log_count += 1
+            if self.client_log_count <= CLIENT_LOG_LIMIT:
+                text = "".join(ch for ch in obj["text"][:200] if ch.isprintable())
+                print(f"[web_server] Browser ({self.session_id}): {text}", flush=True)
+            return
+
         with self.lock:
             vm = self.vm_handle
         if not vm:
             return
 
-        mtype = obj.get("type")
         if mtype == "key" and isinstance(obj.get("key"), str):
             self.core.lib.tdvd_vm_session_dispatch_action(vm, obj["key"].encode("utf-8"), 0, 0)
         elif mtype in ("mouse_move", "mouse_click"):
             x = _as_int(obj.get("x"))
             y = _as_int(obj.get("y"))
             self.core.lib.tdvd_vm_session_dispatch_action(vm, mtype.encode("ascii"), x, y)
-        elif mtype in ("file_loaded", "seek_completed", "time_update", "client_playback", "video_ended"):
+        elif mtype in ("file_loaded", "seek_completed", "time_update", "client_playback", "video_ended",
+                       "loading", "buffering", "video_error"):
             seq = max(0, _as_int(obj.get("seq")))
             pts_ns = -1
             try:
@@ -400,7 +444,9 @@ class WebSession:
             except (TypeError, ValueError, OverflowError):
                 pts_ns = -1
             paused = -1
-            if mtype == "client_playback":
+            if mtype == "buffering":
+                paused = 1 if obj.get("buffering") else 0  # carries the buffering flag
+            elif mtype == "client_playback":
                 if obj.get("state") == "paused":
                     paused = 1
                 elif obj.get("state") == "playing":
@@ -552,6 +598,11 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path or "/"
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
 
+        if method == "GET" and path in PUBLIC_FILES and PUBLIC_FILES[path][1]:
+            content_type, data = PUBLIC_FILES[path]
+            self._send_bytes(200, "OK", content_type, data, extra_headers={"Cache-Control": "public, max-age=86400"})
+            return
+
         if path == "/login":
             if method == "POST":
                 self._handle_login(app, body)
@@ -593,6 +644,10 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                 self._get_thumbnail(app, path, qs)
             elif path.startswith("/api/media/"):
                 self._get_media(app, path, qs)
+            elif path == "/vendor/hls.min.js" and HLS_JS_BYTES:
+                # The page asks for it with ?v=<version>, so it can be cached for good
+                self._send_bytes(200, "OK", "text/javascript; charset=utf-8", HLS_JS_BYTES,
+                                 extra_headers={"Cache-Control": "private, max-age=31536000, immutable"})
             else:
                 self._send_error_text(404, "Not Found")
             return
@@ -725,21 +780,34 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
             self._send_error_text(404, "Thumbnail Not Found")
 
     def _get_media(self, app: "TinyDVDWebServer", path: str, qs: dict) -> None:
-        base_name = os.path.splitext(path[len("/api/media/"):])[0]
-        if not VALID_MEDIA_BASE_RE.fullmatch(base_name):
+        """/api/media/NAME.m3u8 (HLS playlists) and /api/media/NAME.mp4 (their byte ranges)."""
+        base_name, ext = os.path.splitext(path[len("/api/media/"):])
+        if not MEDIA_NAME_RE.fullmatch(base_name + ".mp4") or ext not in (".mp4", ".m3u8"):
             self._send_error_text(400, "Invalid Media Name")
             return
-        mp4_path = app.ensure_remuxed_mp4(sanitize_id(qs.get("disc", [""])[0]), base_name)
-        if not mp4_path:
+        disc_id = sanitize_id(qs.get("disc", [""])[0])
+        if ext == ".m3u8":
+            body = app.playlist(disc_id, base_name, qs.get("part", [""])[0])
+            if not body:
+                self._send_error_text(404, "Media Stream Not Found")
+                return
+            self._send_bytes(200, "OK", "application/vnd.apple.mpegurl", body,
+                             extra_headers={"Cache-Control": "no-cache"})
+            return
+        loc = app.locate_media(disc_id, base_name + ext)
+        if not loc:
             self._send_error_text(404, "Media Stream Not Found")
             return
-        self._serve_range_file(mp4_path, self.headers.get("Range"))
+        self._serve_range_file(loc.path, self.headers.get("Range"), loc.offset, loc.size)
 
-    def _serve_range_file(self, file_path: str, range_header: str | None) -> None:
-        try:
-            total = os.path.getsize(file_path)
-        except OSError:
-            total = 0
+    def _serve_range_file(self, file_path: str, range_header: str | None,
+                          base: int = 0, total: int | None = None) -> None:
+        """Serve file_path[base:base+total] (the whole file by default), honouring a Range header."""
+        if total is None:
+            try:
+                total = os.path.getsize(file_path) - base
+            except OSError:
+                total = 0
         if total <= 0:
             self._send_error_text(404, "Not Found")
             return
@@ -791,7 +859,7 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
-                f.seek(start)
+                f.seek(base + start)
                 rem = content_length
                 while rem > 0:
                     chunk = f.read(min(CHUNK_SIZE, rem))
@@ -953,8 +1021,6 @@ class TinyDVDWebServer:
         announce: bool = True,
         listen: bool = True,
         allow_import: bool = False,
-        cache_dir: str | None = None,
-        cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
     ):
         self.core = core
         self.auth = WebAuth(password)
@@ -963,16 +1029,11 @@ class TinyDVDWebServer:
         self.bind_addr = bind_addr or "127.0.0.1"
         self.port = 8080 if port is None else int(port)
 
-        self.cache_dir = cache_dir or default_cache_dir()
-        self.cache_max_bytes = int(cache_max_bytes)
-        os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
-
         self.sessions_lock = threading.Lock()
         self.sessions: dict[str, WebSession] = {}
 
-        self.remux_locks_guard = threading.Lock()
-        self.remux_locks: dict[str, threading.Lock] = {}
-        self.remux_slots = threading.BoundedSemaphore(REMUX_CONCURRENCY)
+        self.mp4_info: dict[tuple, dict] = {}
+        self.playlist_lock = threading.Lock()
 
         self.sse_lock = threading.Lock()
         self.sse_clients: set[socket.socket] = set()
@@ -1004,6 +1065,7 @@ class TinyDVDWebServer:
             print("\n=======================================================")
             print("  TinyDVD Web Player")
             print(f"  URL: http://{host}:{self.port}")
+            print(f"  {'Folder' if is_dir else 'Disc'}: {self.library.target_path}")
             print(f"  Mode: {'Library' if is_dir else 'Single disc'} ({cnt} movie{'' if cnt == 1 else 's'})")
             print(f"  Web import: {'on' if self.allow_import else 'off (start with --allow-web-import to turn on)'}")
             print("=======================================================\n", flush=True)
@@ -1070,113 +1132,69 @@ class TinyDVDWebServer:
         victim.destroy()
         return True
 
-    def ensure_remuxed_mp4(self, disc_id: str, base_name: str) -> str | None:
-        """
-        An MP4 copy of one of the disc's MKV videos, for browsers. Remuxed
-        once (no re-encoding) into the per-user cache, keyed by the source
-        file's identity, so a re-converted disc never serves a stale copy.
-        """
-        if not VALID_MEDIA_BASE_RE.fullmatch(base_name):
-            return None
-
+    def _disc_path(self, disc_id: str) -> str:
         item = self.library.find_by_id(disc_id)
         if item:
-            dpath = item.path
-        else:
-            is_dir, items, raw_target = self.library.get_snapshot()
-            dpath = items[0].path if items else (raw_target if not is_dir else "")
+            return item.path
+        is_dir, items, raw_target = self.library.get_snapshot()
+        return items[0].path if items else (raw_target if not is_dir else "")
 
-        loc = self.library.locate_video(dpath, f"{base_name}.mkv")
-        if not loc:
+    def locate_media(self, disc_id: str, name: str):
+        """Where one of a disc's video or audio files is (a file, or a slice of a .tdvd)."""
+        if not MEDIA_NAME_RE.fullmatch(name):
             return None
+        loc = self.library.locate_video(self._disc_path(disc_id), name)
+        # Packages are stored uncompressed, so every member is a byte range
+        return loc if loc and loc.kind in ("file", "slice") else None
+
+    def _media_info(self, loc) -> dict:
+        """read_mp4 for a located file, remembered while the file is unchanged."""
+        st = os.stat(loc.path)
+        key = (os.path.realpath(loc.path), loc.offset, loc.size, st.st_mtime_ns)
+        with self.playlist_lock:
+            hit = self.mp4_info.get(key)
+        if hit:
+            return hit
+        info = tinydvd_mp4.read_mp4(loc.path, loc.offset, loc.size)
+        with self.playlist_lock:
+            self.mp4_info[key] = info
+            while len(self.mp4_info) > 256:
+                self.mp4_info.pop(next(iter(self.mp4_info)))
+        return info
+
+    def playlist(self, disc_id: str, name: str, part: str = "") -> bytes | None:
+        """
+        An HLS playlist for one of a disc's videos.
+
+        name is a video's base name: NAME_VIDEO gives the master playlist (the
+        video, with each audio file as an audio track), and with part="video"
+        the video's own segment list; NAME_AUDIO_n gives that track's. The
+        segments are byte ranges of the packaged MP4s, served as they are.
+        """
+        quoted = urllib.parse.quote(disc_id)
         try:
-            st = os.stat(loc.path)
-        except OSError:
-            return None
-        fingerprint = hashlib.blake2b(
-            f"{os.path.abspath(loc.path)}\0{loc.member}\0{loc.offset}\0{loc.size}\0{st.st_size}\0{st.st_mtime_ns}".encode(
-                "utf-8", errors="surrogateescape"),
-            digest_size=8,
-        ).hexdigest()
-        out_path = os.path.join(self.cache_dir, f"{base_name}-{fingerprint}.mp4")
-
-        with self.remux_locks_guard:
-            rlock = self.remux_locks.setdefault(out_path, threading.Lock())
-
-        with rlock:
-            try:
-                if os.path.getsize(out_path) > 0:
-                    os.utime(out_path)  # most recently used, for eviction
-                    return out_path
-            except OSError:
-                pass
-
-            with self.remux_slots:
-                if not self._remux(loc, out_path):
+            if name.endswith("_VIDEO") and part != "video":
+                video = self.locate_media(disc_id, f"{name}.mp4")
+                if not video:
                     return None
-            self._evict_cache(keep=out_path)
-            return out_path
-
-    def _remux(self, loc, out_path: str) -> bool:
-        tmp_path = f"{out_path}.tmp.{threading.get_ident()}"
-        print(f"[web_server] Remuxing {os.path.basename(out_path)}...", flush=True)
-        url = loc.ffmpeg_input()
-        cmd = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-i", url or "pipe:0",
-               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp_path]
-        try:
-            if url:
-                subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, check=False)
-            else:
-                # Compressed archive entry: decompress and pipe it in
-                cmd.remove("-nostdin")
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL)
-                try:
-                    loc.copy_to(proc.stdin)
-                except OSError:
-                    pass
-                finally:
-                    try:
-                        proc.stdin.close()
-                    except OSError:
-                        pass
-                proc.wait()
-            if os.path.isfile(tmp_path) and os.path.getsize(tmp_path) > 0:
-                os.replace(tmp_path, out_path)
-                print(f"[web_server] Remux complete ({os.path.getsize(out_path)} bytes)", flush=True)
-                return True
-            return False
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-
-    def _evict_cache(self, keep: str) -> None:
-        """Delete the least recently used remuxes until the cache fits its size limit."""
-        entries = []
-        try:
-            with os.scandir(self.cache_dir) as it:
-                for e in it:
-                    if e.name.endswith(".mp4") and e.is_file():
-                        st = e.stat()
-                        entries.append((st.st_mtime, st.st_size, e.path))
-        except OSError:
-            return
-        total = sum(size for _, size, _ in entries)
-        for _, size, path in sorted(entries):
-            if total <= self.cache_max_bytes:
-                break
-            if path == keep:
-                continue
-            try:
-                os.unlink(path)  # open readers keep their copy until they finish
-                total -= size
-            except OSError:
-                pass
+                info = self._media_info(video)
+                members = tinydvd_archive.list_members(self._disc_path(disc_id))
+                audio = []
+                for i, audio_name in enumerate(tinydvd_mp4.audio_member_names(f"{name}.mp4", members)):
+                    base = os.path.splitext(audio_name)[0]
+                    audio.append((f"{base}.m3u8?disc={quoted}", f"Audio {i + 1}", members[audio_name]))
+                body = tinydvd_mp4.build_master_playlist(f"{name}.m3u8?disc={quoted}&part=video",
+                                                         info, video.size, audio)
+                return body.encode("ascii")
+            loc = self.locate_media(disc_id, f"{name}.mp4")
+            if not loc:
+                return None
+            info = self._media_info(loc)
+            body = tinydvd_mp4.build_media_playlist(info, f"{name}.mp4?disc={quoted}", HLS_SEGMENT_SECONDS)
+            return body.encode("ascii")
+        except (OSError, ValueError) as e:
+            print(f"[web_server] Can't stream {name}: {e}", flush=True)
+            return None
 
     def _reaper_loop(self) -> None:
         while self.running:

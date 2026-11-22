@@ -830,9 +830,9 @@ class TinyDVDLibrary:
     def read_thumbnail(self, disc_path: str) -> bytes | None:
         return tinydvd_archive.read_thumbnail(disc_path) if disc_path else None
 
-    def locate_video(self, disc_path: str, mkv_name: str) -> tinydvd_archive.MemberLocation | None:
-        """Where an .mkv video's bytes are, inside an archive or a directory."""
-        return tinydvd_archive.locate_member(disc_path, mkv_name)
+    def locate_video(self, disc_path: str, name: str) -> tinydvd_archive.MemberLocation | None:
+        """Where a video or audio file's bytes are, inside an archive or a directory."""
+        return tinydvd_archive.locate_member(disc_path, name)
 
     def _notify_import_change(self) -> None:
         if self.on_import_change:

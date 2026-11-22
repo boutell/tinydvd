@@ -124,24 +124,21 @@ if [[ "$UNINSTALL" -eq 1 && -z "$APP_DIR_GIVEN" && -f "$MAC_APP_RECORD" ]]; then
     MAC_APP_DIR="$(dirname "$MAC_APP")"
 fi
 
-# The per-user cache of web-player videos (rebuilt on demand, so --uninstall
-# deletes it). Worked out before any sudo, which may change HOME
-if [[ -n "${TINYDVD_USER_CACHE:-}" ]]; then
-    USER_CACHE="$TINYDVD_USER_CACHE"
+# The per-user settings folder (--uninstall leaves it, and says where it
+# is). Worked out before any sudo, which may change HOME
+if [[ -n "${TINYDVD_USER_CONFIG:-}" ]]; then
+    USER_CONFIG="$TINYDVD_USER_CONFIG"
 else
     USER_HOME="${HOME:-}"
     if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" ]]; then
         USER_HOME="$(eval echo "~${SUDO_USER}")"
     fi
     if [[ "$OS" == "Darwin" ]]; then
-        USER_CACHE="${USER_HOME}/Library/Caches/tinydvd"
         USER_CONFIG="${USER_HOME}/Library/Application Support/tinydvd"
     else
-        USER_CACHE="${XDG_CACHE_HOME:-${USER_HOME}/.cache}/tinydvd"
         USER_CONFIG="${XDG_CONFIG_HOME:-${USER_HOME}/.config}/tinydvd"
     fi
 fi
-USER_CONFIG="${TINYDVD_USER_CONFIG:-${USER_CONFIG:-}}"
 MAC_BUNDLE_ID="io.github.boutell.tinydvd"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
@@ -430,7 +427,7 @@ if needs_sudo; then
     if [[ "$UNINSTALL" -eq 0 ]]; then
         exec sudo TINYDVD_BASE_PYTHON="${BASE_PYTHON}" TINYDVD_ALREADY_BUILT=1 "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     else
-        exec sudo TINYDVD_USER_CACHE="${USER_CACHE}" TINYDVD_USER_CONFIG="${USER_CONFIG}" \
+        exec sudo TINYDVD_USER_CONFIG="${USER_CONFIG}" \
             "${BASH_SOURCE[0]}" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     fi
 fi
@@ -556,10 +553,6 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
         FOUND=1
     fi
     rm -rf "${LIB_DIR}"
-    if [[ -n "$USER_CACHE" && -d "$USER_CACHE" ]]; then
-        rm -rf "$USER_CACHE"
-        echo "Removed the web player's video cache (${USER_CACHE})"
-    fi
     if [[ "$FOUND" -eq 0 ]]; then
         echo "Nothing from TinyDVD was found in ${PREFIX}."
         echo "If you installed it with --prefix (or --app-dir), uninstall with the same option."
@@ -618,8 +611,14 @@ fi
 
 echo "Runtime -> ${LIB_DIR}"
 install -m 755 "${CORE_LIB_SRC}" "${LIB_DIR}/${CORE_LIB_NAME}"
-install -d "${LIB_DIR}/web"
+install -d "${LIB_DIR}/web" "${LIB_DIR}/web/vendor"
 install -m 644 "${ROOT_DIR}/web/index.html" "${LIB_DIR}/web/index.html"
+for f in manifest.webmanifest apple-touch-icon.png icon-192.png icon-512.png; do
+    install -m 644 "${ROOT_DIR}/web/${f}" "${LIB_DIR}/web/${f}"
+done
+for f in hls.min.js hls.js-LICENSE README; do
+    install -m 644 "${ROOT_DIR}/web/vendor/${f}" "${LIB_DIR}/web/vendor/${f}"
+done
 rm -f "${LIB_DIR}/web_assets.h"
 
 RUNTIME_SCRIPTS=(
@@ -629,6 +628,7 @@ RUNTIME_SCRIPTS=(
     tinydvd_desktop_ui.py
     tinydvd_library.py
     tinydvd_metadata.py
+    tinydvd_mp4.py
     tinydvd_web_server.py
     convert-to-tinydvd.py
     tinydvd-thumbnailer.py
