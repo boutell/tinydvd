@@ -432,7 +432,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-This runs the C tests (MVOB parser, subtitle compositor, DVD VM) and the Python tests (web server, archive helpers, converter). The DVD VM and playback tests need a converted disc at `tinydvds/Dune.tdvd`, which isn't in the repository; without one they skip those parts.
+This runs the C tests (MVOB parser, subtitle compositor, DVD VM) and the Python tests (web server, archive helpers, converter). The DVD VM and playback tests play `tests/fixtures/TestDisc.tdvd`, a half-megabyte synthetic disc (test patterns, a two-button menu, chapters and a subtitle track). `tests/fixtures/make-test-disc.sh` rebuilds it; that needs `dvdauthor`, which the tests themselves don't.
 
 ---
 

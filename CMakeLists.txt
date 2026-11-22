@@ -13,10 +13,19 @@ endif()
 # Ensure Homebrew and standard paths are considered
 if(APPLE)
     list(APPEND CMAKE_PREFIX_PATH "/opt/homebrew" "/usr/local")
+    set(_brew_pc "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig")
+    # mpv's pkg-config file requires libarchive, which Homebrew installs
+    # "keg-only" (outside the usual lib/pkgconfig). Without its directory,
+    # pkg-config reports mpv as found but returns no link flags
+    foreach(_keg "/opt/homebrew/opt/libarchive" "/usr/local/opt/libarchive")
+        if(EXISTS "${_keg}/lib/pkgconfig")
+            string(APPEND _brew_pc ":${_keg}/lib/pkgconfig")
+        endif()
+    endforeach()
     if(DEFINED ENV{PKG_CONFIG_PATH})
-        set(ENV{PKG_CONFIG_PATH} "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+        set(ENV{PKG_CONFIG_PATH} "${_brew_pc}:$ENV{PKG_CONFIG_PATH}")
     else()
-        set(ENV{PKG_CONFIG_PATH} "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig")
+        set(ENV{PKG_CONFIG_PATH} "${_brew_pc}")
     endif()
 endif()
 
@@ -172,9 +181,14 @@ target_compile_definitions(test_web PRIVATE
 )
 target_compile_options(test_web PRIVATE -Wall -Wextra)
 
+# The C tests check with assert(), which a Release build would compile out
+foreach(_test test_mvob test_spu test_dvd_vm test_web)
+    target_compile_options(${_test} PRIVATE -UNDEBUG)
+endforeach()
+
 # Tests: run them all with `ctest --test-dir build --output-on-failure`.
-# The DVD VM and web tests use a real converted disc when one is present
-# (tinydvds/Dune.tdvd, not in the repository) and skip those parts otherwise.
+# The DVD VM and web tests play tests/fixtures/TestDisc.tdvd, a small
+# synthetic disc built by tests/fixtures/make-test-disc.sh.
 enable_testing()
 add_test(NAME mvob_parser COMMAND test_mvob)
 add_test(NAME spu_compositor COMMAND test_spu)

@@ -205,9 +205,10 @@ def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None
         data = json.loads(body.decode("utf-8"))
         assert data["is_directory"] is False
         assert len(data["items"]) == 1
-        assert "Denis Villeneuve" in data["items"][0]["director"]
-        assert "Timoth" in data["items"][0]["cast"]
-        assert data["items"][0]["year"] == 2021
+        assert data["items"][0]["title"] == "TinyDVD Test Disc"
+        assert data["items"][0]["director"] == "Ada Testmaker"
+        assert "Pat Placeholder" in data["items"][0]["cast"]
+        assert data["items"][0]["year"] == 2001
         print("  - GET /api/library: OK (JSON movie catalog with director, cast, year metadata)")
 
         # 3. GET /api/thumbnail
@@ -227,13 +228,13 @@ def test_http_and_websocket_endpoints(core: TinyDVDCore, tdvd_path: str) -> None
         print("  - WebSocket /ws: OK (RFC 6455 101 Switching Protocols & Masked Frames)")
 
         # 5. HTTP 206 Range Streaming
-        st, hdrs, body = http_get(server, "/api/media/VIDEO_TS_VIDEO.mp4", headers={"Range": "bytes=0-1023"})
+        st, hdrs, body = http_get(server, "/api/media/VTS_01_VIDEO.mp4", headers={"Range": "bytes=0-1023"})
         assert st == 206
         assert "video/mp4" in hdrs.get("content-type", "")
         assert hdrs.get("content-range", "").startswith("bytes 0-1023/")
         assert len(body) == 1024
 
-        st416, _, _ = http_get(server, "/api/media/VIDEO_TS_VIDEO.mp4", headers={"Range": "bytes=999999999-1000000999"})
+        st416, _, _ = http_get(server, "/api/media/VTS_01_VIDEO.mp4", headers={"Range": "bytes=999999999-1000000999"})
         assert st416 == 416
         print("  - HTTP 206 Range Streaming: OK (On-demand fast MP4 remux + byte range seek)")
 
@@ -268,7 +269,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
     abs_tdvd = os.path.abspath(tdvd_path)
     test_dir = tempfile.mkdtemp(prefix="tinydvd_test_mixed_")
     try:
-        os.symlink(abs_tdvd, os.path.join(test_dir, "Dune.tdvd"))
+        os.symlink(abs_tdvd, os.path.join(test_dir, "TestDisc.tdvd"))
         for fname, txt in (("home_video.mp4", "dummy"), ("holiday_movie.mkv", "dummy"), ("readme.txt", "notes")):
             with open(os.path.join(test_dir, fname), "w") as f:
                 f.write(txt)
@@ -279,7 +280,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
             st, _, body = http_get(server, "/api/library")
             assert st == 200
             txt = body.decode("utf-8")
-            assert "Dune" in txt
+            assert "TinyDVD Test Disc" in txt
             for unwanted in ("home_video", "holiday_movie", "readme.txt", "OtherFolder"):
                 assert unwanted not in txt
             print("  - Directory Filtering: OK (Tolerates non-TinyDVD entries, only lists .tdvd)")
@@ -304,7 +305,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
                 assert "text/event-stream" in hdr_str
 
                 # Mutate the watched folder while SSE client is listening
-                os.symlink(abs_tdvd, os.path.join(test_dir, "Dune_SSE_Test.tdvd"))
+                os.symlink(abs_tdvd, os.path.join(test_dir, "SSE_Test.tdvd"))
 
                 got_update = b"event: library_update" in sse_buf
                 deadline = time.time() + 3.0
@@ -330,7 +331,7 @@ def test_library_directory_filtering_and_sse(core: TinyDVDCore, tdvd_path: str) 
             assert st == 200
             data = json.loads(body.decode("utf-8"))
             ids = [it["id"] for it in data["items"]]
-            assert disc_id_for_path("Dune_SSE_Test.tdvd") in ids
+            assert disc_id_for_path("SSE_Test.tdvd") in ids
             print("  - OS Watcher + SSE Push: OK (kqueue/inotify detected new .tdvd and pushed library_update)")
         finally:
             server.stop()
@@ -372,7 +373,7 @@ def test_library_waits_for_pick(core: TinyDVDCore, tdvd_path: str) -> None:
     print("Testing that a new library session waits for the viewer to pick a movie...")
     lib_dir = tempfile.mkdtemp(prefix="tinydvd_test_pick_")
     try:
-        os.symlink(os.path.abspath(tdvd_path), os.path.join(lib_dir, "Dune.tdvd"))
+        os.symlink(os.path.abspath(tdvd_path), os.path.join(lib_dir, "TestDisc.tdvd"))
         server = make_server(core, lib_dir)
         try:
             sock, tid = ws_connect(server, "/ws?session=fresh_viewer")
@@ -697,19 +698,17 @@ def test_auth_and_request_rules(core: TinyDVDCore, tdvd_path: str) -> None:
 
 
 def main() -> int:
-    tdvd = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO_ROOT, "tinydvds", "Dune.tdvd")
+    tdvd = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO_ROOT, "tests", "fixtures", "TestDisc.tdvd")
+    assert os.path.isfile(tdvd), f"{tdvd} not found (tests/fixtures/make-test-disc.sh builds it)"
     print("=== Running TinyDVD Web Server & Protocol Tests ===")
     core = TinyDVDCore()
     test_sha1_and_websocket_key()
     test_spu_png_encoding(core)
     test_desktop_ui_helpers(core)
     test_auth_and_request_rules(core, tdvd)
-    if os.path.isfile(tdvd):
-        test_http_and_websocket_endpoints(core, tdvd)
-        test_library_directory_filtering_and_sse(core, tdvd)
-        test_library_waits_for_pick(core, tdvd)
-    else:
-        print(f"Skipping playback and streaming tests ({tdvd} not found)")
+    test_http_and_websocket_endpoints(core, tdvd)
+    test_library_directory_filtering_and_sse(core, tdvd)
+    test_library_waits_for_pick(core, tdvd)
     test_import_dvd_workflow(core)
     test_duplicate_dvd_import_disambiguation(core)
     shutil.rmtree(_TEST_CACHE_DIR, ignore_errors=True)

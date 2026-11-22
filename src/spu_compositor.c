@@ -9,7 +9,11 @@
 #ifdef __APPLE__
 #include <OpenGL/gl.h>
 #else
+/* glUseProgram and glBindBuffer (OpenGL 2.0 / 1.5) are only declared by
+ * glext.h, and only with prototypes enabled */
+#define GL_GLEXT_PROTOTYPES
 #include <GL/gl.h>
+#include <GL/glext.h>
 #endif
 
 static uint64_t spu_monotonic_nanos(void) {
