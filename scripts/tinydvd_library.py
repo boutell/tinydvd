@@ -272,6 +272,16 @@ def optical_device_for(path: str, mounts_file: str = "/proc/self/mounts", platfo
     """
     if not (platform or sys.platform).startswith("linux"):
         return ""
+    if platform is None:
+        # The device the folder's filesystem lives on, straight from the
+        # kernel: works whatever the mount table looks like from here
+        try:
+            st = os.stat(path)
+            name = os.path.basename(os.readlink(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}"))
+            if re.fullmatch(r"sr[0-9]+", name):
+                return f"/dev/{name}"
+        except OSError:
+            pass
     try:
         target = os.path.realpath(path)
         with open(mounts_file, "r", encoding="utf-8", errors="replace") as f:
@@ -982,6 +992,10 @@ class TinyDVDLibrary:
             self.imp_result_disc_path = ""
             self.imp_result_title = ""
             self.imp_logs = []
+            if rip_src != src:
+                # Say so: the source shown is the folder, but the drive is what's read
+                self.imp_logs.append(f">>> {src} is the disc in {rip_src}; ripping it from the drive "
+                                     "(encrypted discs can't be read as files)")
 
         self._notify_import_change()
         t = threading.Thread(
