@@ -1010,7 +1010,9 @@
     });
 
     let currentSeq = 0;
-    let isSeeking = false;
+    // Whether a seek is under way comes from video.seeking, never a flag of
+    // our own: a seek that a new video interrupts never fires 'seeked', and a
+    // flag left set would keep the spinner up (and the menu hidden) for good
 
     // Whether the picture for the latest load or seek is on screen. Until it
     // is, show a spinner (after a moment, so quick seeks don't flash one) and
@@ -1031,7 +1033,7 @@
       }
     }
     function settleIfReady() {
-      if (!isSeeking && pendingSeekPts === null && video.readyState >= 2) setSettled(true);
+      if (!video.seeking && pendingSeekPts === null && video.readyState >= 2) setSettled(true);
       if (bufferingReported && video.readyState >= 3) {
         bufferingReported = false;
         sendWS({ type: 'buffering', buffering: false, seq: currentSeq });
@@ -1050,7 +1052,7 @@
     // Ran out of data mid-playback: the server holds the disc's clock until
     // we catch up
     video.addEventListener('waiting', () => {
-      if (!videoSettled || isSeeking || video.readyState < 1) return;
+      if (!videoSettled || video.seeking || video.readyState < 1) return;
       setSettled(false);
       bufferingReported = true;
       sendWS({ type: 'buffering', buffering: true, seq: currentSeq });
@@ -1090,15 +1092,11 @@
       sendWS({ type: 'client_playback', state: 'paused', pts: video.currentTime, seq: currentSeq });
     });
     video.addEventListener('timeupdate', () => {
-      if (!video.paused && !video.ended && !isSeeking) {
+      if (!video.paused && !video.ended && !video.seeking) {
         sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
       }
     });
-    video.addEventListener('seeking', () => {
-      isSeeking = true;
-    });
     video.addEventListener('seeked', () => {
-      isSeeking = false;
       settleIfReady();
       if (isPaused) {
         video.pause();
@@ -1198,7 +1196,6 @@
           sendWS({ type: 'seek_completed', pts: video.duration, seq: currentSeq });
           reportEnded();
         } else if (Math.abs(video.currentTime - pts) > 0.05) {
-          isSeeking = true;
           setSettled(false);
           video.currentTime = pts;
         } else {
@@ -1218,7 +1215,6 @@
           sendWS({ type: 'seek_completed', pts: video.duration, seq: currentSeq });
           reportEnded();
         } else {
-          isSeeking = true;
           video.currentTime = target;
         }
       }
@@ -1228,7 +1224,6 @@
     });
     video.addEventListener('canplay', () => {
       if (pendingSeekPts !== null) {
-        isSeeking = true;
         video.currentTime = pendingSeekPts;
         pendingSeekPts = null;
       }
@@ -1434,7 +1429,7 @@
     // Sync playback clock back to server
     setInterval(() => {
       updatePlayPauseBtn();
-      if (!video.paused && !video.ended && !isSeeking) {
+      if (!video.paused && !video.ended && !video.seeking) {
         sendWS({ type: 'time_update', pts: video.currentTime, seq: currentSeq });
       }
       // Update time display

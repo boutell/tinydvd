@@ -181,7 +181,9 @@ def _wikidata_year(entity: dict) -> int | None:
     return min(years) if years else None
 
 
-def _wikidata_runtime_minutes(entity: dict) -> int:
+def _wikidata_runtimes(entity: dict) -> list[int]:
+    """Every running time listed, in minutes (a film can have several cuts)"""
+    out = []
     for v in _claim_values(entity, "P2047"):
         try:
             amount = float(str(v.get("amount", "0")))
@@ -193,8 +195,8 @@ def _wikidata_runtime_minutes(entity: dict) -> int:
         elif unit.endswith("/Q25235"):  # hour
             amount *= 60.0
         if amount > 0:
-            return int(round(amount))
-    return 0
+            out.append(int(round(amount)))
+    return out
 
 
 def _wikidata_labels(ids: list[str]) -> dict[str, str]:
@@ -219,7 +221,13 @@ def _wikipedia_summary(enwiki_title: str) -> str:
     return str(data.get("extract") or "").strip()
 
 
-def fetch_wikidata_metadata(title: str, year: int | None = None, runtime_min: int = 0) -> dict | None:
+def _too_new(cand_year: int | None, max_year: int | None) -> int:
+    """1 if a candidate film is newer than the disc it's on (so it can't be that film)"""
+    return 1 if (max_year and cand_year and cand_year > max_year) else 0
+
+
+def fetch_wikidata_metadata(title: str, year: int | None = None, runtime_min: int = 0,
+                            max_year: int | None = None) -> dict | None:
     """Look the title up on Wikidata. Returns None unless a film's title matches exactly."""
     class_filter = "|".join(f"P31={q}" for q in sorted(WIKIDATA_FILM_CLASSES))
     found = _get_json(WIKIDATA_API, {
@@ -244,11 +252,13 @@ def fetch_wikidata_metadata(title: str, year: int | None = None, runtime_min: in
         if wanted not in {_normalize_title(n) for n in names if n}:
             continue
         cand_year = _wikidata_year(ent)
-        cand_rt = _wikidata_runtime_minutes(ent)
+        cand_rts = _wikidata_runtimes(ent)
         year_miss = 0 if (not year or (cand_year and abs(cand_year - year) <= 1)) else 1
-        rt_diff = abs(cand_rt - runtime_min) if (runtime_min and cand_rt) else 999
+        rt_diff = min((abs(rt - runtime_min) for rt in cand_rts), default=999) if runtime_min else 999
         popularity = len(ent.get("sitelinks", {}))
-        candidates.append(((year_miss, rt_diff, -popularity), ent, cand_year))
+        # A year given outright wins; then a film newer than the disc is
+        # ruled out; then the closest running time; then the best known
+        candidates.append(((year_miss, _too_new(cand_year, max_year), rt_diff, -popularity), ent, cand_year))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0])
@@ -313,7 +323,8 @@ def fetch_wikidata_cast_by_imdb_id(imdb_id: str) -> list[str]:
 # TMDb (your own key)
 # ---------------------------------------------------------------------------
 
-def fetch_tmdb_metadata(title: str, year: int | None = None, api_key: str = "", runtime_min: int = 0) -> dict | None:
+def fetch_tmdb_metadata(title: str, year: int | None = None, api_key: str = "", runtime_min: int = 0,
+                        max_year: int | None = None) -> dict | None:
     """Look the title up on The Movie Database with the user's API key."""
     if not api_key:
         return None
@@ -323,6 +334,13 @@ def fetch_tmdb_metadata(title: str, year: int | None = None, api_key: str = "", 
     results = _get_json(f"{TMDB_API}/search/movie", params).get("results", [])
     if not results:
         return None
+    # Films newer than the disc can't be on it (if that leaves any)
+    if not year and max_year:
+        def rel_year(r: dict) -> int | None:
+            d = str(r.get("release_date") or "")
+            return int(d[:4]) if d[:4].isdigit() else None
+        older = [r for r in results if not _too_new(rel_year(r), max_year)]
+        results = older or results
 
     movie = results[0]
     details = None
@@ -388,7 +406,8 @@ def _parse_omdb_item(data: dict, title: str, year: int | None) -> tuple[dict | N
     return meta, (int(rt_tok) if rt_tok.isdigit() else 0), (int(votes) if votes.isdigit() else 0)
 
 
-def fetch_omdb_metadata(title: str, year: int | None = None, api_key: str = "", runtime_min: int = 0) -> dict | None:
+def fetch_omdb_metadata(title: str, year: int | None = None, api_key: str = "", runtime_min: int = 0,
+                        max_year: int | None = None) -> dict | None:
     """Look the title up on OMDb with the user's API key."""
     if not api_key:
         return None
@@ -398,22 +417,29 @@ def fetch_omdb_metadata(title: str, year: int | None = None, api_key: str = "", 
     primary, primary_rt, primary_votes = _parse_omdb_item(_get_json(OMDB_API, params), title, year)
     selected = primary
 
-    if year is None and runtime_min > 0:
+    primary_too_new = bool(primary and _too_new(primary.get("year"), max_year))
+    if year is None and (runtime_min > 0 or primary_too_new):
         sdata = _get_json(OMDB_API, {"s": title, "type": "movie", "apikey": api_key})
         wanted = title.strip().lower()
         exact = [c for c in sdata.get("Search", []) if c.get("Title", "").strip().lower() == wanted]
         if len(exact) > 1 or (primary is None and exact):
-            best_diff = abs(primary_rt - runtime_min) if (primary and primary_rt > 0) else 99999
+            best_diff = abs(primary_rt - runtime_min) if (primary and primary_rt > 0 and runtime_min) else 99999
+            if primary_too_new:
+                selected, best_diff = None, 99999
             for cand in exact[:5]:
                 if not cand.get("imdbID"):
                     continue
                 cmeta, crt, cvotes = _parse_omdb_item(
                     _get_json(OMDB_API, {"i": cand["imdbID"], "apikey": api_key}), title, year)
-                if not cmeta or (primary_votes >= 1000 and cvotes < 1000):
+                if not cmeta or _too_new(cmeta.get("year"), max_year):
                     continue
-                diff = abs(crt - runtime_min) if crt > 0 else 99999
+                if primary_votes >= 1000 and cvotes < 1000 and not primary_too_new:
+                    continue
+                diff = abs(crt - runtime_min) if (crt > 0 and runtime_min) else 99998
                 if selected is None or diff < best_diff:
                     best_diff, selected = diff, cmeta
+        if selected is None:
+            selected = primary  # nothing older found: the disc's date may be wrong
 
     # OMDb lists only the top three or four actors
     if selected and selected.get("imdb_id"):
@@ -432,14 +458,20 @@ def fetch_omdb_metadata(title: str, year: int | None = None, api_key: str = "", 
 # Putting it together
 # ---------------------------------------------------------------------------
 
-def lookup_metadata(title: str, year: int | None, runtime_min: int, tmdb_key: str = "", omdb_key: str = "") -> dict | None:
-    """Try each source in turn: TMDb and OMDb if keyed, then Wikidata."""
+def lookup_metadata(title: str, year: int | None, runtime_min: int, tmdb_key: str = "", omdb_key: str = "",
+                    max_year: int | None = None) -> dict | None:
+    """
+    Try each source in turn: TMDb and OMDb if keyed, then Wikidata. Among
+    films with the same title: a given year wins; failing that, films newer
+    than max_year (the year the disc was mastered) are passed over, then the
+    running time closest to runtime_min decides.
+    """
     sources = []
     if tmdb_key:
-        sources.append(("TMDb", lambda: fetch_tmdb_metadata(title, year, tmdb_key, runtime_min)))
+        sources.append(("TMDb", lambda: fetch_tmdb_metadata(title, year, tmdb_key, runtime_min, max_year)))
     if omdb_key:
-        sources.append(("OMDb", lambda: fetch_omdb_metadata(title, year, omdb_key, runtime_min)))
-    sources.append(("Wikidata", lambda: fetch_wikidata_metadata(title, year, runtime_min)))
+        sources.append(("OMDb", lambda: fetch_omdb_metadata(title, year, omdb_key, runtime_min, max_year)))
+    sources.append(("Wikidata", lambda: fetch_wikidata_metadata(title, year, runtime_min, max_year)))
     for name, fetch in sources:
         print(f"  - Looking up '{title}' on {name}...")
         try:
@@ -466,7 +498,8 @@ def write_metadata(package: str, meta: dict, write_sidecar: bool = False) -> Non
 
 def enrich_movie(package: str, title: str | None = None, year: int | None = None,
                  tmdb_key: str = "", omdb_key: str = "", title_hint_path: str | None = None,
-                 overrides: dict | None = None, write: bool = True, sidecar: bool = False) -> dict:
+                 overrides: dict | None = None, write: bool = True, sidecar: bool = False,
+                 mastered: str = "") -> dict:
     """
     Build metadata for a package: look it up online, then apply any overrides
     (director, cast, genres, overview). Returns the metadata, and saves it
@@ -482,8 +515,15 @@ def enrich_movie(package: str, title: str | None = None, year: int | None = None
     runtime_min = compute_dvd_runtime_minutes(package)
     if runtime_min > 0:
         print(f"  - Main feature runtime: ~{runtime_min} min")
+    # When the disc was mastered (kept from the import, since a package
+    # can't tell): the film can't be newer
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", mastered or ""):
+        mastered = str(existing.get("disc_mastered") or "")
+    max_year = int(mastered[:4]) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", mastered) else None
+    if max_year:
+        print(f"  - Disc mastered: {mastered}")
 
-    meta = lookup_metadata(cur_title, cur_year, runtime_min, tmdb_key, omdb_key)
+    meta = lookup_metadata(cur_title, cur_year, runtime_min, tmdb_key, omdb_key, max_year)
     if not meta:
         print("  - No match found online; keeping existing or given values.")
         meta = {
@@ -495,6 +535,8 @@ def enrich_movie(package: str, title: str | None = None, year: int | None = None
             "overview": existing.get("overview", ""),
         }
     meta["disc_id"] = disc_id or existing.get("disc_id", "")
+    if max_year:
+        meta["disc_mastered"] = mastered
     for key, val in (overrides or {}).items():
         if val:
             meta[key] = val

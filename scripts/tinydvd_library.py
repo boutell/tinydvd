@@ -393,6 +393,16 @@ def _clean_disc_label(raw_label: str) -> str:
     return s
 
 
+def disc_volume_label(device: str) -> str:
+    """The volume label of the disc in a drive (e.g. "DUNE"), or "" if it can't be read"""
+    return tinydvd_archive.read_volume_info(device).label
+
+
+def _is_generic_label(label: str) -> bool:
+    """Labels that say nothing about the movie, like a drive's name"""
+    return not label or re.fullmatch(r"(?i)(sr|cdrom|dvd|disc|disk|rdisk)\d*|DVD_?VIDEO|VIDEO_TS", label) is not None
+
+
 def detect_default_source() -> tuple[str, str]:
     """Auto-detect a mounted DVD volume or optical device and a clean title hint."""
     candidates: list[tuple[str, str]] = []
@@ -425,7 +435,7 @@ def detect_default_source() -> tuple[str, str]:
                 pass
         for dev in ("/dev/sr0", "/dev/cdrom", "/dev/dvd"):
             if os.path.exists(dev):
-                candidates.append((dev, ""))
+                candidates.append((dev, _clean_disc_label(disc_volume_label(dev))))
 
     if candidates:
         return candidates[0]
@@ -985,6 +995,14 @@ class TinyDVDLibrary:
         title_clean = (title or "").strip()
         if title_clean:
             stem = _clean_output_stem(title_clean)
+        elif is_device_path(src):
+            # A drive's name says nothing about the movie; the disc's label
+            # does (and names the package, which is what the movie details
+            # are looked up by). Without one, the rip's folder name is used
+            # later (see _import_worker)
+            label = disc_volume_label(src)
+            stem = _clean_output_stem(_clean_disc_label(label)) if not _is_generic_label(label) else ""
+            stem = stem or "DVD"
         else:
             b = os.path.basename(src.rstrip("/"))
             for ext in (".iso", ".img", ".nrg", ".tdvd", ".tinydvd"):
@@ -1148,6 +1166,13 @@ class TinyDVDLibrary:
                     if os.path.isdir(os.path.join(rip_tmp_dir, d))
                 ]
                 conv_input = subdirs[0] if subdirs else rip_tmp_dir
+                # No title yet (the disc's label couldn't be read up front):
+                # dvdbackup names its folder after the disc's title
+                ripped_name = os.path.basename(conv_input)
+                if stem == "DVD" and subdirs and not _is_generic_label(ripped_name):
+                    stem = _clean_output_stem(_clean_disc_label(ripped_name)) or stem
+                    desired_output = os.path.join(os.path.dirname(desired_output), f"{stem}.tdvd")
+                    self._append_log(f">>> Disc title: {stem}")
 
             with self.import_lock:
                 self.imp_state = IMPORT_CONVERTING
@@ -1156,6 +1181,12 @@ class TinyDVDLibrary:
             self._notify_import_change()
 
             cmd = [sys.executable, "-u", convert_script, conv_input, desired_output]
+            # The rip is just files; when the disc was mastered (a ceiling on
+            # the film's year, for the movie details lookup) is only on the disc
+            if is_dev:
+                mastered = tinydvd_archive.read_volume_info(src).mastered
+                if mastered:
+                    cmd += ["--disc-mastered", mastered]
             if rip_tmp_dir:
                 cmd.append("--delete-rip-before-packaging")
             if skip_enrichment:

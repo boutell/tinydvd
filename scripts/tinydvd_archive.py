@@ -29,6 +29,38 @@ COPY_CHUNK = 1024 * 1024
 ZIP_LOCAL_HEADER_LEN = 30
 
 
+class VolumeInfo(NamedTuple):
+    label: str      # e.g. "DUNE"; "" if unset
+    mastered: str   # when the disc was mastered, "YYYY-MM-DD"; "" if unset or implausible
+
+
+def read_volume_info(path: str) -> VolumeInfo:
+    """
+    The volume label and mastering date of a disc in a drive (e.g. /dev/sr0)
+    or a disc image (.iso), from its ISO 9660 primary volume descriptor, which
+    DVD-Videos carry alongside UDF. Never encrypted, so no libdvdcss needed.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(16 * 2048)
+            pvd = f.read(2048)
+    except OSError:
+        return VolumeInfo("", "")
+    if len(pvd) < 830 or pvd[0] != 1 or pvd[1:6] != b"CD001":
+        return VolumeInfo("", "")
+    label = pvd[40:72].decode("ascii", "replace").strip(" \x00")
+    # Volume creation date: "YYYYMMDDHHMMSScc" plus a time zone byte; all
+    # zeros or junk when the authoring tool didn't fill it in. DVD-Video
+    # began in 1996, so anything earlier (or in the future) is junk too
+    stamp = pvd[813:821].decode("ascii", "replace")
+    mastered = ""
+    if stamp.isdigit():
+        y, m, d = int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8])
+        if 1996 <= y <= time.localtime().tm_year + 1 and 1 <= m <= 12 and 1 <= d <= 31:
+            mastered = f"{y:04d}-{m:02d}-{d:02d}"
+    return VolumeInfo(label, mastered)
+
+
 def is_tdvd_path(path: str) -> bool:
     """True if path names a .tdvd / .tinydvd archive (by extension, any case)."""
     return bool(path) and path.lower().endswith(TDVD_EXTENSIONS)

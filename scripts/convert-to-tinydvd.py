@@ -1155,6 +1155,9 @@ def main():
     parser.add_argument("--keep-mvob-audio", action="store_true", help="Also retain raw audio sectors inside .mvob files")
     parser.add_argument("--delete-rip-before-packaging", action="store_true",
                         help=argparse.SUPPRESS)  # for the importer's own temporary rip only
+    parser.add_argument("--disc-mastered", default="", metavar="YYYY-MM-DD",
+                        help="When the disc was mastered, if the input doesn't say (it's read from ISO "
+                             "images and drives); helps pick the right film among remakes")
     parser.add_argument("--skip-enrichment", action="store_true",
                         help="Don't look up the movie's details (director, cast, genres, overview, year) online. "
                              "The lookup sends only the title, to Wikidata/Wikipedia and any service you give a key for.")
@@ -1179,10 +1182,11 @@ def main():
         if args.skip_enrichment:
             return existing
         print("\n[metadata] Looking up movie details...")
+        mastered = args.disc_mastered or tinydvd_archive.read_volume_info(raw_input).mastered
         try:
             return tinydvd_metadata.enrich_movie(
                 source_dir, title_hint_path=output_path, tmdb_key=args.tmdb_key,
-                omdb_key=args.omdb_key, write=False)
+                omdb_key=args.omdb_key, write=False, mastered=mastered)
         except Exception as e:
             print(f"[warning] Metadata lookup failed: {e}", file=sys.stderr)
             return existing

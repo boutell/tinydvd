@@ -201,6 +201,7 @@ add_test(NAME dvd_vm COMMAND test_dvd_vm WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME mpv_playback COMMAND test_mpv WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME web_server COMMAND test_web WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 add_test(NAME archive_helpers COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_archive.py)
+add_test(NAME metadata_lookup COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_metadata.py)
 add_test(NAME transcoder COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_transcode.py)
 add_test(NAME av_sync COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_av_sync.py)
 set_tests_properties(mvob_parser spu_compositor dvd_vm mpv_playback web_server archive_helpers transcoder av_sync

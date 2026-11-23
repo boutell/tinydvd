@@ -217,6 +217,24 @@ def test_mounted_disc_drive(tmp: str) -> None:
     assert tinydvd_library.optical_device_for("/media/trox/A Disc", mounts, platform="darwin") == ""
     print("  - Mounted discs are ripped from their drive: OK")
 
+    # A drive is named after its disc's label, not the drive ("sr0")
+    image = os.path.join(tmp, "disc.img")
+    pvd = bytearray(2048)
+    pvd[0], pvd[1:6] = 1, b"CD001"
+    pvd[40:72] = b"DUNE_PART_ONE".ljust(32)
+    with open(image, "wb") as f:
+        f.write(b"\0" * 16 * 2048 + bytes(pvd))
+    assert tinydvd_library.disc_volume_label(image) == "DUNE_PART_ONE"
+    assert tinydvd_library._clean_disc_label("DUNE_PART_ONE") == "Dune Part One"
+    with open(image, "wb") as f:
+        f.write(b"\0" * 17 * 2048)
+    assert tinydvd_library.disc_volume_label(image) == ""
+    assert tinydvd_library.disc_volume_label(os.path.join(tmp, "missing")) == ""
+    for generic in ("", "sr0", "DVD_VIDEO", "cdrom", "VIDEO_TS"):
+        assert tinydvd_library._is_generic_label(generic), generic
+    assert not tinydvd_library._is_generic_label("DUNE")
+    print("  - Discs in a drive are named by their volume label: OK")
+
 
 def main() -> int:
     print("=== Running TinyDVD archive helper tests ===")
