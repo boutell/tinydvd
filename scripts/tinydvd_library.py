@@ -303,6 +303,21 @@ def optical_device_for(path: str, mounts_file: str = "/proc/self/mounts", platfo
     return real if re.fullmatch(r"/dev/sr[0-9]+", real) else ""
 
 
+def describe_source_device(path: str) -> str:
+    """For the import log: which device the kernel says path is on"""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        return f"can't stat it: {e.strerror}"
+    if stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode):
+        return "a device"
+    dev = f"{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
+    try:
+        return f"device {dev} = {os.path.basename(os.readlink('/sys/dev/block/' + dev))}"
+    except OSError:
+        return f"device {dev}, not a block device"
+
+
 def check_import_space(src: str, out_dir: str) -> str:
     """An explanation if out_dir lacks room to import src, else an empty string"""
     try:
@@ -992,10 +1007,14 @@ class TinyDVDLibrary:
             self.imp_result_disc_path = ""
             self.imp_result_title = ""
             self.imp_logs = []
+            # Always say what drive detection found (and which import code this
+            # is), so a log shows whether the drive was used and why
+            self.imp_logs.append(f">>> Import (drive-check 3): source {src}")
             if rip_src != src:
-                # Say so: the source shown is the folder, but the drive is what's read
-                self.imp_logs.append(f">>> {src} is the disc in {rip_src}; ripping it from the drive "
+                self.imp_logs.append(f">>> That's the disc in {rip_src}; ripping it from the drive "
                                      "(encrypted discs can't be read as files)")
+            else:
+                self.imp_logs.append(f">>> Not a disc in a drive ({describe_source_device(src)}); reading it as files")
 
         self._notify_import_change()
         t = threading.Thread(
