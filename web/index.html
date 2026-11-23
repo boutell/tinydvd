@@ -640,6 +640,23 @@
       font-size: 0.85rem;
       color: var(--text);
     }
+    .import-exists {
+      margin-top: 14px;
+      padding: 12px;
+      border-radius: 8px;
+      background: rgba(255, 196, 0, 0.10);
+      border: 1px solid rgba(255, 196, 0, 0.45);
+      color: #ffe9a8;
+      font-size: 13.5px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }
+    .import-exists-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 10px;
+    }
     .import-error-msg {
       color: var(--danger);
       background: rgba(255, 77, 77, 0.12);
@@ -825,12 +842,19 @@
         </div>
         <div class="import-field">
           <label class="import-label" for="import-title">Movie Title (optional)</label>
-          <input id="import-title" type="text" class="import-input" placeholder="Auto-detect from disc label (e.g. Eulogy)" autocomplete="off">
+          <input id="import-title" type="text" class="import-input" placeholder="From the disc's label" autocomplete="off">
         </div>
         <label class="import-checkbox-row">
           <input id="import-enrich" type="checkbox" checked>
           <span>Fetch movie metadata (director, cast, year, genres)</span>
         </label>
+        <div id="import-exists" class="import-exists" style="display:none;">
+          <div id="import-exists-text"></div>
+          <div class="import-exists-actions">
+            <button id="btn-import-keep" class="hud-btn">Keep Both</button>
+            <button id="btn-import-replace" class="import-btn-danger">Replace</button>
+          </div>
+        </div>
       </div>
 
       <div id="import-progress-box" class="import-progress-box">
@@ -1793,6 +1817,17 @@
     const importErrorMsg = document.getElementById('import-error-msg');
     const importLog = document.getElementById('import-log');
     const btnStartImport = document.getElementById('btn-start-import');
+    const importExists = document.getElementById('import-exists');
+    const importExistsText = document.getElementById('import-exists-text');
+    const btnImportKeep = document.getElementById('btn-import-keep');
+    const btnImportReplace = document.getElementById('btn-import-replace');
+    let importExistingName = '';
+
+    function hideImportExists() {
+      importExistingName = '';
+      importExists.style.display = 'none';
+      btnStartImport.style.visibility = '';
+    }
     const btnCancelImport = document.getElementById('btn-cancel-import');
     const btnPlayImported = document.getElementById('btn-play-imported');
     const btnOpenImport = document.getElementById('btn-open-import');
@@ -1808,10 +1843,14 @@
         if (!importSourceInput.value && data.default_source) {
           importSourceInput.value = data.default_source;
         }
-        if (!importTitleInput.value && data.default_title) {
-          importTitleInput.value = data.default_title;
-        }
         importPrefilled = true;
+      }
+      // The title the disc's label suggests is only shown, never put in the
+      // field: a title in the field names the import, and would still be
+      // there for the next disc
+      if (!data.active) {
+        importTitleInput.placeholder = data.default_title
+          ? "From the disc's label: " + data.default_title : "From the disc's label";
       }
 
       const isActive = (data.state === 'ripping' || data.state === 'converting' || data.active);
@@ -1888,6 +1927,7 @@
 
     function openImportModal() {
       importPrefilled = false;
+      hideImportExists();
       importModal.classList.add('visible');
       pollImportStatus();
     }
@@ -1896,7 +1936,9 @@
       importModal.classList.remove('visible');
     }
 
-    function startImport() {
+    // choice: undefined to ask if the name is taken; {replace: name} or
+    // {keep_both: true} once the user has answered
+    function startImport(choice) {
       const src = importSourceInput.value.trim();
       if (!src) {
         importErrorMsg.textContent = 'Please enter a DVD drive device or source path.';
@@ -1908,9 +1950,20 @@
       btnStartImport.disabled = true;
       importErrorMsg.style.display = 'none';
 
-      api('/api/import/start', { source: src, title: title, skip_enrichment: !importEnrichCheck.checked })
+      hideImportExists();
+      api('/api/import/start', Object.assign(
+        { source: src, title: title, skip_enrichment: !importEnrichCheck.checked }, choice || {}))
         .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
         .then(({ ok, data }) => {
+          if (!ok && data && data.status === 'exists') {
+            importExistingName = data.name;
+            importExistsText.textContent = '“' + data.name + '” is already in your library. '
+              + 'Replace it with this disc, or keep both (the new one is saved beside it)?';
+            importExists.style.display = 'block';
+            btnStartImport.style.visibility = 'hidden';
+            btnStartImport.disabled = false;
+            return;
+          }
           if (!ok) {
             importErrorMsg.textContent = (data && data.error) || 'Failed to start import.';
             importErrorMsg.style.display = 'block';
@@ -1919,6 +1972,7 @@
             return;
           }
           lastImportState = 'converting';
+          importTitleInput.value = '';  // a title belongs to this disc only
           pollImportStatus();
         })
         .catch(err => {
@@ -1938,7 +1992,14 @@
     if (btnOpenImport) btnOpenImport.onclick = openImportModal;
     document.getElementById('btn-close-import').onclick = closeImportModal;
     btnDoneImport.onclick = closeImportModal;
-    btnStartImport.onclick = startImport;
+    btnStartImport.onclick = () => startImport();
+    btnImportKeep.onclick = () => startImport({ keep_both: true });
+    btnImportReplace.onclick = () => {
+      if (importExistingName) startImport({ replace: importExistingName });
+    };
+    // A different source or title may mean a different name: ask again
+    importSourceInput.addEventListener('input', hideImportExists);
+    importTitleInput.addEventListener('input', hideImportExists);
     btnCancelImport.onclick = cancelImport;
     btnPlayImported.onclick = () => {
       if (!lastImportedDiscId) return;

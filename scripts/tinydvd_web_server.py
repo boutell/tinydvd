@@ -730,10 +730,20 @@ class TinyDVDRequestHandler(BaseHTTPRequestHandler):
         if not app.allow_import:
             self._send_json(403, "Forbidden", {"status": "error", "error": "Web import is turned off on this server"})
             return
+        source, title = str(body.get("source") or ""), str(body.get("title") or "")
+        # The name is taken: ask before replacing it (replace names the file
+        # the user agreed to replace; keep_both saves the new one beside it)
+        replace = str(body.get("replace") or "")
+        if not replace and not body.get("keep_both"):
+            existing = app.library.existing_import_target(source, title)
+            if existing:
+                self._send_json(409, "Conflict", {"status": "exists", "name": existing})
+                return
         ok, err = app.library.start_import(
-            str(body.get("source") or ""),
-            title=str(body.get("title") or ""),
+            source,
+            title=title,
             skip_enrichment=bool(body.get("skip_enrichment")),
+            replace=replace,
         )
         if ok:
             self._send_json(200, "OK", {"status": "started"})

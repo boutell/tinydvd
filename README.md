@@ -49,6 +49,8 @@ Most commercial DVDs are CSS-encrypted. To rip them straight from a drive you ne
 
 Importing a disc from a drive needs up to about one and a half times the disc's size free (at most roughly 13 GB) in your library folder while it works. The ripped copy is deleted as soon as it's converted, and when the import is done only the `.tdvd` remains, usually 20–35% of the disc's size. TinyDVD checks the free space before it starts, and it deletes its working files whether the import finishes, fails or is cancelled.
 
+An import is named after the disc's label unless you type a title. If your library already has a TinyDVD by that name, the import asks first, naming the file: **Replace** it, or **Keep Both** (the new one gets the year or a number added, like `Dune (2).tdvd`). Nothing is replaced without that answer. The converter on its own does the same: it asks in a terminal, takes `--replace`, and otherwise keeps both.
+
 #### Other options
 
 To install somewhere you can write without `sudo`, use `./install --prefix ~/.local` (on macOS the app then goes in `~/Applications`; choose another folder with `--app-dir`). To remove everything again:
@@ -323,7 +325,7 @@ tinydvd --lookup                 # the disc in the drive
 tinydvd --lookup /dev/sr0 --title "Dune: Part Two"
 ```
 
-It looks the disc up exactly as the import dialog's "Fetch movie metadata" option does and prints the `metadata.json` the import would store. The disc must be mounted (most desktops do this when you insert it), since its running time comes from the disc's IFO files.
+It looks the disc up exactly as the import dialog's "Fetch movie metadata" option does and prints the `metadata.json` the import would store. It reads only the disc's small IFO files (where its running time is), so it takes seconds. It also works on a mounted disc, a `VIDEO_TS` folder, an `.iso`, or a `.tdvd`.
 
 Changing a `.tdvd` file (metadata or thumbnail) writes a new copy next to it and swaps it in, so an interrupted update never damages the original. It needs enough free space for a second copy while it runs.
 

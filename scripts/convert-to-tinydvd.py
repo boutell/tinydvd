@@ -1057,11 +1057,13 @@ def _meta_bytes(meta):
     return json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def build_archive(source_dir, desired_path, meta):
+def build_archive(source_dir, desired_path, meta, replace=False):
     """
     Package source_dir as a .tdvd under desired_path or the first free
-    variant of it. The archive is written to a hidden temporary file and only
-    then moved into place, so the library never sees a half-written archive.
+    variant of it; or, if replace (which the user must have confirmed), as
+    desired_path whether or not it exists. The archive is written to a hidden
+    temporary file and only then moved into place, so the library never sees
+    a half-written archive, and a replaced one survives a failed conversion.
     Returns the path written.
     """
     parent = os.path.dirname(desired_path) or "."
@@ -1073,7 +1075,7 @@ def build_archive(source_dir, desired_path, meta):
 
     candidates = output_candidates(desired_path, year)
     cand, copy_no = next(candidates)
-    while os.path.exists(cand):
+    while os.path.exists(cand) and not (replace and cand == desired_path):
         cand, copy_no = next(candidates)
 
     def meta_for(n):
@@ -1095,6 +1097,13 @@ def build_archive(source_dir, desired_path, meta):
     os.close(fd)
     try:
         package_tdvd_archive(source_dir, tmp, extra)
+        if replace and cand == desired_path:
+            replaced = os.path.exists(desired_path)
+            os.chmod(tmp, tinydvd_archive.NEW_FILE_MODE)
+            os.replace(tmp, desired_path)
+            if replaced:
+                print(f"[replace] Replaced the existing {os.path.basename(desired_path)}, as confirmed")
+            return desired_path
         while True:
             if cand != desired_path:
                 print(f"[duplicate] An archive already has that name; saving as {cand}")
@@ -1110,6 +1119,38 @@ def build_archive(source_dir, desired_path, meta):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def confirm_replace(output_path, is_single_file, replace_flag):
+    """
+    Whether to replace an existing TinyDVD at output_path. Never without the
+    user's say: --replace, or (in a terminal) a yes to a question naming it.
+    Asked before converting, not after. Without it, a new .tdvd is saved
+    beside the old one, and a TinyDVD folder isn't written into at all.
+    """
+    exists = os.path.exists(output_path) if is_single_file else (
+        os.path.isdir(output_path) and bool(tinydvd_archive.list_members(output_path)))
+    if not exists or replace_flag:
+        return replace_flag
+    name = os.path.basename(output_path)
+    if is_single_file:
+        question = (f"{name} already exists. Replace it? "
+                    f"(Otherwise the new one is saved beside it.) [y/N] ")
+    else:
+        question = f"The folder {name} already has files in it. Write the TinyDVD over them? [y/N] "
+    answer = ""
+    if sys.stdin.isatty():
+        try:
+            answer = input(question).strip().lower()
+        except EOFError:
+            answer = ""
+    if answer in ("y", "yes"):
+        return True
+    if not is_single_file:
+        sys.exit(f"Not writing into {output_path}, which already has files in it "
+                 "(pass --replace to write over them, or choose another folder).")
+    print(f"[duplicate] {name} already exists; the new one will be saved beside it")
+    return False
 
 
 def _delete_temporary_rip(path):
@@ -1158,6 +1199,9 @@ def main():
     parser.add_argument("--disc-mastered", default="", metavar="YYYY-MM-DD",
                         help="When the disc was mastered, if the input doesn't say (it's read from ISO "
                              "images and drives); helps pick the right film among remakes")
+    parser.add_argument("--replace", action="store_true",
+                        help="Replace the output .tdvd if it exists (by default the new one is saved "
+                             "beside it, as '<name> (2).tdvd')")
     parser.add_argument("--skip-enrichment", action="store_true",
                         help="Don't look up the movie's details (director, cast, genres, overview, year) online. "
                              "The lookup sends only the title, to Wikidata/Wikipedia and any service you give a key for.")
@@ -1191,17 +1235,19 @@ def main():
             print(f"[warning] Metadata lookup failed: {e}", file=sys.stderr)
             return existing
 
+    replace = confirm_replace(output_path, is_single_file, args.replace)
+
     if is_single_file:
         parent_dir = os.path.dirname(output_path) or "."
         os.makedirs(parent_dir, exist_ok=True)
         if is_already_converted_dir(raw_input):
-            output_path = build_archive(raw_input, output_path, lookup_meta(raw_input))
+            output_path = build_archive(raw_input, output_path, lookup_meta(raw_input), replace)
         else:
             with tempfile.TemporaryDirectory(prefix=".tdvd_stage_", dir=parent_dir) as stage_dir:
                 run_conversion_to_dir(raw_input, stage_dir, args)
                 if args.delete_rip_before_packaging:
                     _delete_temporary_rip(raw_input)
-                output_path = build_archive(stage_dir, output_path, lookup_meta(stage_dir))
+                output_path = build_archive(stage_dir, output_path, lookup_meta(stage_dir), replace)
     else:
         run_conversion_to_dir(raw_input, output_path, args)
         meta = lookup_meta(output_path)

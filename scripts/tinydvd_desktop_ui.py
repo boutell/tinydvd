@@ -452,6 +452,10 @@ class TinyDVDDesktopUI:
 
         self.import_modal_open = False
         self.import_prefilled = False
+        self.import_title_hint = ""
+        # A TinyDVD already has the name this import would take: the user
+        # is being asked whether to replace it (its file name) or keep both
+        self.import_conflict = ""
         self.last_import_state = IMPORT_IDLE
         self.last_import_active = False
         self.local_import_err = ""
@@ -480,6 +484,7 @@ class TinyDVDDesktopUI:
         self.r_modal_cancel = Rect()
         self.r_modal_done = Rect()
         self.r_modal_play = Rect()
+        self.r_modal_keep = Rect()
 
         self.sync_catalog_snapshot()
         self.last_catalog_gen = self.lib.get_generation()
@@ -534,16 +539,19 @@ class TinyDVDDesktopUI:
         self.dragging_tf = False
         self.copy_log_feedback_ms = 0
         self.local_import_err = ""
+        self.import_conflict = ""
 
         st = self._read_import_snapshot()
         active = st["active"]
-        if not active and not self.import_prefilled:
+        if not active:
             def_src, def_title = detect_default_source()
-            if not self.tf_source.text and def_src:
+            if not self.import_prefilled and not self.tf_source.text and def_src:
                 self.tf_source.set_text(def_src)
-            if not self.tf_title.text and def_title:
-                self.tf_title.set_text(def_title)
-            self.import_prefilled = True
+                self.import_prefilled = True
+            # The title the disc's label suggests is only shown, never put in
+            # the field: a title in the field names the import, and would
+            # still be there for the next disc
+            self.import_title_hint = def_title
 
         self.focus = FOCUS_NONE if active else FOCUS_MODAL_SOURCE
         self.dirty = True
@@ -555,21 +563,33 @@ class TinyDVDDesktopUI:
             self.focus = FOCUS_NONE
         self.dirty = True
 
-    def start_import_from_modal(self) -> None:
+    def start_import_from_modal(self, choice: str = "") -> None:
+        """choice: "" to ask first if the name is taken; "replace" or "keep" once answered"""
         src = self.tf_source.text.strip()
         if not src:
             self.local_import_err = "Please enter a DVD drive device or source path."
             self.dirty = True
             return
         self.local_import_err = ""
+        existing = self.lib.existing_import_target(src, self.tf_title.text)
+        # Ask (again, if the source or title changed the name since)
+        if existing and (not choice or existing != self.import_conflict):
+            self.import_conflict = existing
+            self.dirty = True
+            return
+        replace = existing if choice == "replace" else ""
+        self.import_conflict = ""
         ok, err = self.lib.start_import(
             src,
             title=self.tf_title.text,
             skip_enrichment=not self.enrich_checked,
+            replace=replace,
         )
         if not ok:
             self.local_import_err = err or "Failed to start import."
         else:
+            # A title belongs to this disc only
+            self.tf_title.set_text("")
             self.focus = FOCUS_NONE
             self.dragging_tf = False
         self.dirty = True
@@ -661,6 +681,7 @@ class TinyDVDDesktopUI:
         self.r_modal_cancel = Rect()
         self.r_modal_done = Rect()
         self.r_modal_play = Rect()
+        self.r_modal_keep = Rect()
         self.card_hits = []
 
         if in_player_view:
@@ -713,7 +734,8 @@ class TinyDVDDesktopUI:
             st = imp["state"]
             active = imp["active"]
             show_form = not active
-            show_progress = (st != IMPORT_IDLE) or active or bool(self.local_import_err)
+            show_progress = ((st != IMPORT_IDLE) or active or bool(self.local_import_err)
+                             or bool(self.import_conflict))
 
             mw = min(580.0, float(win_w) - 40.0)
             mh = 112.0 + (202.0 if show_form else 0.0) + (236.0 if show_progress else 0.0)
@@ -763,6 +785,10 @@ class TinyDVDDesktopUI:
                 sw_btn = 124.0
                 self.r_modal_start = Rect(rx - sw_btn, footer_y, sw_btn, 36.0)
                 rx -= sw_btn + 10.0
+                if self.import_conflict:
+                    kw = 110.0
+                    self.r_modal_keep = Rect(rx - kw, footer_y, kw, 36.0)
+                    rx -= kw + 10.0
             cw = 84.0
             self.r_modal_done = Rect(rx - cw, footer_y, cw, 36.0)
             rx -= cw + 10.0
@@ -1289,7 +1315,8 @@ class TinyDVDDesktopUI:
             self._draw_textfield(
                 self.r_modal_title,
                 self.tf_title,
-                "Auto-detect from disc label (e.g. Eulogy)",
+                (f"From the disc's label: {self.import_title_hint}" if self.import_title_hint
+                 else "From the disc's label"),
                 self.focus == FOCUS_MODAL_TITLE,
                 False,
                 12.0,
@@ -1315,7 +1342,11 @@ class TinyDVDDesktopUI:
             )
             cur_y = self.r_modal_enrich.y + 34.0
 
+        conflict = self.import_conflict if not active else ""
         display_err = self.local_import_err or err_msg
+        if conflict:
+            display_err = (f"\u201c{conflict}\u201d is already in your library. Replace it with this "
+                           "disc, or keep both (the new one is saved beside it)?")
         if st != IMPORT_IDLE or active or display_err:
             pbox_h = b.y + b.h - 66.0 - cur_y
             if pbox_h > 40.0:
@@ -1323,8 +1354,10 @@ class TinyDVDDesktopUI:
                     self.ctx, ix, cur_y, iw, pbox_h, 8.0, 0,
                     0.043, 0.047, 0.063, 1.0, 1.0, 1.0, 1.0, 1.0, 0.12
                 )
-                is_err = (st == IMPORT_ERROR) or bool(self.local_import_err)
+                is_err = (st == IMPORT_ERROR) or bool(self.local_import_err) or bool(conflict)
                 s_text = stage_msg or ("Error" if self.local_import_err else "Importing...")
+                if conflict:
+                    s_text = "Name already in use"
                 prog_cy = (
                     self.r_modal_copy_log.y + self.r_modal_copy_log.h * 0.5
                     if self.r_modal_copy_log.h > 0.0
@@ -1350,15 +1383,16 @@ class TinyDVDDesktopUI:
 
                 log_y = cur_y + 36.0
                 if is_err and display_err:
+                    lines = 2 if conflict else 1
                     self.core.lib.tdvd_canvas_rounded_rect(
-                        self.ctx, ix + 12.0, log_y, iw - 24.0, 30.0, 5.0, 0,
+                        self.ctx, ix + 12.0, log_y, iw - 24.0, 16.0 + 15.0 * lines, 5.0, 0,
                         1.0, 0.30, 0.30, 0.14, 0.0, 0.0, 0.0, 0.0, 0.0
                     )
                     self._draw_text(
-                        display_err, ix + 20.0, log_y + 7.0, iw - 40.0, 1, 12.0, False, False,
+                        display_err, ix + 20.0, log_y + 7.0, iw - 40.0, lines, 12.0, False, False,
                         (1.0, 0.45, 0.45, 1.0), ALIGN_LEFT,
                     )
-                    log_y += 36.0
+                    log_y += 22.0 + 15.0 * lines
 
                 log_h = cur_y + pbox_h - 10.0 - log_y
                 if log_h > 24.0:
@@ -1386,7 +1420,16 @@ class TinyDVDDesktopUI:
             self.r_modal_done, "Close", False, False,
             self.r_modal_done.contains(self.mouse_x, self.mouse_y),
         )
-        if not active:
+        if not active and conflict:
+            self._draw_button(
+                self.r_modal_keep, "Keep Both", False, False,
+                self.r_modal_keep.contains(self.mouse_x, self.mouse_y),
+            )
+            self._draw_button(
+                self.r_modal_start, "Replace", False, True,
+                self.r_modal_start.contains(self.mouse_x, self.mouse_y),
+            )
+        elif not active:
             self._draw_button(
                 self.r_modal_start, "Start Import", True, False,
                 self.r_modal_start.contains(self.mouse_x, self.mouse_y),
@@ -1598,8 +1641,11 @@ class TinyDVDDesktopUI:
                         self.enrich_checked = not self.enrich_checked
                         self.dirty = True
                         return True, "", "", False
+                    if self.import_conflict and self.r_modal_keep.contains(mx, my):
+                        self.start_import_from_modal("keep")
+                        return True, "", "", False
                     if self.r_modal_start.contains(mx, my):
-                        self.start_import_from_modal()
+                        self.start_import_from_modal("replace" if self.import_conflict else "")
                         return True, "", "", False
 
                 self.focus = FOCUS_NONE
@@ -1769,7 +1815,9 @@ class TinyDVDDesktopUI:
                     return True, "", "", False
                 if sym in (SDLK_RETURN, SDLK_KP_ENTER):
                     if self.import_modal_open:
-                        self.start_import_from_modal()
+                        # Replacing takes a click on Replace, never just Enter
+                        if not self.import_conflict:
+                            self.start_import_from_modal()
                         return True, "", "", False
                     if self.focus == FOCUS_SEARCH and self.filtered_indices:
                         idx = self.selected_filtered if 0 <= self.selected_filtered < len(self.filtered_indices) else 0

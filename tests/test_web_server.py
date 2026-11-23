@@ -48,6 +48,7 @@ from tinydvd_desktop_ui import (
     parse_png_sar,
 )
 from tinydvd_library import TinyDVDLibrary, disc_id_for_path
+import tinydvd_archive
 import tinydvd_mp4
 from tinydvd_web_server import TinyDVDWebServer, compute_ws_accept_key
 
@@ -586,15 +587,27 @@ def test_duplicate_dvd_import_disambiguation(core: TinyDVDCore) -> None:
             assert st == 200
             poll_import_until_done(server)
 
-            # 2. Dune Test (2021).tdvd
+            # The name is taken: nothing starts until the user says what to
+            # do, and the question names the file
+            before = sorted(os.listdir(lib_dir))
+            st, _, body = http_post_json(server, "/api/import/start",
+                                         {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True})
+            assert st == 409 and json.loads(body) == {"status": "exists", "name": "Dune Test.tdvd"}, body
+            assert not json.loads(http_get(server, "/api/import/status")[2])["active"]
+            assert sorted(os.listdir(lib_dir)) == before
+
+            # 2. Keep both: Dune Test (2021).tdvd
             st, _, _ = http_post_json(server, "/api/import/start",
-                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True})
+                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True,
+                                       "keep_both": True})
             assert st == 200
             poll_import_until_done(server)
 
-            # 3. Dune Test (2021) (2).tdvd
+            # 3. Keep both: Dune Test (2021) (2).tdvd. Replacing a file
+            # other than the one this import would take counts for nothing
             st, _, _ = http_post_json(server, "/api/import/start",
-                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True})
+                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True,
+                                       "replace": "Dune Test (2021).tdvd"})
             assert st == 200
             res3 = poll_import_until_done(server)
             assert res3["result_title"] == "Dune Test (2)"
@@ -609,7 +622,20 @@ def test_duplicate_dvd_import_disambiguation(core: TinyDVDCore) -> None:
             assert "David Lynch" in txt
             assert "Denis Villeneuve" in txt
             assert "Dune Test (2)" in txt
-            print("  - Duplicate DVD Disambiguation: OK (year suffix + (2) numeric suffix, no overwrites)")
+
+            # 4. Replace, as confirmed: Dune Test.tdvd now holds the 2021 disc
+            st, _, _ = http_post_json(server, "/api/import/start",
+                                      {"source": src2_dir, "title": "Dune Test", "skip_enrichment": True,
+                                       "replace": "Dune Test.tdvd"})
+            assert st == 200
+            res4 = poll_import_until_done(server)
+            assert any("Replacing Dune Test.tdvd" in line for line in res4["logs"]), res4["logs"]
+            assert sorted(n for n in os.listdir(lib_dir) if n.endswith(".tdvd")) == [
+                "Dune Test (2021) (2).tdvd", "Dune Test (2021).tdvd", "Dune Test.tdvd"]
+            replaced = tinydvd_archive.read_metadata(os.path.join(lib_dir, "Dune Test.tdvd"))
+            assert replaced["director"] == "Denis Villeneuve", replaced
+            print("  - Duplicate DVD Disambiguation: OK (asks first, naming the file; keep both adds a "
+                  "year or (2); replace only the confirmed file)")
         finally:
             server.stop()
     finally:

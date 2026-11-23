@@ -6,6 +6,8 @@ shares, and for disc IDs.
 
 from __future__ import annotations
 
+import importlib
+import io
 import json
 import os
 import shutil
@@ -236,6 +238,44 @@ def test_mounted_disc_drive(tmp: str) -> None:
     print("  - Discs in a drive are named by their volume label: OK")
 
 
+def test_replace_needs_confirmation(tmp: str) -> None:
+    """The converter replaces an existing TinyDVD only when told to"""
+    converter = importlib.import_module("convert-to-tinydvd")
+    lib = os.path.join(tmp, "replace_lib")
+    os.makedirs(lib)
+    src = os.path.join(tmp, "replace_src")
+    os.makedirs(src)
+    with open(os.path.join(src, "VIDEO_TS.IFO"), "wb") as f:
+        f.write(b"new")
+    old = os.path.join(lib, "Movie.tdvd")
+    with open(old, "wb") as f:
+        f.write(b"the old one")
+
+    real_stdin = sys.stdin
+    sys.stdin = io.StringIO("y\n")   # not a terminal: nobody to ask, so no
+    try:
+        assert converter.confirm_replace(old, True, False) is False
+        assert converter.confirm_replace(old, True, True) is True
+        assert converter.confirm_replace(os.path.join(lib, "Other.tdvd"), True, False) is False
+        try:  # a TinyDVD folder isn't written into without the say-so
+            converter.confirm_replace(src, False, False)
+            raise AssertionError("wrote into an existing folder")
+        except SystemExit:
+            pass
+    finally:
+        sys.stdin = real_stdin
+
+    kept = converter.build_archive(src, old, {"title": "Movie"}, replace=False)
+    assert kept == os.path.join(lib, "Movie (2).tdvd"), kept
+    with open(old, "rb") as f:
+        assert f.read() == b"the old one"
+    assert converter.build_archive(src, old, {"title": "Movie"}, replace=True) == old
+    assert tinydvd_archive.read_member(old, "VIDEO_TS.IFO", 100) == b"new"
+    assert tinydvd_archive.read_metadata(old)["title"] == "Movie"
+    assert sorted(os.listdir(lib)) == ["Movie (2).tdvd", "Movie.tdvd"]   # no temporary files left
+    print("  - Replacing an existing TinyDVD only when confirmed: OK")
+
+
 def main() -> int:
     print("=== Running TinyDVD archive helper tests ===")
     tmp = tempfile.mkdtemp(prefix="tinydvd_test_archive_")
@@ -248,6 +288,7 @@ def main() -> int:
         test_default_library_path(tmp)
         test_import_housekeeping(tmp)
         test_mounted_disc_drive(tmp)
+        test_replace_needs_confirmation(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("All archive helper tests passed!")

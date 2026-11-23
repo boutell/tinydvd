@@ -404,8 +404,17 @@ def _is_generic_label(label: str) -> bool:
     return not label or re.fullmatch(r"(?i)(sr|cdrom|dvd|disc|disk|rdisk)\d*|DVD_?VIDEO|VIDEO_TS", label) is not None
 
 
+def _label_title_hint(dev: str) -> str:
+    """What an import from the drive would be named, if the disc's label says"""
+    stem = import_output_stem(dev)
+    return "" if stem == "DVD" else stem
+
+
 def detect_default_source() -> tuple[str, str]:
-    """Auto-detect a mounted DVD volume or optical device and a clean title hint."""
+    """
+    A mounted DVD volume or optical drive, and the name an import of it would
+    get (from the disc's label), or "" if there's no label to go by
+    """
     candidates: list[tuple[str, str]] = []
     if sys.platform == "darwin":
         volumes_dir = "/Volumes"
@@ -416,7 +425,7 @@ def detect_default_source() -> tuple[str, str]:
                         continue
                     vp = os.path.join(volumes_dir, entry)
                     if os.path.isdir(vp) and is_dvd_dir(vp):
-                        candidates.append((vp, _clean_disc_label(entry)))
+                        candidates.append((vp, import_output_stem(vp)))
             except OSError:
                 pass
     else:
@@ -430,13 +439,13 @@ def detect_default_source() -> tuple[str, str]:
                         dirs[:] = []
                         continue
                     if is_dvd_dir(root):
-                        candidates.append((root, _clean_disc_label(os.path.basename(root))))
+                        candidates.append((root, import_output_stem(root)))
                         dirs[:] = []
             except OSError:
                 pass
         for dev in ("/dev/sr0", "/dev/cdrom", "/dev/dvd"):
             if os.path.exists(dev):
-                candidates.append((dev, _clean_disc_label(disc_volume_label(dev))))
+                candidates.append((dev, _label_title_hint(dev)))
 
     if candidates:
         return candidates[0]
@@ -493,27 +502,42 @@ def preview_import_metadata(src: str, title: str = "") -> dict:
     disc's IFO files (which hold the running time and are never encrypted)
     are read where they are. Raises ValueError if src can't be previewed.
     """
-    rip_src = optical_device_for(src) or src   # as start_import does
-    stem = import_output_stem(rip_src, title)
-    ifo_dir = src
-    if is_device_path(src):
-        ifo_dir = mount_point_of(src)
-        if not ifo_dir:
-            raise ValueError(f"The disc in {src} isn't mounted; mount it (or open it in the file "
-                             "manager) so its IFO files can be read.")
-    if os.path.isdir(os.path.join(ifo_dir, "VIDEO_TS")):
-        ifo_dir = os.path.join(ifo_dir, "VIDEO_TS")
-    is_package = tinydvd_archive.is_tdvd_path(src)
-    if not (is_package or any(n.upper() == "VIDEO_TS.IFO" for n in tinydvd_archive.list_members(ifo_dir))):
-        raise ValueError(f"No DVD found at {src} (a drive, a mounted disc, a VIDEO_TS folder or a .tdvd)")
-    # Only a drive knows when its disc was mastered (a .tdvd keeps it in its
-    # metadata, which the lookup reads itself)
-    mastered = tinydvd_archive.read_volume_info(rip_src).mastered if is_device_path(rip_src) else ""
+    if not os.path.exists(src):
+        raise ValueError(f"{src} doesn't exist")
+    stem = import_output_stem(src, title)   # as start_import does
+    rip_src = optical_device_for(src) or src
+    is_image = os.path.isfile(src) and src.lower().endswith((".iso", ".img"))
     print(f"Source: {src}" + (f" (drive {rip_src})" if rip_src != src else ""))
     print(f"Import would be named: {stem}.tdvd")
-    return tinydvd_metadata.enrich_movie(
-        ifo_dir, title_hint_path=f"{stem}.tdvd", write=False, mastered=mastered,
-        tmdb_key=os.environ.get("TMDB_API_KEY", ""), omdb_key=os.environ.get("OMDB_API_KEY", ""))
+    # Only a disc knows when it was mastered (a .tdvd keeps it in its
+    # metadata, which the lookup reads itself). The import passes it on for a
+    # drive; the converter reads it from an image itself
+    mastered = (tinydvd_archive.read_volume_info(rip_src).mastered
+                if is_device_path(rip_src) or is_image else "")
+
+    def lookup(ifo_dir: str) -> dict:
+        if not (tinydvd_archive.is_tdvd_path(ifo_dir)
+                or any(n.upper() == "VIDEO_TS.IFO" for n in tinydvd_archive.list_members(ifo_dir))):
+            raise ValueError(f"No DVD found at {src} (a drive, a mounted disc, a VIDEO_TS folder, "
+                             "an .iso or a .tdvd)")
+        return tinydvd_metadata.enrich_movie(
+            ifo_dir, title_hint_path=f"{stem}.tdvd", write=False, mastered=mastered,
+            tmdb_key=os.environ.get("TMDB_API_KEY", ""), omdb_key=os.environ.get("OMDB_API_KEY", ""))
+
+    if is_device_path(src) or is_image:
+        # Read the IFOs straight off the disc, as the import's rip would get
+        # them; no need to mount it
+        ifos = tinydvd_archive.read_disc_ifos(src)
+        if not ifos and is_device_path(src) and mount_point_of(src):
+            src = mount_point_of(src)
+        else:
+            with tempfile.TemporaryDirectory(prefix=".tdvd_lookup_") as tmp:
+                for name, data in ifos.items():
+                    with open(os.path.join(tmp, name), "wb") as f:
+                        f.write(data)
+                return lookup(tmp)
+    ifo_dir = os.path.join(src, "VIDEO_TS") if os.path.isdir(os.path.join(src, "VIDEO_TS")) else src
+    return lookup(ifo_dir)
 
 
 def _compute_dir_signature(target_path: str, is_library: bool) -> int:
@@ -1027,7 +1051,33 @@ class TinyDVDLibrary:
                 "logs": list(self.imp_logs),
             }
 
-    def start_import(self, source: str, title: str = "", skip_enrichment: bool = False) -> tuple[bool, str]:
+    def _import_out_dir(self) -> str:
+        with self.catalog_lock:
+            return self.target_path if self.is_library else (os.path.dirname(self.target_path) or ".")
+
+    def existing_import_target(self, source: str, title: str = "") -> str:
+        """
+        The file name an import of source would take, if a TinyDVD already
+        has it (so the user must be asked before replacing it), else "".
+        """
+        src = os.path.expanduser((source or "").strip())
+        if not src or not os.path.exists(src):
+            return ""
+        stem = import_output_stem(src, (title or "").strip())
+        if stem == "DVD" and is_device_path(src) and not (title or "").strip():
+            # No label: the name comes from the rip, so it isn't known yet
+            # (and if it's taken then, the new one is kept beside it)
+            return ""
+        name = f"{stem}.tdvd"
+        return name if os.path.exists(os.path.join(self._import_out_dir(), name)) else ""
+
+    def start_import(self, source: str, title: str = "", skip_enrichment: bool = False,
+                     replace: str = "") -> tuple[bool, str]:
+        """
+        Start importing source. If its name is taken, the new one is saved
+        beside the old one ("<name> (2).tdvd"), unless replace is that file
+        name: the user has confirmed replacing that very file.
+        """
         src = os.path.expanduser((source or "").strip())
         if not src:
             return False, "Missing DVD source path."
@@ -1039,8 +1089,7 @@ class TinyDVDLibrary:
         if not os.path.isfile(convert_script):
             return False, "convert-to-tinydvd.py not found."
 
-        with self.catalog_lock:
-            out_dir = self.target_path if self.is_library else (os.path.dirname(self.target_path) or ".")
+        out_dir = self._import_out_dir()
 
         if not os.path.isdir(out_dir):
             try:
@@ -1063,6 +1112,8 @@ class TinyDVDLibrary:
         title_clean = (title or "").strip()
         stem = import_output_stem(src, title_clean)
         desired_output = os.path.join(out_dir, f"{stem}.tdvd")
+        # Only the very file the user agreed to replace
+        replace_output = desired_output if replace and replace == os.path.basename(desired_output) else ""
 
         with self.import_lock:
             if self.imp_active:
@@ -1095,7 +1146,7 @@ class TinyDVDLibrary:
         self._notify_import_change()
         t = threading.Thread(
             target=self._import_worker,
-            args=(rip_src, desired_output, stem, convert_script, bool(skip_enrichment)),
+            args=(rip_src, desired_output, stem, convert_script, bool(skip_enrichment), replace_output),
             name="tdvd-import-worker",
             daemon=True,
         )
@@ -1137,7 +1188,8 @@ class TinyDVDLibrary:
         return rc
 
     def _import_worker(
-        self, src: str, desired_output: str, stem: str, convert_script: str, skip_enrichment: bool
+        self, src: str, desired_output: str, stem: str, convert_script: str, skip_enrichment: bool,
+        replace_output: str = "",
     ) -> None:
         rip_tmp_dir = None
         conv_input = src
@@ -1242,6 +1294,9 @@ class TinyDVDLibrary:
                 cmd.append("--delete-rip-before-packaging")
             if skip_enrichment:
                 cmd.append("--skip-enrichment")
+            if replace_output and replace_output == desired_output:
+                cmd.append("--replace")
+                self._append_log(f">>> Replacing {os.path.basename(desired_output)}, as confirmed")
 
             def on_convert_line(s: str) -> None:
                 nonlocal final_archive

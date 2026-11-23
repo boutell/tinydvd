@@ -61,6 +61,51 @@ def read_volume_info(path: str) -> VolumeInfo:
     return VolumeInfo(label, mastered)
 
 
+def _iso_dir_records(f, lba: int, size: int):
+    """(name, flags, extent LBA, size) of each entry in an ISO 9660 directory"""
+    f.seek(lba * 2048)
+    data = f.read(min(size, 1 << 20))
+    pos = 0
+    while pos < len(data):
+        rec_len = data[pos]
+        if rec_len == 0:
+            # Records don't cross sectors; the rest of this one is padding
+            pos = (pos // 2048 + 1) * 2048
+            continue
+        rec = data[pos:pos + rec_len]
+        if len(rec) >= 34:
+            name = rec[33:33 + rec[32]].decode("ascii", "replace").split(";")[0].rstrip(".")
+            yield (name, rec[25], struct.unpack("<I", rec[2:6])[0], struct.unpack("<I", rec[10:14])[0])
+        pos += rec_len
+
+
+def read_disc_ifos(path: str, max_bytes: int = 16 << 20) -> dict[str, bytes]:
+    """
+    The IFO files of a DVD in a drive (e.g. /dev/sr0) or a disc image, read
+    from its ISO 9660 file system, so the disc needn't be mounted. IFOs are
+    never encrypted. {} if they can't be found.
+    """
+    out: dict[str, bytes] = {}
+    try:
+        with open(path, "rb") as f:
+            f.seek(16 * 2048)
+            pvd = f.read(2048)
+            if len(pvd) < 190 or pvd[0] != 1 or pvd[1:6] != b"CD001":
+                return {}
+            root_lba, root_size = struct.unpack("<I", pvd[158:162])[0], struct.unpack("<I", pvd[166:170])[0]
+            video_ts = [r for r in _iso_dir_records(f, root_lba, root_size)
+                        if r[0].upper() == "VIDEO_TS" and r[1] & 2]
+            if not video_ts:
+                return {}
+            for name, flags, lba, size in list(_iso_dir_records(f, video_ts[0][2], video_ts[0][3])):
+                if not flags & 2 and name.upper().endswith(".IFO") and 0 < size <= max_bytes:
+                    f.seek(lba * 2048)
+                    out[name.upper()] = f.read(size)
+    except OSError:
+        return {}
+    return out
+
+
 def is_tdvd_path(path: str) -> bool:
     """True if path names a .tdvd / .tinydvd archive (by extension, any case)."""
     return bool(path) and path.lower().endswith(TDVD_EXTENSIONS)

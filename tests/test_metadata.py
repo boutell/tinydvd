@@ -8,6 +8,7 @@ date. Offline: Wikidata's answers are canned.
 from __future__ import annotations
 
 import os
+import struct
 import sys
 import tempfile
 
@@ -107,6 +108,39 @@ def test_volume_info(tmp: str) -> None:
     print("  - Disc label and mastering date from the volume descriptor: OK")
 
 
+def make_iso(label: str, date: str, files: dict[str, bytes]) -> bytes:
+    """A minimal ISO 9660 image with these files in VIDEO_TS"""
+    def record(name: bytes, lba: int, size: int, is_dir: bool) -> bytes:
+        rec = bytearray(33 + len(name) + (1 - len(name) % 2))
+        rec[0] = len(rec)
+        rec[2:10] = struct.pack("<I", lba) + struct.pack(">I", lba)
+        rec[10:18] = struct.pack("<I", size) + struct.pack(">I", size)
+        rec[25] = 2 if is_dir else 0
+        rec[32] = len(name)
+        rec[33:33 + len(name)] = name
+        return bytes(rec)
+
+    def sector(data: bytes) -> bytes:
+        return data + b"\0" * (-len(data) % 2048)
+
+    names = sorted(files)
+    lbas, lba = {}, 20   # 16 PVD, 17 terminator, 18 root, 19 VIDEO_TS
+    for n in names:
+        lbas[n] = lba
+        lba += (len(files[n]) + 2047) // 2048
+    root = record(b"\0", 18, 2048, True) + record(b"\1", 18, 2048, True) + record(b"VIDEO_TS", 19, 2048, True)
+    video_ts = record(b"\0", 19, 2048, True) + record(b"\1", 18, 2048, True) + b"".join(
+        record(f"{n.upper()};1".encode(), lbas[n], len(files[n]), False) for n in names)
+    pvd = bytearray(2048)
+    pvd[0], pvd[1:6] = 1, b"CD001"
+    pvd[40:72] = label.encode().ljust(32)
+    pvd[156:190] = record(b"\0", 18, 2048, True)
+    pvd[813:830] = date.encode().ljust(17, b"0")
+    terminator = bytes([255]) + b"CD001" + b"\0" * 2042
+    return (b"\0" * 16 * 2048 + bytes(pvd) + terminator + sector(root) + sector(video_ts)
+            + b"".join(sector(files[n]) for n in names))
+
+
 def test_import_preview(tmp: str) -> None:
     """tinydvd --lookup names and looks up a disc as an import would"""
     mounts = os.path.join(tmp, "mounts")
@@ -144,6 +178,22 @@ def test_import_preview(tmp: str) -> None:
     # running time fits no Dune, so nothing is found
     assert searched and searched[0].startswith("Dune Part Two Ok "), searched
     assert meta["title"] == "Dune Part Two Ok" and meta["disc_id"], meta
+    # The same disc as an image (as a drive would read): its IFOs are read
+    # straight from the ISO 9660 file system, and the disc's date is used
+    ifos = {n: tinydvd_archive.read_member(fixture, n, 1 << 24)
+            for n in tinydvd_archive.list_members(fixture) if n.upper().endswith(".IFO")}
+    iso = os.path.join(tmp, "DUNE_PART_TWO_OK.iso")
+    with open(iso, "wb") as f:
+        f.write(make_iso("DUNE_PART_TWO_OK", "2024060112000000", ifos))
+    assert tinydvd_archive.read_disc_ifos(iso) == {n.upper(): d for n, d in ifos.items()}
+    M._get_json = fake
+    try:
+        from_image = tinydvd_library.preview_import_metadata(iso)
+    finally:
+        M._get_json = real
+    assert from_image["disc_id"] == meta["disc_id"] and from_image["disc_mastered"] == "2024-06-01", from_image
+    assert tinydvd_archive.read_disc_ifos(os.path.join(tmp, "mounts")) == {}  # not a disc
+
     try:
         tinydvd_library.preview_import_metadata(tmp)
         raise AssertionError("not a disc")
