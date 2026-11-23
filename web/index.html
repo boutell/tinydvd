@@ -1787,6 +1787,7 @@
 
     // Built-in DVD Import Workflow
     const importModal = document.getElementById('import-modal');
+    const btnDoneImport = document.getElementById('btn-done-import');
     const importSourceInput = document.getElementById('import-source');
     const importTitleInput = document.getElementById('import-title');
     const importEnrichCheck = document.getElementById('import-enrich');
@@ -1831,6 +1832,8 @@
         btnCancelImport.style.display = 'none';
         btnPlayImported.style.display = 'none';
         importErrorMsg.style.display = 'none';
+        btnDoneImport.textContent = 'Close';
+        btnDoneImport.title = '';
       } else {
         importForm.style.display = isActive ? 'none' : 'block';
         importProgressBox.classList.add('visible');
@@ -1854,6 +1857,9 @@
         btnStartImport.style.display = isActive ? 'none' : 'inline-block';
         btnStartImport.disabled = false;
         btnCancelImport.style.display = isActive ? 'inline-block' : 'none';
+        // Closing the dialog doesn't stop an import; say so while one runs
+        btnDoneImport.textContent = isActive ? 'Hide' : 'Close';
+        btnDoneImport.title = isActive ? 'The import keeps going; reopen it from the Importing DVD button' : '';
 
         if (data.state === 'done' && data.result_disc_id) {
           lastImportedDiscId = data.result_disc_id;
@@ -1936,7 +1942,7 @@
 
     if (btnOpenImport) btnOpenImport.onclick = openImportModal;
     document.getElementById('btn-close-import').onclick = closeImportModal;
-    document.getElementById('btn-done-import').onclick = closeImportModal;
+    btnDoneImport.onclick = closeImportModal;
     btnStartImport.onclick = startImport;
     btnCancelImport.onclick = cancelImport;
     btnPlayImported.onclick = () => {

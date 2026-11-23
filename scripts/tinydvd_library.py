@@ -176,6 +176,11 @@ def sweep_stale_work(directory: str, now: float | None = None) -> int:
     return freed
 
 
+# dvdbackup --progress: "Copying Title, part 2/4: 40% done (400/1024 MiB)",
+# rewritten in place with carriage returns (which read as line breaks here)
+DVDBACKUP_PROGRESS_RE = re.compile(r"(Copying .*?\d+% done \(\d+/\d+ MiB\))")
+
+
 def _tree_size(path: str) -> int:
     if not os.path.isdir(path) or os.path.islink(path):
         return os.lstat(path).st_size
@@ -1010,7 +1015,9 @@ class TinyDVDLibrary:
             # Always say what drive detection found (and which import code this
             # is), so a log shows whether the drive was used and why
             self.imp_logs.append(f">>> Import (drive-check 3): source {src}")
-            if rip_src != src:
+            if is_device_path(src):
+                self.imp_logs.append(">>> That's a drive; ripping the disc in it")
+            elif rip_src != src:
                 self.imp_logs.append(f">>> That's the disc in {rip_src}; ripping it from the drive "
                                      "(encrypted discs can't be read as files)")
             else:
@@ -1085,14 +1092,52 @@ class TinyDVDLibrary:
                 with self.import_lock:
                     self.imp_state = IMPORT_RIPPING
                     self.imp_stage_msg = "Ripping DVD disc..."
-                self._append_log(f">>> Running dvdbackup -M -i {src} -o {rip_tmp_dir}")
+                self._append_log(f">>> Running dvdbackup -M -p -i {src} -o {rip_tmp_dir}")
                 self._notify_import_change()
 
+                # Progress: dvdbackup's --progress line covers one file at a
+                # time, so the overall figure comes from how much of the disc
+                # has been copied, checked every couple of seconds (its output
+                # may arrive in bursts through the pipe)
+                disc_bytes = _disc_size(src)
+                rip_detail = [""]
+                rip_done = threading.Event()
+
+                def show_rip_progress() -> None:
+                    copied = _tree_size(rip_tmp_dir)
+                    pct = min(99, int(100 * copied / disc_bytes)) if disc_bytes else 0
+                    msg = f"Ripping DVD disc: {pct}% ({format_size(copied)} of about {format_size(disc_bytes)})"
+                    if rip_detail[0]:
+                        msg += f" - {rip_detail[0]}"
+                    with self.import_lock:
+                        if self.imp_state != IMPORT_RIPPING or self.imp_stage_msg == msg:
+                            return
+                        self.imp_stage_msg = msg[:200]
+                    self._notify_import_change()
+
+                def tick() -> None:
+                    while not rip_done.wait(2.0):
+                        show_rip_progress()
+
                 def on_rip_line(line: str) -> None:
+                    m = DVDBACKUP_PROGRESS_RE.search(line)
+                    if m:
+                        # Into the status line, not the log: there are thousands
+                        rip_detail[0] = m.group(1).strip()
+                        return
                     self._append_log(line)
                     self._notify_import_change()
 
-                rc = self._run_import_step([dvdbackup_bin, "-M", "-i", src, "-o", rip_tmp_dir], on_rip_line)
+                ticker = threading.Thread(target=tick, name="tdvd-rip-progress", daemon=True)
+                ticker.start()
+                cmd = [dvdbackup_bin, "-M", "-p", "-i", src, "-o", rip_tmp_dir]
+                stdbuf = shutil.which("stdbuf")
+                if stdbuf:
+                    cmd = [stdbuf, "-o0"] + cmd  # unbuffered, so progress arrives as it happens
+                try:
+                    rc = self._run_import_step(cmd, on_rip_line)
+                finally:
+                    rip_done.set()
                 if rc != 0:
                     raise RuntimeError(f"dvdbackup exited with status {rc}.")
 
