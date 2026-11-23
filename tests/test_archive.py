@@ -199,6 +199,25 @@ def test_import_housekeeping(tmp: str) -> None:
     print("  - Import disk-space estimate and warning: OK")
 
 
+def test_mounted_disc_drive(tmp: str) -> None:
+    # A mounted DVD is ripped from its drive (encrypted discs can't be read as
+    # files); everything else is read where it is
+    mounts = os.path.join(tmp, "mounts")
+    with open(mounts, "w") as f:
+        f.write("/dev/nvme0n1p2 / ext4 rw 0 0\n"
+                "/dev/sr0 /media/trox/A\\040Disc udf ro,nosuid 0 0\n"
+                "/dev/loop3 /media/trox/IMAGE iso9660 ro 0 0\n"
+                "tmpfs /run tmpfs rw 0 0\n")
+    find = lambda p: tinydvd_library.optical_device_for(p, mounts, platform="linux")  # noqa: E731
+    assert find("/media/trox/A Disc") == "/dev/sr0"
+    assert find("/media/trox/A Disc/VIDEO_TS") == "/dev/sr0"
+    assert find("/media/trox/A Disc2") == ""  # a different folder, not inside the mount
+    assert find("/media/trox/IMAGE") == ""  # a mounted image file: read as files
+    assert find("/home/trox/rips/MOVIE") == ""
+    assert tinydvd_library.optical_device_for("/media/trox/A Disc", mounts, platform="darwin") == ""
+    print("  - Mounted discs are ripped from their drive: OK")
+
+
 def main() -> int:
     print("=== Running TinyDVD archive helper tests ===")
     tmp = tempfile.mkdtemp(prefix="tinydvd_test_archive_")
@@ -210,6 +229,7 @@ def main() -> int:
         test_disc_ids()
         test_default_library_path(tmp)
         test_import_housekeeping(tmp)
+        test_mounted_disc_drive(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("All archive helper tests passed!")

@@ -10,6 +10,7 @@ players read in place (see tinydvd_mp4.py).
 from __future__ import annotations
 
 import sys
+import errno
 import os
 import glob
 import struct
@@ -1208,4 +1209,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except OSError as e:
+        if e.errno != errno.EIO:
+            raise
+        # Most often a mounted commercial DVD: its video is CSS-encrypted and
+        # the drive won't hand over those sectors without authentication
+        print(f"\nError: couldn't read {e.filename or 'the input'} (input/output error).", file=sys.stderr)
+        print("If this is a mounted DVD, it's probably encrypted: rip it from the drive first with\n"
+              "dvdbackup (needs libdvdcss; './install --with-libdvdcss' adds both), or import it\n"
+              "with TinyDVD, which does that for you. Otherwise the disc may be scratched or dirty.",
+              file=sys.stderr)
+        sys.exit(1)

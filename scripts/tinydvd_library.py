@@ -254,6 +254,45 @@ def is_device_path(src: str) -> bool:
     return stat.S_ISBLK(st.st_mode) or stat.S_ISCHR(st.st_mode)
 
 
+def _unescape_mount_field(field: str) -> str:
+    """/proc/self/mounts writes spaces and the like as octal escapes (\\040)"""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def optical_device_for(path: str, mounts_file: str = "/proc/self/mounts", platform: str | None = None) -> str:
+    """
+    The optical drive (e.g. /dev/sr0) whose disc is mounted at or above path,
+    or "" if path isn't on a disc in a drive (Linux only).
+
+    A commercial DVD's video files are usually CSS-encrypted, and the drive
+    refuses to read those sectors (Input/output error) until something
+    authenticates with it. Reading the mounted files can't do that; ripping
+    from the drive with dvdbackup (libdvdcss) can, so imports rip mounted
+    discs from their drive.
+    """
+    if not (platform or sys.platform).startswith("linux"):
+        return ""
+    try:
+        target = os.path.realpath(path)
+        with open(mounts_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    best_mount, best_device = "", ""
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        device, mount_point = _unescape_mount_field(parts[0]), _unescape_mount_field(parts[1])
+        inside = target == mount_point or target.startswith(mount_point.rstrip("/") + "/")
+        if inside and len(mount_point) > len(best_mount):
+            best_mount, best_device = mount_point, device
+    if not best_device.startswith("/dev/"):
+        return ""
+    real = os.path.realpath(best_device)
+    return real if re.fullmatch(r"/dev/sr[0-9]+", real) else ""
+
+
 def check_import_space(src: str, out_dir: str) -> str:
     """An explanation if out_dir lacks room to import src, else an empty string"""
     try:
@@ -901,11 +940,15 @@ class TinyDVDLibrary:
             except OSError as e:
                 return False, f"Cannot create library directory: {e}"
 
+        # A disc mounted from a drive is ripped from the drive (see
+        # optical_device_for); its folder name still makes the title
+        rip_src = optical_device_for(src) or src
+
         with self.import_lock:
             busy = self.imp_active
         if not busy:
             sweep_stale_work(out_dir)
-            space_problem = check_import_space(src, out_dir)
+            space_problem = check_import_space(rip_src, out_dir)
             if space_problem:
                 return False, space_problem
 
@@ -943,7 +986,7 @@ class TinyDVDLibrary:
         self._notify_import_change()
         t = threading.Thread(
             target=self._import_worker,
-            args=(src, desired_output, stem, convert_script, bool(skip_enrichment)),
+            args=(rip_src, desired_output, stem, convert_script, bool(skip_enrichment)),
             name="tdvd-import-worker",
             daemon=True,
         )
@@ -998,10 +1041,10 @@ class TinyDVDLibrary:
                 dvdbackup_bin = shutil.which("dvdbackup")
                 if not dvdbackup_bin:
                     raise RuntimeError(
-                        "dvdbackup is required to rip directly from optical drive devices "
-                        "(you can still import previously ripped VIDEO_TS folders, unencrypted .iso images, "
-                        "or mounted unencrypted disc folders without it; to enable direct drive ripping, "
-                        "install dvdbackup or run ./scripts/install-deps.sh --with-libdvdcss)."
+                        f"Importing a disc from a drive ({src}) needs dvdbackup, and libdvdcss for "
+                        "encrypted (most commercial) DVDs. Reinstall with './install --with-libdvdcss' "
+                        "to add them. Previously ripped VIDEO_TS folders and unencrypted .iso images "
+                        "import without them."
                     )
                 # Rip next to the library, not into the system temp folder,
                 # which can be small (on many Linux systems it's in RAM)
