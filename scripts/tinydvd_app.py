@@ -8,6 +8,7 @@ canvas primitives.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import signal
@@ -20,7 +21,7 @@ if SCRIPTS_DIR not in sys.path:
 
 from tinydvd_core import TinyDVDCore
 from tinydvd_desktop_ui import PLAYER_KEY_HELP, run_desktop_app
-from tinydvd_library import default_library_path
+from tinydvd_library import default_library_path, detect_default_source, preview_import_metadata
 from tinydvd_web_server import TinyDVDWebServer
 
 
@@ -74,6 +75,10 @@ def print_usage(prog: str) -> None:
     print("                            saved in your config folder on first run)")
     print("  --allow-web-import        Let web users import DVDs (runs the ripping and")
     print("                            conversion tools on paths they type)")
+    print("  --lookup [source]         Show the movie details an import of a disc would store,")
+    print("                            without importing (a drive like /dev/sr0, a mounted disc,")
+    print("                            a VIDEO_TS folder, or a .tdvd; default: the disc in the drive)")
+    print("  --title <title>           With --lookup: the title typed in the import dialog")
     print("  -f, --fullscreen          Start in fullscreen mode")
     print("  -h, --help                Show this help text")
     print("  -v, --version             Show version information\n")
@@ -81,6 +86,25 @@ def print_usage(prog: str) -> None:
     width = max(len(keys) for keys, _ in PLAYER_KEY_HELP) + 2
     for keys, desc in PLAYER_KEY_HELP:
         print(f"  {keys.ljust(width)}{desc}")
+
+
+def run_lookup(src: str | None, title: str) -> int:
+    """
+    Look up a disc's movie details exactly as the import's "Fetch movie
+    metadata" option does, and print what would go in its metadata.json
+    """
+    src = src or detect_default_source()[0]
+    if not src:
+        print("No disc found; name one (e.g. /dev/sr0).", file=sys.stderr)
+        return 1
+    try:
+        meta = preview_import_metadata(src, title)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    print("\nmetadata.json:")
+    print(json.dumps(meta, indent=2, ensure_ascii=False))
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -92,6 +116,8 @@ def main(argv: list[str]) -> int:
     bind_addr = "127.0.0.1"
     password_file = None
     allow_import = False
+    lookup = False
+    title = ""
 
     i = 1
     while i < len(argv):
@@ -120,6 +146,12 @@ def main(argv: list[str]) -> int:
             if i + 1 < len(argv):
                 i += 1
                 password_file = argv[i]
+        elif arg == "--lookup":
+            lookup = True
+        elif arg == "--title":
+            if i + 1 < len(argv):
+                i += 1
+                title = argv[i]
         elif arg == "--allow-web-import":
             allow_import = True
         elif arg in ("-f", "--fullscreen"):
@@ -131,6 +163,9 @@ def main(argv: list[str]) -> int:
             print_usage(prog)
             return 1
         i += 1
+
+    if lookup:
+        return run_lookup(dvd_path, title)
 
     if not dvd_path:
         dvd_path = default_library_path()

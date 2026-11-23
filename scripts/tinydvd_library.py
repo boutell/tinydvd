@@ -25,6 +25,7 @@ import time
 import traceback
 
 import tinydvd_archive
+import tinydvd_metadata
 
 
 IMPORT_IDLE = 0
@@ -446,6 +447,73 @@ def _clean_output_stem(raw: str) -> str:
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", (raw or "").strip())
     stem = re.sub(r"\s+", " ", stem).strip(" .")
     return stem or "Imported DVD"
+
+
+def import_output_stem(src: str, title: str = "") -> str:
+    """
+    The name an import of src gets (before ".tdvd"). It's also the title the
+    movie details are looked up by, unless the import is given one.
+    """
+    if title.strip():
+        return _clean_output_stem(title.strip())
+    if is_device_path(src):
+        # A drive's name says nothing about the movie; the disc's label does.
+        # Without one, "DVD", and the rip's folder name is used later (see
+        # _import_worker)
+        label = disc_volume_label(src)
+        stem = _clean_output_stem(_clean_disc_label(label)) if not _is_generic_label(label) else ""
+        return stem or "DVD"
+    b = os.path.basename(src.rstrip("/"))
+    for ext in (".iso", ".img", ".nrg", ".tdvd", ".tinydvd"):
+        if b.lower().endswith(ext):
+            b = b[: -len(ext)]
+            break
+    return _clean_output_stem(_clean_disc_label(b) if b.isupper() else b)
+
+
+def mount_point_of(device: str, mounts_file: str = "/proc/self/mounts") -> str:
+    """Where the disc in a drive (e.g. /dev/sr0) is mounted, or "" if it isn't"""
+    target = os.path.realpath(device)
+    try:
+        with open(mounts_file, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and os.path.realpath(_unescape_mount_field(parts[0])) == target:
+            return _unescape_mount_field(parts[1])
+    return ""
+
+
+def preview_import_metadata(src: str, title: str = "") -> dict:
+    """
+    The movie details an import of src (with this title, if any) would store,
+    looked up the same way, but without ripping or converting anything: the
+    disc's IFO files (which hold the running time and are never encrypted)
+    are read where they are. Raises ValueError if src can't be previewed.
+    """
+    rip_src = optical_device_for(src) or src   # as start_import does
+    stem = import_output_stem(rip_src, title)
+    ifo_dir = src
+    if is_device_path(src):
+        ifo_dir = mount_point_of(src)
+        if not ifo_dir:
+            raise ValueError(f"The disc in {src} isn't mounted; mount it (or open it in the file "
+                             "manager) so its IFO files can be read.")
+    if os.path.isdir(os.path.join(ifo_dir, "VIDEO_TS")):
+        ifo_dir = os.path.join(ifo_dir, "VIDEO_TS")
+    is_package = tinydvd_archive.is_tdvd_path(src)
+    if not (is_package or any(n.upper() == "VIDEO_TS.IFO" for n in tinydvd_archive.list_members(ifo_dir))):
+        raise ValueError(f"No DVD found at {src} (a drive, a mounted disc, a VIDEO_TS folder or a .tdvd)")
+    # Only a drive knows when its disc was mastered (a .tdvd keeps it in its
+    # metadata, which the lookup reads itself)
+    mastered = tinydvd_archive.read_volume_info(rip_src).mastered if is_device_path(rip_src) else ""
+    print(f"Source: {src}" + (f" (drive {rip_src})" if rip_src != src else ""))
+    print(f"Import would be named: {stem}.tdvd")
+    return tinydvd_metadata.enrich_movie(
+        ifo_dir, title_hint_path=f"{stem}.tdvd", write=False, mastered=mastered,
+        tmdb_key=os.environ.get("TMDB_API_KEY", ""), omdb_key=os.environ.get("OMDB_API_KEY", ""))
 
 
 def _compute_dir_signature(target_path: str, is_library: bool) -> int:
@@ -993,24 +1061,7 @@ class TinyDVDLibrary:
                 return False, space_problem
 
         title_clean = (title or "").strip()
-        if title_clean:
-            stem = _clean_output_stem(title_clean)
-        elif is_device_path(src):
-            # A drive's name says nothing about the movie; the disc's label
-            # does (and names the package, which is what the movie details
-            # are looked up by). Without one, the rip's folder name is used
-            # later (see _import_worker)
-            label = disc_volume_label(src)
-            stem = _clean_output_stem(_clean_disc_label(label)) if not _is_generic_label(label) else ""
-            stem = stem or "DVD"
-        else:
-            b = os.path.basename(src.rstrip("/"))
-            for ext in (".iso", ".img", ".nrg", ".tdvd", ".tinydvd"):
-                if b.lower().endswith(ext):
-                    b = b[: -len(ext)]
-                    break
-            stem = _clean_output_stem(_clean_disc_label(b) if b.isupper() else b)
-
+        stem = import_output_stem(src, title_clean)
         desired_output = os.path.join(out_dir, f"{stem}.tdvd")
 
         with self.import_lock:

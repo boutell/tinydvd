@@ -15,6 +15,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
 import tinydvd_archive  # noqa: E402
+import tinydvd_library  # noqa: E402
 import tinydvd_metadata as M  # noqa: E402
 
 MINUTE = "http://www.wikidata.org/entity/Q7727"
@@ -106,11 +107,57 @@ def test_volume_info(tmp: str) -> None:
     print("  - Disc label and mastering date from the volume descriptor: OK")
 
 
+def test_import_preview(tmp: str) -> None:
+    """tinydvd --lookup names and looks up a disc as an import would"""
+    mounts = os.path.join(tmp, "mounts")
+    with open(mounts, "w") as f:
+        f.write("/dev/sda1 / ext4 rw 0 0\n/dev/sr0 /media/me/DUNE\\040PART rw 0 0\n")
+    assert tinydvd_library.mount_point_of("/dev/sr0", mounts) == "/media/me/DUNE PART"
+    assert tinydvd_library.mount_point_of("/dev/sr1", mounts) == ""
+
+    assert tinydvd_library.import_output_stem("/x/DUNE_PART_TWO_OK") == "Dune Part Two Ok"
+    assert tinydvd_library.import_output_stem("/x/movie.iso") == "movie"
+    assert tinydvd_library.import_output_stem("/x/DUNE", "Dune: Part Two") == "Dune Part Two"
+
+    # A disc's folder, as mounted: VIDEO_TS holds the IFOs
+    disc = os.path.join(tmp, "DUNE_PART_TWO_OK")
+    os.makedirs(os.path.join(disc, "VIDEO_TS"))
+    fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "TestDisc.tdvd")
+    for name in tinydvd_archive.list_members(fixture):
+        if name.upper().endswith(".IFO"):
+            with open(os.path.join(disc, "VIDEO_TS", name), "wb") as f:
+                f.write(tinydvd_archive.read_member(fixture, name, 1 << 24))
+    searched = []
+
+    def fake(url: str, params: dict | None = None) -> dict:
+        if (params or {}).get("list") == "search":
+            searched.append(params["srsearch"])
+        return fake_get_json(url, params)
+
+    real = M._get_json
+    M._get_json = fake
+    try:
+        meta = tinydvd_library.preview_import_metadata(disc)
+    finally:
+        M._get_json = real
+    # Looked up by the name the import would give it; the test disc's
+    # running time fits no Dune, so nothing is found
+    assert searched and searched[0].startswith("Dune Part Two Ok "), searched
+    assert meta["title"] == "Dune Part Two Ok" and meta["disc_id"], meta
+    try:
+        tinydvd_library.preview_import_metadata(tmp)
+        raise AssertionError("not a disc")
+    except ValueError:
+        pass
+    print("  - Previewing an import's movie details (tinydvd --lookup): OK")
+
+
 def main() -> int:
     print("=== Movie details lookup tests ===")
     with tempfile.TemporaryDirectory() as tmp:
         test_choosing_among_remakes()
         test_volume_info(tmp)
+        test_import_preview(tmp)
     print("All movie details lookup tests passed!")
     return 0
 

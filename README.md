@@ -314,7 +314,16 @@ Where the details come from, in this order:
 - **[OMDb](https://www.omdbapi.com/apikey.aspx)**, if you have set a key.
 - **[Wikidata](https://www.wikidata.org/)**, with no key needed. Its data is CC0. The plot summary comes from the movie's English Wikipedia article (CC BY-SA 4.0); its source and link are saved in the metadata next to it.
 
-Only the title, and the year if known, is sent. When several films share a title, the one whose running time is closest to the disc's main feature wins.
+Only the title, and the year if known, is sent. When several films share a title, a film newer than the disc (by the date it was mastered, read from the disc when importing from a drive) is passed over, then the one whose running time is closest to the disc's main feature wins. If nothing matches, the last word or two of the title are dropped, since disc labels often end in leftovers (`DUNE_PART_TWO_OK`), as long as the film then found fits the disc.
+
+To see what an import would find for a disc, without importing it:
+
+```bash
+tinydvd --lookup                 # the disc in the drive
+tinydvd --lookup /dev/sr0 --title "Dune: Part Two"
+```
+
+It looks the disc up exactly as the import dialog's "Fetch movie metadata" option does and prints the `metadata.json` the import would store. The disc must be mounted (most desktops do this when you insert it), since its running time comes from the disc's IFO files.
 
 Changing a `.tdvd` file (metadata or thumbnail) writes a new copy next to it and swaps it in, so an interrupted update never damages the original. It needs enough free space for a second copy while it runs.
 
