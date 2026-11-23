@@ -20,12 +20,17 @@ import tinydvd_metadata as M  # noqa: E402
 MINUTE = "http://www.wikidata.org/entity/Q7727"
 
 
-def film(qid: str, year: int, minutes: list[int], sitelinks: int) -> dict:
+def film(qid: str, year: int, minutes: list[int], sitelinks: int, label: str = "Dune",
+         cancelled_year: int = 0) -> dict:
+    dates = [{"mainsnak": {"datavalue": {"value": {"time": f"+{year}-10-22T00:00:00Z"}}}}]
+    if cancelled_year:  # a release date announced, then cancelled
+        dates.append({"rank": "deprecated",
+                      "mainsnak": {"datavalue": {"value": {"time": f"+{cancelled_year}-10-20T00:00:00Z"}}}})
     return {
         "id": qid,
-        "labels": {"en": {"value": "Dune"}},
+        "labels": {"en": {"value": label}},
         "claims": {
-            "P577": [{"mainsnak": {"datavalue": {"value": {"time": f"+{year}-10-22T00:00:00Z"}}}}],
+            "P577": dates,
             "P2047": [{"mainsnak": {"datavalue": {"value": {"amount": f"+{m}", "unit": MINUTE}}}}
                       for m in minutes],
         },
@@ -34,8 +39,10 @@ def film(qid: str, year: int, minutes: list[int], sitelinks: int) -> dict:
 
 
 # Two films called Dune: Lynch's (1984; 137 min, and a 190 min TV cut) and
-# Villeneuve's (2021; 155 min), the better known one
-FILMS = {"Q1": film("Q1", 1984, [137, 190], 80), "Q2": film("Q2", 2021, [155], 90)}
+# Villeneuve's (2021; 155 min), the better known one; and its sequel, whose
+# first release date was cancelled
+FILMS = {"Q1": film("Q1", 1984, [137, 190], 80), "Q2": film("Q2", 2021, [155], 90),
+         "Q3": film("Q3", 2024, [166], 70, label="Dune: Part Two", cancelled_year=2023)}
 
 
 def fake_get_json(url: str, params: dict | None = None) -> dict:
@@ -47,8 +54,8 @@ def fake_get_json(url: str, params: dict | None = None) -> dict:
     return {}
 
 
-def pick(**kw) -> int:
-    meta = M.fetch_wikidata_metadata("Dune", **kw)
+def pick(title: str = "Dune", **kw) -> int:
+    meta = M.fetch_wikidata_metadata(title, **kw)
     assert meta, kw
     return meta["year"]
 
@@ -66,9 +73,17 @@ def test_choosing_among_remakes() -> None:
         assert pick(runtime_min=155, max_year=2003) == 1984    # the disc's date beats a running time
         assert pick(year=1984, max_year=2022) == 1984          # a year given outright beats everything
         assert pick(max_year=1990) == 1984
+        # Punctuation doesn't matter, and a cancelled release date doesn't count
+        assert pick("Dune Part Two") == 2024
+        # Junk at the end of a disc label is dropped, if the film fits the disc
+        assert pick("Dune Part Two Ok", runtime_min=166, max_year=2024) == 2024
+        assert pick("Dune Ok", runtime_min=137) == 1984
+        assert M.fetch_wikidata_metadata("Dune Part Two Ok") is None             # nothing to check it with
+        assert M.fetch_wikidata_metadata("Dune Part Two Ok", runtime_min=100) is None  # doesn't fit
+        assert M.fetch_wikidata_metadata("Dune Part Two Ok", runtime_min=166, max_year=2022) is None
     finally:
         M._get_json = real
-    print("  - Choosing among films with the same title (year, disc date, running time): OK")
+    print("  - Choosing among films with the same title (year, disc date, running time, disc label junk): OK")
 
 
 def test_volume_info(tmp: str) -> None:

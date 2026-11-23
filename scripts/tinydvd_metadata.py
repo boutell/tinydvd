@@ -162,6 +162,10 @@ def _aliases(entity: dict) -> list[str]:
 def _claim_values(entity: dict, prop: str) -> list:
     out = []
     for claim in entity.get("claims", {}).get(prop, []):
+        # Deprecated statements are known to be wrong, e.g. a release date
+        # that was announced and then cancelled
+        if claim.get("rank") == "deprecated":
+            continue
         val = claim.get("mainsnak", {}).get("datavalue", {}).get("value")
         if val is not None:
             out.append(val)
@@ -226,9 +230,36 @@ def _too_new(cand_year: int | None, max_year: int | None) -> int:
     return 1 if (max_year and cand_year and cand_year > max_year) else 0
 
 
+# How close a film's running time must be to the disc's before a shortened
+# title (see below) is trusted
+SHORTENED_TITLE_RUNTIME_SLACK = 10
+
+
 def fetch_wikidata_metadata(title: str, year: int | None = None, runtime_min: int = 0,
                             max_year: int | None = None) -> dict | None:
-    """Look the title up on Wikidata. Returns None unless a film's title matches exactly."""
+    """
+    Look the title up on Wikidata. Returns None unless a film's title matches
+    exactly, ignoring case and punctuation.
+
+    Disc labels often end in junk ("DUNE_PART_TWO_OK", "ALIEN_WS", "..._D1"),
+    so if nothing matches, it tries again without the last word or two. A
+    match found that way must also fit the disc: its running time close to the
+    main feature's, and not newer than the disc.
+    """
+    words = title.split()
+    for drop in range(0, min(2, len(words) - 1) + 1):
+        shortened = drop > 0
+        if shortened and not runtime_min:
+            break
+        meta = _fetch_wikidata_exact(" ".join(words[:len(words) - drop]), year, runtime_min, max_year,
+                                     must_fit=shortened)
+        if meta:
+            return meta
+    return None
+
+
+def _fetch_wikidata_exact(title: str, year: int | None, runtime_min: int, max_year: int | None,
+                          must_fit: bool) -> dict | None:
     class_filter = "|".join(f"P31={q}" for q in sorted(WIKIDATA_FILM_CLASSES))
     found = _get_json(WIKIDATA_API, {
         "action": "query", "list": "search", "format": "json", "srlimit": "20",
@@ -258,7 +289,10 @@ def fetch_wikidata_metadata(title: str, year: int | None = None, runtime_min: in
         popularity = len(ent.get("sitelinks", {}))
         # A year given outright wins; then a film newer than the disc is
         # ruled out; then the closest running time; then the best known
-        candidates.append(((year_miss, _too_new(cand_year, max_year), rt_diff, -popularity), ent, cand_year))
+        too_new = _too_new(cand_year, max_year)
+        if must_fit and (too_new or rt_diff > SHORTENED_TITLE_RUNTIME_SLACK):
+            continue
+        candidates.append(((year_miss, too_new, rt_diff, -popularity), ent, cand_year))
     if not candidates:
         return None
     candidates.sort(key=lambda c: c[0])
