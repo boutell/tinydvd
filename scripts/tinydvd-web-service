@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# tinydvd-web-service: keep the TinyDVD web player running all the time on a
+# Linux machine with systemd (Ubuntu, Debian, ...), as you, starting at boot.
+#
+#   tinydvd-web-service enable [options]   Set it up (or change settings) and start it
+#   tinydvd-web-service disable            Stop it and remove the service
+#   tinydvd-web-service status             Is it running? With which settings?
+#
+# Options for enable (each one you leave out keeps its current setting, or the
+# default the first time):
+#   --bind <ip>           Address to listen on (default: 0.0.0.0, every network;
+#                         127.0.0.1 for this computer only)
+#   --port <port>         Port (default: 8080)
+#   --library <folder>    Folder to serve (default: your videos folder)
+#   --allow-web-import    Let web users import DVDs (see tinydvd --help)
+#   --no-web-import       Turn that back off
+#   --user <name>         Who it runs as (default: you; for use from a root shell)
+#
+# It installs a system service, /etc/systemd/system/tinydvd-web.service, so
+# enable and disable ask for your password through sudo. The service itself
+# runs as you, never as root. Its settings are in ~/.config/tinydvd/web-service.conf.
+#
+# ./install fills in @LIB_DIR@ and @PYTHON@.
+
+set -euo pipefail
+
+LIB_DIR="@LIB_DIR@"
+PYTHON="@PYTHON@"
+TEMPLATE="${LIB_DIR}/tinydvd-web.service"
+SERVICE="tinydvd-web.service"
+UNIT_FILE="/etc/systemd/system/${SERVICE}"
+# First line of a unit file we wrote, so we never replace or delete anyone else's
+MARK="# Installed by tinydvd-web-service"
+
+usage() {
+    sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+check_systemd() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1 \
+        || die "this computer isn't running systemd, so it can't run the web player as a service."
+}
+
+# Re-run under sudo, keeping the arguments, after saying why
+become_root() {
+    [[ "$(id -u)" -eq 0 ]] && return 0
+    command -v sudo >/dev/null 2>&1 || die "this needs administrator rights; run it as root with --user $(id -un)."
+    echo "Installing or removing a system service needs administrator rights, so sudo may ask for your password."
+    echo "The web player itself will run as $(id -un), not as root."
+    exec sudo "${BASH_SOURCE[0]}" "$@"
+}
+
+# The user a unit file we wrote runs as
+unit_user() {
+    sed -n 's/^User=//p' "$UNIT_FILE" | head -n 1
+}
+
+is_our_unit() {
+    [[ -f "$UNIT_FILE" ]] && [[ "$(head -n 1 "$UNIT_FILE")" == "$MARK" ]]
+}
+
+home_of() {
+    getent passwd "$1" | cut -d: -f6
+}
+
+# The settings file of a user (where tinydvd also keeps their web password)
+settings_of() {
+    printf '%s/.config/tinydvd/web-service.conf' "$(home_of "$1")"
+}
+
+# A setting's value from a settings file, or nothing
+read_setting() {
+    local file="$1" key="$2" line value
+    [[ -r "$file" ]] || return 0
+    line="$(grep -E "^${key}=" "$file" | tail -n 1 || true)"
+    [[ -n "$line" ]] || return 0
+    value="${line#*=}"
+    if [[ "$value" == \"*\" ]]; then
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value//\\\"/\"}"
+        value="${value//\\\\/\\}"
+    fi
+    printf '%s' "$value"
+}
+
+# A value quoted for a systemd environment file
+quote_setting() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '"%s"' "$v"
+}
+
+# Run a command as the service's user, with their home folder
+as_user() {
+    local who="$1"
+    shift
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$who" -- env HOME="$(home_of "$who")" "$@"
+    else
+        sudo -u "$who" -H "$@"
+    fi
+}
+
+server_url() {
+    local bind="$1" port="$2" host
+    case "$bind" in
+        0.0.0.0|::|"")
+            host="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            [[ -n "$host" ]] || host="$(hostname)"
+            ;;
+        *) host="$bind" ;;
+    esac
+    [[ "$host" == *:* ]] && host="[${host}]"
+    printf 'http://%s:%s' "$host" "$port"
+}
+
+cmd_enable() {
+    local bind="" port="" library="" import="" owner=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bind|--port|--library|--user)
+                [[ $# -ge 2 ]] || die "$1 needs a value"
+                case "$1" in
+                    --bind) bind="$2" ;;
+                    --port) port="$2" ;;
+                    --library) library="$2" ;;
+                    --user) owner="$2" ;;
+                esac
+                shift 2
+                ;;
+            --bind=*) bind="${1#*=}"; shift ;;
+            --port=*) port="${1#*=}"; shift ;;
+            --library=*) library="${1#*=}"; shift ;;
+            --user=*) owner="${1#*=}"; shift ;;
+            --allow-web-import) import="--allow-web-import"; shift ;;
+            --no-web-import) import="off"; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown option: $1 (try --help)" ;;
+        esac
+    done
+
+    if [[ -z "$owner" ]]; then
+        # Under sudo, the person who ran sudo; otherwise whoever is running this
+        if [[ "$(id -u)" -eq 0 ]]; then owner="${SUDO_USER:-root}"; else owner="$(id -un)"; fi
+    fi
+    [[ "$owner" != "root" ]] \
+        || die "the web player shouldn't run as root. Run this as the user it should run as, or pass --user <name>."
+    [[ -n "$(home_of "$owner")" ]] || die "there's no user called '${owner}'."
+    check_systemd
+    [[ -f "$TEMPLATE" ]] || die "${TEMPLATE} is missing; reinstall TinyDVD with ./install."
+    if [[ "$(id -u)" -ne 0 ]]; then
+        # A relative --library means the folder you're in, not root's
+        if [[ -n "$library" && "$library" != /* ]]; then
+            library="$(pwd -P)/${library}"
+        fi
+        local args=(enable --user "$owner")
+        [[ -n "$bind" ]] && args+=(--bind "$bind")
+        [[ -n "$port" ]] && args+=(--port "$port")
+        [[ -n "$library" ]] && args+=(--library "$library")
+        [[ "$import" == "off" ]] && args+=(--no-web-import)
+        [[ "$import" == "--allow-web-import" ]] && args+=(--allow-web-import)
+        become_root "${args[@]}"
+    fi
+
+    if [[ -f "$UNIT_FILE" ]]; then
+        is_our_unit || die "${UNIT_FILE} exists and wasn't made by tinydvd-web-service; not replacing it."
+        local current
+        current="$(unit_user)"
+        [[ "$current" == "$owner" ]] \
+            || die "the web player service is set up for ${current}. They (or you) can remove it first: tinydvd-web-service disable"
+    fi
+
+    local settings settings_dir
+    settings="$(settings_of "$owner")"
+    settings_dir="$(dirname "$settings")"
+
+    # Anything not given keeps its current setting, then the default
+    [[ -n "$bind" ]] || bind="$(read_setting "$settings" TINYDVD_WEB_BIND)"
+    [[ -n "$bind" ]] || bind="0.0.0.0"
+    [[ -n "$port" ]] || port="$(read_setting "$settings" TINYDVD_WEB_PORT)"
+    [[ -n "$port" ]] || port="8080"
+    [[ -n "$library" ]] || library="$(read_setting "$settings" TINYDVD_WEB_LIBRARY)"
+    if [[ -z "$library" ]]; then
+        library="$(as_user "$owner" "$PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); from tinydvd_library import default_library_path; print(default_library_path())' "${LIB_DIR}/scripts")"
+    fi
+    if [[ -z "$import" ]]; then
+        import="$(read_setting "$settings" TINYDVD_WEB_OPTIONS)"
+    elif [[ "$import" == "off" ]]; then
+        import=""
+    fi
+
+    [[ "$bind" =~ ^[0-9A-Fa-f.:]+$ ]] || die "--bind takes an IP address, like 0.0.0.0 or 127.0.0.1 (got '${bind}')."
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || die "--port takes a number from 1 to 65535 (got '${port}')."
+    port=$((10#$port))
+    (( port >= 1 && port <= 65535 )) || die "--port takes a number from 1 to 65535 (got '${port}')."
+    (( port >= 1024 )) \
+        || die "the web player runs as ${owner}, who can't use ports below 1024; pick 1024 or higher (put a reverse proxy in front for port 80/443)."
+    [[ "$library" == /* ]] || die "--library needs a full path (got '${library}')."
+    as_user "$owner" test -r "$library" \
+        || die "${library} doesn't exist, or ${owner} can't read it."
+    if [[ -d "$library" ]]; then
+        library="$(cd "$library" && pwd -P)"
+        as_user "$owner" test -x "$library" || die "${owner} can't open the folder ${library}."
+    fi
+
+    # The settings, written as the user so they stay theirs
+    as_user "$owner" mkdir -p "$settings_dir"
+    as_user "$owner" chmod 700 "$settings_dir"
+    local content
+    content="$(
+        echo "# TinyDVD web player service settings (tinydvd-web-service enable changes these)."
+        echo "# After editing by hand: sudo systemctl restart tinydvd-web"
+        echo "# You can also set TINYDVD_WEB_PASSWORD here instead of using ${settings_dir}/web-password."
+        echo "TINYDVD_WEB_BIND=$(quote_setting "$bind")"
+        echo "TINYDVD_WEB_PORT=$(quote_setting "$port")"
+        echo "TINYDVD_WEB_LIBRARY=$(quote_setting "$library")"
+        echo "TINYDVD_WEB_OPTIONS=$(quote_setting "$import")"
+        # Keep a password someone put here by hand
+        if [[ -f "$settings" ]]; then
+            grep -E '^TINYDVD_WEB_PASSWORD=' "$settings" || true
+        fi
+    )"
+    printf '%s\n' "$content" | as_user "$owner" sh -c 'umask 077; t="$(mktemp "$1.XXXXXX")" && cat > "$t" && mv -f "$t" "$1"' sh "$settings"
+
+    local tmp
+    tmp="$(mktemp "/etc/systemd/system/.${SERVICE}.XXXXXX")"
+    {
+        echo "$MARK"
+        sed -e "s|@USER@|${owner}|g" -e "s|@SETTINGS@|${settings}|g" "$TEMPLATE"
+    } > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$UNIT_FILE"
+
+    systemctl daemon-reload
+    systemctl enable "$SERVICE" >/dev/null 2>&1
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$SERVICE"
+
+    # Wait for it to start listening (a bad setting shows up as a quick exit)
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        systemctl is-active --quiet "$SERVICE" || break
+        if command -v ss >/dev/null 2>&1 && ss -ltnH "sport = :${port}" 2>/dev/null | grep -q .; then
+            break
+        fi
+    done
+    if ! systemctl is-active --quiet "$SERVICE"; then
+        echo "The web player didn't start. Its last messages:" >&2
+        journalctl -u "$SERVICE" -n 20 --no-pager >&2 || true
+        exit 1
+    fi
+
+    echo "The TinyDVD web player is running as ${owner}, and will start whenever this computer does."
+    echo "  URL:      $(server_url "$bind" "$port")"
+    echo "  Folder:   ${library}"
+    echo "  Import:   $([[ -n "$import" ]] && echo on || echo off)"
+    if [[ -n "$(read_setting "$settings" TINYDVD_WEB_PASSWORD)" ]]; then
+        echo "  Password: TINYDVD_WEB_PASSWORD in ${settings}"
+    elif [[ -s "${settings_dir}/web-password" ]]; then
+        echo "  Password: $(head -n 1 "${settings_dir}/web-password")  (from ${settings_dir}/web-password)"
+    else
+        echo "  Password: will be saved in ${settings_dir}/web-password"
+    fi
+    echo "Settings: ${settings}. Logs: journalctl -u tinydvd-web"
+    echo "Change settings by running this again with new options; stop it with: tinydvd-web-service disable"
+}
+
+cmd_disable() {
+    if [[ ! -e "$UNIT_FILE" ]]; then
+        echo "The TinyDVD web player service isn't set up."
+        return 0
+    fi
+    is_our_unit || die "${UNIT_FILE} wasn't made by tinydvd-web-service; leaving it alone."
+    become_root disable
+    local owner
+    owner="$(unit_user)"
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1 || true
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE" >/dev/null 2>&1 || true
+    echo "Stopped the TinyDVD web player and removed its service."
+    if [[ -n "$owner" && -f "$(settings_of "$owner")" ]]; then
+        echo "Its settings are still in $(settings_of "$owner"), for next time."
+    fi
+}
+
+cmd_status() {
+    if ! is_our_unit; then
+        echo "The TinyDVD web player service isn't set up."
+        echo "Set it up with: tinydvd-web-service enable"
+        return 0
+    fi
+    local owner settings
+    owner="$(unit_user)"
+    settings="$(settings_of "$owner")"
+    systemctl status "$SERVICE" --no-pager || true
+    echo ""
+    echo "Runs as ${owner}, and starts at boot."
+    if [[ -r "$settings" ]]; then
+        echo "Settings (${settings}):"
+        echo "  Address: $(read_setting "$settings" TINYDVD_WEB_BIND)"
+        echo "  Port:    $(read_setting "$settings" TINYDVD_WEB_PORT)"
+        echo "  Folder:  $(read_setting "$settings" TINYDVD_WEB_LIBRARY)"
+        echo "  Options: $(read_setting "$settings" TINYDVD_WEB_OPTIONS)"
+    fi
+}
+
+case "${1:-}" in
+    enable) shift; cmd_enable "$@" ;;
+    disable) shift; cmd_disable ;;
+    status) shift; cmd_status ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command: $1 (try --help)" ;;
+esac

@@ -1,0 +1,41 @@
+# TinyDVD web player as a system service that runs as one ordinary user (with
+# their files and web password) and starts at boot. `tinydvd-web-service
+# enable` sets it up; see the README.
+#
+# Settings live in that user's ~/.config/tinydvd/web-service.conf, which
+# overrides the defaults below. After editing it:
+#   sudo systemctl restart tinydvd-web
+#
+# ./install fills in @BIN_DIR@; tinydvd-web-service fills in @USER@ and @SETTINGS@.
+
+[Unit]
+Description=TinyDVD web player
+Documentation=https://github.com/boutell/tinydvd
+# Binding to one particular address needs the network up first
+Wants=network-online.target
+After=network-online.target
+# Give up after 5 failed starts in 5 minutes rather than retrying forever
+# (e.g. the port is taken)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@USER@
+Environment=TINYDVD_WEB_BIND=0.0.0.0
+Environment=TINYDVD_WEB_PORT=8080
+Environment=TINYDVD_WEB_OPTIONS=
+# Log lines reach the journal as they happen, not when a buffer fills
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-@SETTINGS@
+# ${VAR} is always one argument (folders with spaces work); $TINYDVD_WEB_OPTIONS
+# is split into words, and adds nothing when empty
+ExecStart=@BIN_DIR@/tinydvd --serve --bind ${TINYDVD_WEB_BIND} --port ${TINYDVD_WEB_PORT} $TINYDVD_WEB_OPTIONS ${TINYDVD_WEB_LIBRARY}
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

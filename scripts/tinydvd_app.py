@@ -145,7 +145,11 @@ def main(argv: list[str]) -> int:
             return 1
         server = TinyDVDWebServer(core, dvd_path, password, bind_addr=bind_addr, port=port,
                                   allow_import=allow_import)
-        print(f"  Password: {password}  (from {password_source})\n", flush=True)
+        if sys.stdout.isatty():
+            print(f"  Password: {password}  (from {password_source})\n", flush=True)
+        else:
+            # A log (such as the systemd journal) may be readable by others
+            print(f"  Password: see {password_source}\n", flush=True)
 
         def on_sig(_signum, _frame):
             server.running = False

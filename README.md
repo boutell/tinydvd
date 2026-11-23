@@ -187,6 +187,15 @@ To stream your collection to a web browser, tablet, phone or smart TV:
 
    The server speaks plain HTTP. That's fine at home; don't expose it to the internet without a TLS reverse proxy in front.
 
+   **Keep it running all the time (Linux with systemd: Ubuntu, Debian, ...).** `./install` adds a `tinydvd-web-service` command:
+   ```bash
+   tinydvd-web-service enable                      # your videos folder, every network, port 8080
+   tinydvd-web-service enable --port 9000 --library /srv/movies --bind 127.0.0.1
+   tinydvd-web-service status
+   tinydvd-web-service disable
+   ```
+   It installs a system service, `tinydvd-web`, that starts at boot. The service runs as you, never as root, with your files and your web password. Installing it needs administrator rights, so `enable` and `disable` ask for your password through `sudo` (from a root shell, use `--user <name>`). Unlike `tinydvd --serve`, the service listens on every network by default (`--bind 0.0.0.0`), because a server only this computer can reach isn't much use. Settings you leave out keep their current values. They're saved in `~/.config/tinydvd/web-service.conf`; if you edit that file by hand, run `sudo systemctl restart tinydvd-web` afterwards. Logs: `journalctl -u tinydvd-web`. `enable` prints the password, but the service doesn't write it to the log. `./install --uninstall` stops and removes the service too.
+
 2. **Graceful Tolerance of Non-TinyDVD Files:**
    You do not need to separate your `.tdvd` files into their own isolated folder. TinyDVD expands `~` automatically and scans `~/Videos`, **tolerating and silently ignoring** any non-TinyDVD files (such as `.mp4`, `.mkv`, `.avi`, `.srt`, or downloads) and other subdirectories. Only `.tdvd` archives (and unpacked TinyDVD folders) are added to the library catalog.
 

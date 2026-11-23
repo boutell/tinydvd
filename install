@@ -28,6 +28,8 @@ DVDCSS_FLAG=""
 UNINSTALL=0
 MAC_APP_DIR="${TINYDVD_MAC_APP_DIR:-}"
 APP_DIR_GIVEN="${TINYDVD_MAC_APP_DIR:-}"
+# The arguments as given, for re-running under sudo (the loop below uses them up)
+ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -311,9 +313,6 @@ needs_sudo() {
     return 1
 }
 
-# Preserve original CLI args for optional sudo re-exec
-ORIG_ARGS=("$@")
-
 BASE_PYTHON="${TINYDVD_BASE_PYTHON:-}"
 if [[ "$UNINSTALL" -eq 0 ]]; then
     if [[ "${TINYDVD_ALREADY_BUILT:-0}" != "1" ]]; then
@@ -513,12 +512,28 @@ install_mac_app() {
     printf '%s\n' "$MAC_APP" > "$MAC_APP_RECORD"
 }
 
+# Uninstalling: stop and remove the web player service, if tinydvd-web-service
+# set one up (it would only fail, retrying, once the program is gone)
+stop_web_service() {
+    local helper="${BIN_DIR}/tinydvd-web-service" unit="/etc/systemd/system/tinydvd-web.service"
+    [[ -f "$unit" && "$(head -n 1 "$unit")" == "# Installed by tinydvd-web-service" ]] || return 0
+    grep -qF "ExecStart=${BIN_DIR}/tinydvd " "$unit" || return 0  # another prefix's
+    if [[ -x "$helper" ]] && is_our_command "$helper"; then
+        "$helper" disable || true
+    fi
+    if [[ -f "$unit" ]]; then
+        echo "Couldn't remove the web player service; run 'tinydvd-web-service disable' before uninstalling."
+        exit 1
+    fi
+}
+
 if [[ "$UNINSTALL" -eq 1 ]]; then
     echo "=== Uninstalling tinydvd from ${PREFIX} ==="
     FOUND=0
     [[ -d "$LIB_DIR" ]] && FOUND=1
+    if [[ "$OS" == "Linux" ]]; then stop_web_service; fi
     for name in tinydvd tinydvd-player convert-to-tinydvd tinydvd-thumbnailer \
-                tinydvd-set-thumbnail tinydvd-add-thumbnail; do
+                tinydvd-set-thumbnail tinydvd-add-thumbnail tinydvd-web-service; do
         f="${BIN_DIR}/${name}"
         [[ -e "$f" || -L "$f" ]] || continue
         if is_our_command "$f"; then
@@ -692,10 +707,20 @@ Exec=${BIN_DIR}/tinydvd -f %f|"
     set_default_handler "${VENV_PYTHON}" add
     refresh_caches
 
+    # The optional always-on web player: a systemd user unit, set up per user
+    # by tinydvd-web-service (nothing runs until someone enables it)
+    echo "Web player service -> ${BIN_DIR}/tinydvd-web-service"
+    sed -e "s|@BIN_DIR@|${BIN_DIR}|g" "${ROOT_DIR}/data/tinydvd-web.service" > "${LIB_DIR}/tinydvd-web.service"
+    chmod 644 "${LIB_DIR}/tinydvd-web.service"
+    sed -e "s|@LIB_DIR@|${LIB_DIR}|g" -e "s|@PYTHON@|${VENV_PYTHON}|g" \
+        "${ROOT_DIR}/scripts/tinydvd-web-service" > "${BIN_DIR}/tinydvd-web-service"
+    chmod 755 "${BIN_DIR}/tinydvd-web-service"
+
     echo ""
     echo "Installed cleanly with isolated Python runtime (${VENV_PYTHON})."
     echo "Double-click any .tdvd file in GNOME Files to play it."
     echo "If Nautilus was already open, restart it (nautilus -q) to pick up thumbnails."
+    echo "To keep the web player running all the time (as you, from boot): tinydvd-web-service enable"
 else
     if [[ "$MAC_APP_BUILT" -eq 1 ]]; then install_mac_app; fi
     echo ""
