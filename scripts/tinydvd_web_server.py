@@ -429,11 +429,20 @@ class WebSession:
             return
 
         if mtype == "key" and isinstance(obj.get("key"), str):
-            self.core.lib.tdvd_vm_session_dispatch_action(vm, obj["key"].encode("utf-8"), 0, 0)
+            self.core.lib.tdvd_vm_session_dispatch_action(vm, obj["key"].encode("utf-8"), 0, 0, 0.0)
         elif mtype in ("mouse_move", "mouse_click"):
             x = _as_int(obj.get("x"))
             y = _as_int(obj.get("y"))
-            self.core.lib.tdvd_vm_session_dispatch_action(vm, mtype.encode("ascii"), x, y)
+            self.core.lib.tdvd_vm_session_dispatch_action(vm, mtype.encode("ascii"), x, y, 0.0)
+        elif mtype == "seek_to":
+            # The timeline: the DVD engine does the seek (within the title
+            # playing), so it knows where playback is
+            try:
+                pts = float(obj.get("pts"))
+            except (TypeError, ValueError):
+                return
+            if pts >= 0.0 and pts < 1e7:
+                self.core.lib.tdvd_vm_session_dispatch_action(vm, b"seek_abs", 0, 0, pts)
         elif mtype in ("file_loaded", "seek_completed", "time_update", "client_playback", "video_ended",
                        "loading", "buffering", "video_error"):
             seq = max(0, _as_int(obj.get("seq")))

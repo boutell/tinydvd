@@ -34,6 +34,7 @@ typedef enum {
     ACT_TOGGLE_PAUSE,
     ACT_SEEK_REL,
     ACT_SEEK_FRAC,
+    ACT_SEEK_ABS,
     ACT_NEXT_CHAPTER,
     ACT_PREV_CHAPTER,
     ACT_CYCLE_SUBS,
@@ -1244,7 +1245,11 @@ static void show_timeline_osd(dvd_vm_bridge_t *b, uint64_t cur_pts, uint64_t min
     vm_osd_message(b, osd);
 }
 
-static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_seconds, double fraction) {
+/* A seek within the current title: by delta_seconds if is_relative, else to
+ * abs_pts_nanos if that's >= 0 (clamped to the title), else to a fraction of
+ * the title */
+static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_seconds, double fraction,
+                             int64_t abs_pts_nanos) {
     if (!b || !b->current_pgc || b->current_pgc->nr_of_cells == 0 || b->vobu_count == 0 || b->has_active_hli) {
         return false;
     }
@@ -1264,6 +1269,10 @@ static bool vm_seek_timeline(dvd_vm_bridge_t *b, bool is_relative, int delta_sec
         if (t < (int64_t)min_pts) t = (int64_t)min_pts;
         if (t > (int64_t)max_pts) t = (int64_t)max_pts;
         target_pts = (uint64_t)t;
+    } else if (abs_pts_nanos >= 0) {
+        target_pts = (uint64_t)abs_pts_nanos;
+        if (target_pts < min_pts) target_pts = min_pts;
+        if (target_pts > max_pts) target_pts = max_pts;
     } else {
         if (fraction < 0.0) fraction = 0.0;
         if (fraction > 1.0) fraction = 1.0;
@@ -1570,10 +1579,13 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
     }
 
     if (act == ACT_SEEK_REL) {
-        return vm_seek_timeline(b, true, ax, 0.0);
+        return vm_seek_timeline(b, true, ax, 0.0, -1);
     }
     if (act == ACT_SEEK_FRAC) {
-        return vm_seek_timeline(b, false, 0, afrac);
+        return vm_seek_timeline(b, false, 0, afrac, -1);
+    }
+    if (act == ACT_SEEK_ABS) {
+        return vm_seek_timeline(b, false, 0, 0.0, (int64_t)(afrac * 1e9));
     }
     if (act == ACT_NEXT_CHAPTER) {
         return vm_step_chapter(b, +1);
@@ -1585,10 +1597,10 @@ static bool process_pending_user_action(dvd_vm_bridge_t *b) {
     if (!b->has_active_hli || b->active_hli.hl_gi.btn_ns == 0) {
         /* When playing a clip/movie with no interactive menu buttons active,
          * Arrow keys seek along the clip timeline (-10s/+10s, -60s/+60s)! */
-        if (act == ACT_LEFT)  return vm_seek_timeline(b, true, -10, 0.0);
-        if (act == ACT_RIGHT) return vm_seek_timeline(b, true, +10, 0.0);
-        if (act == ACT_DOWN)  return vm_seek_timeline(b, true, -60, 0.0);
-        if (act == ACT_UP)    return vm_seek_timeline(b, true, +60, 0.0);
+        if (act == ACT_LEFT)  return vm_seek_timeline(b, true, -10, 0.0, -1);
+        if (act == ACT_RIGHT) return vm_seek_timeline(b, true, +10, 0.0, -1);
+        if (act == ACT_DOWN)  return vm_seek_timeline(b, true, -60, 0.0, -1);
+        if (act == ACT_UP)    return vm_seek_timeline(b, true, +60, 0.0, -1);
         return false;
     }
 
@@ -2253,6 +2265,13 @@ void dvd_vm_bridge_seek_fraction(dvd_vm_bridge_t *b, double fraction_0_to_1) {
     pthread_mutex_lock(&b->lock);
     b->pending_action = ACT_SEEK_FRAC;
     b->action_frac = fraction_0_to_1;
+    pthread_mutex_unlock(&b->lock);
+}
+void dvd_vm_bridge_seek_absolute(dvd_vm_bridge_t *b, double seconds) {
+    if (!b || !(seconds >= 0.0)) return;
+    pthread_mutex_lock(&b->lock);
+    b->pending_action = ACT_SEEK_ABS;
+    b->action_frac = seconds;
     pthread_mutex_unlock(&b->lock);
 }
 void dvd_vm_bridge_next_chapter(dvd_vm_bridge_t *b)              { queue_action(b, ACT_NEXT_CHAPTER, 0, 0); }

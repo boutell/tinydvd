@@ -341,6 +341,7 @@ class TinyDVDCore:
             ctypes.c_char_p,
             ctypes.c_int,
             ctypes.c_int,
+            ctypes.c_double,
         ]
         lib.tdvd_vm_session_dispatch_action.restype = None
 

@@ -1622,8 +1622,10 @@
       if (!video.duration || !isFinite(video.duration)) return;
       const r = e.currentTarget.getBoundingClientRect();
       const frac = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-      video.currentTime = frac * video.duration;
-      sendWS({ type: 'time_update', pts: video.currentTime });
+      // The DVD engine does the seek and tells us where to go: setting
+      // currentTime here would leave it believing playback was still at the
+      // old spot, and it would put it back there
+      sendWS({ type: 'seek_to', pts: frac * video.duration });
     };
 
     function toggleShortcuts() {

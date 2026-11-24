@@ -91,6 +91,8 @@ bool dvd_vm_bridge_escape(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_toggle_pause(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_seek_relative(dvd_vm_bridge_t *bridge, int delta_seconds);
 void dvd_vm_bridge_seek_fraction(dvd_vm_bridge_t *bridge, double fraction_0_to_1);
+/* To a time in the current video file, in seconds (clamped to the current title) */
+void dvd_vm_bridge_seek_absolute(dvd_vm_bridge_t *bridge, double seconds);
 void dvd_vm_bridge_next_chapter(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_prev_chapter(dvd_vm_bridge_t *bridge);
 void dvd_vm_bridge_cycle_subtitles(dvd_vm_bridge_t *bridge);

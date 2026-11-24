@@ -216,6 +216,16 @@ int main(int argc, char **argv) {
     seeks = snapshot().seeks;
     dvd_vm_bridge_seek_relative(vm, -3);
     expect_position(7.0, seeks, "seek back 3 s");
+    /* The timeline: to a time in the video, which must stay in the title */
+    seeks = snapshot().seeks;
+    dvd_vm_bridge_seek_absolute(vm, 16.0);
+    expect_position(16.0, seeks, "seek to 16 s");
+    seeks = snapshot().seeks;
+    dvd_vm_bridge_seek_absolute(vm, 4.0);
+    expect_position(4.0, seeks, "seek back to 4 s");
+    seeks = snapshot().seeks;
+    dvd_vm_bridge_seek_absolute(vm, 500.0);
+    expect_position(19.5, seeks, "seek past the end of the title");
     printf("Seeking: OK\n");
 
     /* Subtitles: the disc has one track, and cycling reports it */

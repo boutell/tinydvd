@@ -510,6 +510,7 @@ static int dispatch_vm_action(dvd_vm_bridge_t *vm, const char *action, int x, in
     if (strcmp(action, "escape") == 0) return dvd_vm_bridge_escape(vm) ? 1 : 0;
     if (strcmp(action, "seek_rel") == 0) { dvd_vm_bridge_seek_relative(vm, (int)darg); return 1; }
     if (strcmp(action, "seek_frac") == 0) { dvd_vm_bridge_seek_fraction(vm, darg); return 1; }
+    if (strcmp(action, "seek_abs") == 0)  { dvd_vm_bridge_seek_absolute(vm, darg); return 1; }
     if (strcmp(action, "mouse_move") == 0) { dvd_vm_bridge_mouse_move(vm, x, y); return 1; }
     if (strcmp(action, "mouse_click") == 0) { dvd_vm_bridge_mouse_click(vm, x, y); return 1; }
     return 0;
@@ -1397,11 +1398,11 @@ int tdvd_vm_session_load(tdvd_vm_session_t *s, const char *disc_path, const char
     return rc;
 }
 
-void tdvd_vm_session_dispatch_action(tdvd_vm_session_t *s, const char *action, int x, int y) {
+void tdvd_vm_session_dispatch_action(tdvd_vm_session_t *s, const char *action, int x, int y, double darg) {
     if (!s || !action) return;
     pthread_mutex_lock(&s->lock);
     /* Web clients send mouse positions already in DVD frame pixels */
-    dispatch_vm_action(s->vm, action, x, y, 0.0);
+    dispatch_vm_action(s->vm, action, x, y, darg);
     pthread_mutex_unlock(&s->lock);
 }
 
